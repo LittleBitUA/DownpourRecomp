@@ -1,0 +1,87 @@
+# =============================================================================
+# DownpourRecomp .gitignore
+# =============================================================================
+# CRITICAL: this project must NOT distribute any of the following:
+#   - Silent Hill: Downpour game files (XEX executable, content, DLC, ISOs)
+#   - Any binary derived from the game executable (e.g. codegen output)
+#   - Any captured frames, screenshots, or video of the game
+#
+# Users build the project against their own legally-owned copy of the game.
+# =============================================================================
+
+# --- Game files (never commit) ----------------------------------------------
+Game/
+assets/
+**/default.xex
+**/default.pe.bin
+**/*.xex
+**/*.pe.bin
+**/*.iso
+**/*.ISO
+**/*.god
+**/*.GOD
+**/*.xexp
+**/*.zar
+**/*.dlc
+
+# --- ReXGlue codegen output (derived from XEX, regeneratable) --------------
+generated/
+
+# --- Build artifacts --------------------------------------------------------
+out/
+build/
+build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+*.ninja
+*.ninja_*
+compile_commands.json
+
+# --- Compiled binaries ------------------------------------------------------
+*.dll
+*.exe
+*.pdb
+*.lib
+*.so
+*.dylib
+*.obj
+*.o
+
+# --- Captures / debug dumps -------------------------------------------------
+*.rdc
+renderdoc_*
+*.dmp
+trace_*
+
+# --- Logs -------------------------------------------------------------------
+*.log
+logs/
+
+# --- Archives (used to ship game / captures) --------------------------------
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+*.tgz
+
+# --- Editor / IDE -----------------------------------------------------------
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.code-workspace
+.cache/
+
+# --- OS junk ----------------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Local toolchain caches -------------------------------------------------
+.cache/
+__pycache__/
+*.pyc

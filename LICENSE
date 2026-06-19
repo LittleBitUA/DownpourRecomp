@@ -3,13 +3,6 @@ BSD 3-Clause License
 Copyright (c) 2026, DownpourRecomp contributors
 All rights reserved.
 
-This project depends on the ReXGlue SDK, which is itself derived from the
-Xenia project (https://xenia.jp). ReXGlue and Xenia carry their own license
-terms; see those projects for details. This repository contains only the
-DownpourRecomp application shell, build configuration, and ReXGlue codegen
-metadata authored for Silent Hill: Downpour - no game assets are included
-or distributed.
-
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions are met:
 

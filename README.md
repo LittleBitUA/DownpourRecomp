@@ -1,8 +1,8 @@
 <div align="center">
 
-# DownpourRecomp
+# Silent Hill: Downpour — PC Port (DownpourRecomp)
 
-**Silent Hill: Downpour** (Xbox 360, 2012) — natively recompiled for Windows.
+### Play *Silent Hill: Downpour* natively on Windows, in 1080p, with keyboard + mouse — no emulator required.
 
 [![Latest release](https://img.shields.io/github/v/release/LittleBitUA/DownpourRecomp?style=for-the-badge&label=Download&color=blue)](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
 [![Total downloads](https://img.shields.io/github/downloads/LittleBitUA/DownpourRecomp/latest/total?style=for-the-badge&color=brightgreen)](https://github.com/LittleBitUA/DownpourRecomp/releases)
@@ -10,119 +10,277 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?style=for-the-badge&logo=windows)](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
 [![Stars](https://img.shields.io/github/stars/LittleBitUA/DownpourRecomp?style=for-the-badge&color=yellow)](https://github.com/LittleBitUA/DownpourRecomp/stargazers)
 
-![Murphy close-up](docs/screenshots/murphy-closeup.png)
+![Murphy close-up — Silent Hill: Downpour running natively on PC](docs/screenshots/murphy-closeup.png)
 
-### [⬇  Download the latest release](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
+## [⬇  Download v0.1.1 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
 
 </div>
 
 ---
 
-## What is this
+## Table of contents
 
-DownpourRecomp is a **static recompilation** of *Silent Hill: Downpour*'s Xbox 360 executable to native Windows. The PowerPC code in the original `default.xex` is translated to C++ at build time, then linked against a host runtime that emulates the Xbox 360 ABI (CPU registers, kernel objects, threading, GPU command processor + EDRAM). The result is a regular Windows process — **no emulator, no JIT, no per-frame instruction dispatch overhead**.
-
-CPU-side game logic runs natively. The renderer is the upstream Xenia D3D12 stack, ported into ReXGlue, plus a narrow fix for the chromatic-noise artifact that surfaces on the fast RTV render-target-cache path on UE3 G-buffer titles.
-
-Built on the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk).
-
-> [!IMPORTANT]
-> This repository contains **no Konami or Vatra Games assets**. You must own a legal copy of *Silent Hill: Downpour* (Xbox 360 USA/EUR, title id `4B4E0823`, base XEX hash `7A3D5809776EE6AB`) and provide your own dumped game data tree.
+- [What is this?](#what-is-this)
+- [Why does this exist?](#why-does-this-exist)
+- [Comparison vs Xenia and the Xbox 360](#comparison-vs-xenia-and-the-xbox-360)
+- [Screenshots](#screenshots)
+- [What you need before playing](#what-you-need-before-playing)
+- [How to install and play](#how-to-install-and-play)
+- [Default controls](#default-controls)
+- [Runtime configuration](#runtime-configuration)
+- [Frequently asked questions](#frequently-asked-questions)
+- [Building from source](#building-from-source)
+- [Technical deep-dives](#technical-deep-dives)
+- [Acknowledgements](#acknowledgements)
+- [Legal](#legal)
 
 ---
 
-## Status
+## What is this?
 
-End-to-end playable as of **2026-06-19**.
+**DownpourRecomp is a native Windows port of *Silent Hill: Downpour* (Konami / Vatra Games, Xbox 360, 2012).** The original Xbox 360 game is converted into a regular Windows program — once and for all, at build time — so it runs on your PC the same way as any other Windows app.
 
-| Subsystem | State |
-| --- | --- |
-| CPU recompilation | **Stable** |
-| Kernel imports | Workarounds in place; no known blockers |
-| GPU — D3D12 RTV/DSV path | **Working** — fast, default; chromatic-noise [fix](docs/chromatic-noise-fix.md) shipped |
-| GPU — D3D12 ROV path | Working — slower correctness fallback |
-| Audio (XAudio2) | Working |
-| Input — keyboard + mouse | Working — smoothed mouse-to-stick mapping |
-| Input — gamepad | Working |
-| Save / load | Working |
-| Achievements / online | Stubbed (single-player only) |
+If you've used Xenia or RPCS3 before, this is **not** that. There is no emulator, no JIT translator running on every CPU instruction, no per-frame interpretation overhead. The PowerPC code in the original Xbox 360 binary is translated into native x86-64 C++ code ahead of time, and then linked against a small host runtime that handles the Xbox-specific parts (input, kernel calls, GPU command processor, EDRAM). The result is a real `downpour.exe` that boots like any other game.
+
+This technique is called **static recompilation**. It's the same idea behind:
+- [N64: Recompiled](https://github.com/Mr-Wiseguy/N64Recomp) (the project that started the trend),
+- [Sonic Mania: Recompiled](https://github.com/SonicMania-Recompiled/Sonic-Mania-Recompiled),
+- [Skate 3 Recomp](https://github.com/Sergeanur/Skate3Recomp),
+- [DPRecomp](https://github.com/LittleBitUA/DPRecomp) (the same author's *Deadly Premonition* port).
+
+DownpourRecomp uses the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) — a Xenia-derived Xbox 360 host runtime — as the foundation, and adds the Silent Hill: Downpour-specific glue and a narrow GPU fix that makes the fast render path produce a clean image.
+
+> [!NOTE]
+> **You provide your own legally-owned copy of the game.** The release zip is the host shell only (~27 MiB). It does not contain `default.xex`, game data, music, or any Konami / Vatra assets. See [What you need before playing](#what-you-need-before-playing).
+
+---
+
+## Why does this exist?
+
+*Silent Hill: Downpour* never received an official PC release. On modern hardware your three options are:
+
+1. **Real Xbox 360 hardware.** Works, but ageing — disc reads fail, HDMI is 720p tops, no improvements over 2012.
+2. **Xenia emulator** ([xenia-canary](https://github.com/xenia-canary/xenia-canary)). Works for Downpour visually but with the overhead of dynamic translation and the dependency on Xenia's evolution.
+3. **DownpourRecomp** (this project). A native Windows process, full mouse + keyboard support, the chromatic-noise artifact on the fast render path fixed, and the entire CPU side running natively at x86-64 speed.
+
+Option 3 is what this project exists to be.
+
+---
+
+## Comparison vs Xenia and the Xbox 360
+
+| | Xbox 360 (original) | Xenia emulator | **DownpourRecomp** |
+| --- | --- | --- | --- |
+| **Resolution** | 720p (HDMI) | up to 4K (DSR) | up to 4K, native 1080p default |
+| **Frame rate** | 30 FPS | 30 FPS (UE3 cap) | 30 FPS (UE3 cap)\* |
+| **Input** | Xbox 360 controller only | XInput controllers | XInput + **native mouse & keyboard** |
+| **Disc / file requirement** | Original disc | Dumped XEX + game data | Dumped XEX + game data |
+| **GPU rendering** | Xbox 360 GPU | Xenia D3D12 / Vulkan | Xenia D3D12 backend (ported) |
+| **CPU execution** | PowerPC native | Dynamic recompiler (JIT) | **Statically recompiled to native x86-64** |
+| **CPU overhead** | none | per-frame translation | **none** |
+| **Chromatic-noise bug** | n/a (clean) | clean | **fixed** (see [docs](docs/chromatic-noise-fix.md)) |
+| **Modding hooks** | none | limited | C++ source-level hooks |
+| **Install size** | disc only | ~80 MiB + your dump | ~110 MiB + your dump |
+
+\* The 30 FPS cap is inside the recompiled game logic (UE3 fixed tick rate). Lifting it requires patching the game's tick code, not the runtime — see [Frequently asked questions](#frequently-asked-questions).
+
+---
+
+## Screenshots
 
 <div align="center">
 
-![Prison Block 4 intro](docs/screenshots/block-4-intro.png)
-![Murphy in the prison corridor](docs/screenshots/prison-corridor.png)
+| Title screen | Murphy close-up |
+| --- | --- |
+| ![Title screen](docs/screenshots/murphy-closeup.png) | ![Murphy close-up](docs/screenshots/block-4-intro.png) |
+
+| Prison Block 4 intro | Prison corridor |
+| --- | --- |
+| ![Prison Block 4 intro](docs/screenshots/block-4-intro.png) | ![Murphy in the prison corridor](docs/screenshots/prison-corridor.png) |
 
 </div>
 
 ---
 
-## Quick start
+## What you need before playing
 
-1. **Download** the latest release zip: [v0.1.1 →](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
-2. **Extract** it somewhere with read/write access.
-3. **Drop your legally-owned game files** into an `assets/` folder next to `downpour.exe`. The expected layout:
+The download is **the application only**. You bring the game. To play, you need:
+
+1. **A legally-owned copy of *Silent Hill: Downpour* for Xbox 360** — disc, digital download, or backup of either. Region USA or EUR (`title id 4B4E0823`, base XEX hash `7A3D5809776EE6AB`). Other regions are untested.
+2. **Your own dumped `default.xex`** extracted from that copy.
+3. **The full game data tree** — `nxeart`, `SHGame/`, `AvatarAssetPack/`, and the rest of the disc's files. The game streams content (audio, levels, scripts) from disk at runtime, so the XEX alone is not enough.
+4. A modern Windows PC: Windows 10 or 11 (x86-64), a D3D12-capable discrete GPU (RTX 30-series or equivalent, 6+ GB VRAM recommended).
+
+> [!IMPORTANT]
+> Do not ask in the issue tracker or anywhere else where to get the XEX. Bring your own legally-acquired copy.
+
+---
+
+## How to install and play
+
+1. **Download** the latest release zip: [DownpourRecomp v0.1.1 →](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
+2. **Extract** the zip somewhere with read/write access (e.g. `C:\Games\DownpourRecomp\`).
+3. **Put your game files** into an `assets/` folder next to `downpour.exe`. The expected layout:
 
    ```
-   downpour.exe
-   rexruntimerd.dll
-   downpour.toml         ← rename from downpour.toml.sample
-   assets/
-     default.xex
-     nxeart
-     SHGame/
-     AvatarAssetPack/
+   C:\Games\DownpourRecomp\
+     downpour.exe
+     rexruntimerd.dll
+     TracyClientrd.dll
+     downpour.toml         ← rename from downpour.toml.sample
+     start.bat
+     assets\
+       default.xex         ← your XEX, from your dumped copy
+       nxeart
+       SHGame\
+       AvatarAssetPack\
    ```
 
-4. **Rename** `downpour.toml.sample` → `downpour.toml`. It already enables mouse mode and the chromatic-noise fix.
-5. **Launch** via `start.bat`, or:
+4. **Rename** `downpour.toml.sample` → `downpour.toml`. It already enables the chromatic-noise fix and sensible defaults.
+5. **Double-click `start.bat`**, or open a terminal and run:
 
    ```powershell
    downpour.exe --game_data_root assets
    ```
 
-Press `F4` in-game for the settings overlay (cvars, key binds, sensitivity, draw scale).
-Press `` ` `` (backtick) for the console.
+6. The game launches in fullscreen 1080p. Press **F4** in-game to open the **settings overlay** (cvars, keybinds, mouse sensitivity, render scale). Press **`** (backtick) for the **console**.
+
+That's it — you're playing *Silent Hill: Downpour* natively on PC.
+
+---
+
+## Default controls
+
+| Action | Key / Button |
+| --- | --- |
+| Move | `W` `A` `S` `D` |
+| Camera | Mouse |
+| Interact / fire | `Space` / `LMB` |
+| Aim / look | `RMB` |
+| Run | `Shift` |
+| Crouch | `C` |
+| Reload | `R` |
+| Menu | `Esc` |
+| Pause / Map | `Tab` |
+| Settings overlay | `F4` |
+| Console | `` ` `` |
+
+All bindings are remappable live via F4 → Input → Keybinds.
 
 ---
 
 ## Runtime configuration
 
-The recompiled binary reads `downpour.toml` from its working directory. A minimal config:
+The recompiled binary reads `downpour.toml` from its working directory. The sample shipped with the release already has these defaults set:
 
 ```toml
-# RTV chromatic-noise fix - see docs/chromatic-noise-fix.md for the forensic
-# trail of how this was localized via RenderDoc Pixel History.
+# Chromatic-noise fix on the fast RTV path. Safe to leave enabled for Downpour.
+# Details: docs/chromatic-noise-fix.md
 skip_depth_color_7e3_aliasing_transfers = true
 
-# D3D12 path: "rtv" for the fast HostRenderTargets path; "rov" for the slow but
-# always-correct PixelShaderInterlock path (correctness fallback).
+# Render path: "rtv" = fast HostRenderTargets, "rov" = slower correctness fallback
 render_target_path_d3d12 = "rtv"
 
-# Window / display - native 1080p by default.
+# Native 1080p
 window_width = 1920
 window_height = 1080
 fullscreen = true
 video_mode_width = 1920
 video_mode_height = 1080
 
-# Soft present-rate cap.
+# Soft present-rate cap
 d3d12_present_frame_limiter = true
 
-# Mouse + keyboard. Hot-reloadable via F4.
+# Keyboard + mouse mode (hot-reloadable via F4)
 mnk_mode = true
-# mnk_sensitivity = 1.0   # default; raise/lower to taste
+# mnk_sensitivity = 1.0   # raise for faster mouse, lower for slower
 
-# Path to the game file tree (relative to this file's folder).
+# Path to your game files (relative to this folder)
 game_data_root = "./assets"
 
 [log.levels]
 gpu = "info"
 ```
 
-All cvars are also editable live via the **F4 settings overlay**.
-
 > [!TIP]
-> For internal supersampling (sharper but heavier), open F4 → GPU and raise `draw_resolution_scale_x` / `draw_resolution_scale_y` to 2 — equivalent to DSR / VSR at 1440p downscaled to 1080p.
+> For internal supersampling (sharper at the cost of GPU time), open F4 → GPU and raise `draw_resolution_scale_x` / `draw_resolution_scale_y` to 2. That renders internally at 2160p and downscales to your output — similar to NVIDIA DSR or AMD VSR. Heavy on mid-range cards; leave at 1 for default 1080p.
+
+---
+
+## Frequently asked questions
+
+<details>
+<summary><b>Is this an emulator?</b></summary>
+
+No. An emulator runs the original Xbox 360 instructions on a virtual CPU at runtime. DownpourRecomp converts the Xbox 360 instructions into native x86-64 code at build time, so what you run on your PC is a real Windows executable. Think of it as the game being "re-translated" once, not interpreted on every frame.
+
+</details>
+
+<details>
+<summary><b>Why isn't the game executable included? Where do I get it?</b></summary>
+
+Including the game's binary or any of its data files would be copyright infringement. You need to obtain the XEX and game data from your own legally-owned copy of the Xbox 360 release. We will not tell you where to download a copy, and asking will get your issue closed.
+
+</details>
+
+<details>
+<summary><b>Can I unlock the frame rate above 30 FPS?</b></summary>
+
+Not at runtime in this version. The 30 FPS cap is baked into the game's UE3 tick loop in the recompiled code. The community-known Xenia patch (`xenia_patches.toml` in this repo, "Unlock FPS") is a guest-memory byte patch — it works under Xenia because Xenia reads guest code on every frame, but in a static recomp the relevant instructions are already translated to native code, so writing bytes to that guest address does nothing.
+
+True 60+ FPS support would require either (a) regenerating the recomp against a pre-patched XEX, or (b) hand-patching the corresponding native function. Neither is done in v0.1.1. The "Camera movement slows down over 60 FPS" warning from the Xenia patch description still applies to this game engine.
+
+</details>
+
+<details>
+<summary><b>Does mouse and keyboard work?</b></summary>
+
+Yes — *Silent Hill: Downpour* never had an official PC port, so this is the first time the game can be played with a mouse and keyboard. The ReXGlue SDK ships a mouse-to-right-stick mapping with smoothing (rewritten in v0.1.1 for clean continuous mouse motion). All controller buttons are remappable to keyboard keys via F4 → Input.
+
+</details>
+
+<details>
+<summary><b>What about ultrawide, HDR, ray tracing?</b></summary>
+
+The game is a 2012 UE3 title — no native HDR or RT support. Ultrawide is **not** automatically letterboxed; you'll get a stretched 16:9 image at 21:9 unless you cap your window/output to 16:9. Aspect-correct ultrawide support would require a UE3 FOV patch (similar to Skate 3 Recomp's approach) and is not implemented in v0.1.1.
+
+</details>
+
+<details>
+<summary><b>Do achievements unlock?</b></summary>
+
+No. There is no Xbox Live backend, so any code path that submits an achievement is stubbed out. Saves work; achievements don't.
+
+</details>
+
+<details>
+<summary><b>Will the save files transfer to/from a real Xbox 360?</b></summary>
+
+The save layout matches the Xbox 360 format, so in principle yes — but no one's verified a round-trip yet. If you do, please open an issue with the result.
+
+</details>
+
+<details>
+<summary><b>Why does GitHub call this a "native PC port" and not an "emulator"?</b></summary>
+
+Because the file you run, `downpour.exe`, is a normal Windows executable produced by Clang from C++ source code. There is no virtual CPU. The CPU instructions that used to live in the Xbox 360 binary have been *translated* to C++ at build time. That's what "static recompilation" means.
+
+</details>
+
+<details>
+<summary><b>I'm getting a crash / artefact / weird behaviour. What do I do?</b></summary>
+
+Open an issue on [GitHub Issues](https://github.com/LittleBitUA/DownpourRecomp/issues) with:
+
+- The exact symptom and the scene where it happens.
+- A screenshot or short video if visual.
+- The `logs/` folder next to `downpour.exe` (text logs, not too large).
+- Your `downpour.toml` so we know your configuration.
+- GPU model and driver version.
+
+Do **not** attach any game files or binaries that link against game data.
+
+</details>
 
 ---
 
@@ -134,16 +292,16 @@ All cvars are also editable live via the **F4 settings overlay**.
 ### Requirements
 
 - **Windows 10/11 x86-64** with up-to-date GPU drivers (D3D12 + DXIL/DXBC).
-- A discrete GPU. RTX 30-series or equivalent (≥ 6 GB VRAM) for stable 1080p; RTX 40-/50-series for headroom on 1440p / 2160p downscale or higher draw scale.
-- **Visual Studio 2022** (17.8+) with the "Desktop development with C++" workload, Windows 10 SDK, and CMake/Ninja components. Or any equivalent toolchain that can build modern C++23.
+- A discrete GPU. RTX 30-series or equivalent (≥ 6 GB VRAM) for 1080p; RTX 40-/50-series for headroom on 1440p / 2160p downscale.
+- **Visual Studio 2022** (17.8+) with the "Desktop development with C++" workload, Windows 10 SDK, and CMake/Ninja components.
 - **CMake** ≥ 3.25 and **Ninja** ≥ 1.11.
 - **LLVM/Clang-cl** is used by ReXGlue for the recompiled translation units; install LLVM and put `clang.exe` / `clang-cl.exe` on `PATH`.
-- The ReXGlue SDK installed somewhere on disk (see below).
-- A legal copy of Silent Hill: Downpour — region USA/EUR (`title id 4B4E0823`). The hash that this project's codegen was generated against is `7A3D5809776EE6AB`.
+- The ReXGlue SDK installed somewhere on disk.
+- A legal copy of Silent Hill: Downpour (`title id 4B4E0823`, hash `7A3D5809776EE6AB`).
 
-### 1. Set up the ReXGlue SDK
+### 1. Build and install the ReXGlue SDK
 
-DownpourRecomp consumes the ReXGlue SDK as an installed CMake package. Build and install the SDK first (one-time, takes ~10 minutes):
+DownpourRecomp consumes the SDK as an installed CMake package. One-time, ~10 minutes:
 
 ```bash
 git clone https://github.com/rexglue/rexglue-sdk.git
@@ -152,19 +310,17 @@ cmake --preset win-amd64-relwithdebinfo
 cmake --build out/build/win-amd64 --config RelWithDebInfo --target install
 ```
 
-Note the install prefix (defaults to `out/install/win-amd64/` inside the SDK tree).
+The install prefix defaults to `out/install/win-amd64/`.
 
 ### 2. Provide the game executable
-
-Place your own legally-extracted XEX next to the codegen output:
 
 ```
 DownpourRecomp/
   assets/
-    default.xex      ← your XEX, NOT included in this repository
+    default.xex          ← your XEX, not in this repo
 ```
 
-`.gitignore` blocks accidental commits of any `*.xex`, `*.iso`, `*.god`, `*.dlc`, etc. Do not bypass it.
+`.gitignore` blocks accidental commits of `*.xex`, `*.iso`, `*.god`, `*.dlc`, etc.
 
 ### 3. Run codegen
 
@@ -172,7 +328,7 @@ DownpourRecomp/
 rexglue codegen --manifest downpour_manifest.toml
 ```
 
-This translates the PPC code in `assets/default.xex` into C++ source files under `generated/default/`. The output is large (~280 MB) and is excluded from git.
+Translates the PPC code into C++ under `generated/default/` (~280 MB, excluded from git).
 
 ### 4. Configure and build
 
@@ -182,48 +338,29 @@ cmake --preset win-amd64-relwithdebinfo \
 cmake --build out/build/win-amd64 --config RelWithDebInfo --target downpour
 ```
 
-The build outputs `downpour.exe` and depends on `rexruntimerd.dll` (copy the DLL from the ReXGlue install next to the executable).
+Produces `downpour.exe`. Copy `rexruntimerd.dll` from the SDK install next to it.
 
-### 5. Provide game data
+### 5. Provide the runtime game data
 
-The runtime needs the full game file tree (XEX is not enough — the game streams content, audio, and scripts from disk):
-
-```
-<some-folder>/
-  SHGame/...            ← game content
-  AvatarAssetPack/      ← Konami avatar files
-  default.xex           ← the same XEX as in assets/
-  nxeart                ← title metadata
-```
-
-Point the runtime at this folder using `game_data_root` in `downpour.toml` or via the `--game_data_root` command-line argument.
+The runtime needs the full game file tree (the XEX alone is not enough). Point at it via `game_data_root` in `downpour.toml` or `--game_data_root` CLI.
 
 </details>
 
 ---
 
-## Project structure
-
-This is one of a small family of ReXGlue-based static-recompilation ports. The repository contains:
-
-- The Silent Hill: Downpour codegen output (function tables, vtable address fix-ups, indirect-call targets discovered at runtime — checked into `downpour_config.toml`).
-- A thin `DownpourApp` shell that overrides ReXApp hooks for any Downpour-specific behaviour.
-- A `xenia_patches.toml` file with optional game patches (Unlock FPS, force 16x AF, disable FXAA, show FPS counter — disabled by default; see *Known limitations* below).
-
----
-
-## Known limitations
-
-- **Online features** (multiplayer hooks, leaderboards) are stubbed.
-- **Achievements** do not unlock anywhere (no XBL backend).
-- **Avatars** in the Xbox 360 dashboard sense are not rendered.
-- Patches in `xenia_patches.toml` (FPS unlock etc.) are **reference-only** in this port. Recomp statically translates the relevant code paths, so runtime byte patches against guest addresses do not take effect — patching at codegen time is the proper fix path.
-
----
-
 ## Technical deep-dives
 
-- 📜 [Chromatic-noise fix](docs/chromatic-noise-fix.md) — full RenderDoc Pixel History backward trace from the noisy swapchain pixel to the divergent depth → 7e3 ownership transfer (EID 9506), the narrow one-direction cvar that resolves it, and a "what NOT to retry" dead-ends list.
+- 📜 [**Chromatic-noise fix**](docs/chromatic-noise-fix.md) — full RenderDoc Pixel History backward trace from the noisy swapchain pixel to the divergent depth → 7e3 ownership transfer (EID 9506), the narrow one-direction cvar that resolves it, and a "what NOT to retry" dead-ends list.
+
+---
+
+## Project structure
+
+This repository contains:
+
+- **Recompiled game** codegen output: function tables, vtable address fix-ups, indirect-call targets discovered at runtime (`downpour_config.toml`).
+- A thin `DownpourApp` shell that overrides ReXApp hooks for Downpour-specific behaviour.
+- `xenia_patches.toml` — optional game patches (Unlock FPS, force 16x AF, disable FXAA, show FPS counter — reference-only in this port; see [FAQ](#frequently-asked-questions)).
 
 ---
 
@@ -231,14 +368,25 @@ This is one of a small family of ReXGlue-based static-recompilation ports. The r
 
 - The [Xenia](https://github.com/xenia-canary/xenia-canary) team — the entire D3D12 GPU backend that ReXGlue derives from is their work.
 - The [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) maintainers for the static recomp tooling.
-- The static-recomp recipe pioneered by N64Recomp / N64: Recompiled and followed by Sonic Mania: Recompiled, Skate 3 Recomp, [Deadly Premonition Recomp](https://github.com/LittleBitUA/DPRecomp).
+- The static-recomp recipe pioneered by [N64: Recompiled](https://github.com/Mr-Wiseguy/N64Recomp) and followed by Sonic Mania: Recompiled, Skate 3 Recomp, and [Deadly Premonition Recomp (DPRecomp)](https://github.com/LittleBitUA/DPRecomp).
 
 ---
 
 ## Legal
 
-This repository contains **no Konami or Vatra Games assets**. It is original code (build configuration, codegen metadata, application shell) that targets an existing legally-owned copy of *Silent Hill: Downpour* for personal use under the user's own jurisdiction's fair-use / private-copy provisions.
+This repository contains **no Konami or Vatra Games assets, no game code, no game data, no game audio.** It is original code (build configuration, codegen metadata, application shell) that targets a separately-supplied legally-owned copy of *Silent Hill: Downpour* for personal use under the user's own jurisdiction's fair-use / private-copy provisions.
 
-Do not distribute the game executable, game data, or any binary built against game data. Pull requests that include game content will be rejected.
+Do not distribute the game executable, game data, or any binary that links against game data. Pull requests that include game content will be rejected.
 
 Code under this repository is released under the **BSD 3-Clause license** — see [LICENSE](LICENSE).
+
+The license applies only to the host-side source under `src/`, build scripts, CMake files, TOML configs, and documentation. The recompiled game code produced at build time (`generated/default/`) is derived from the copyrighted *Silent Hill: Downpour* binary and is **not** covered by this license.
+
+---
+
+<div align="center">
+
+**Related projects by the same author:**
+[DPRecomp — Deadly Premonition (PC port)](https://github.com/LittleBitUA/DPRecomp)
+
+</div>

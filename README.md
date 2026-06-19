@@ -39,7 +39,7 @@ End-to-end playable as of **2026-06-19**.
 | --- | --- |
 | CPU recompilation | **Stable** |
 | Kernel imports | Workarounds in place; no known blockers |
-| GPU — D3D12 RTV/DSV path | **Working** — fast, default; chromatic-noise [fix](#the-fix) shipped |
+| GPU — D3D12 RTV/DSV path | **Working** — fast, default; chromatic-noise [fix](docs/chromatic-noise-fix.md) shipped |
 | GPU — D3D12 ROV path | Working — slower correctness fallback |
 | Audio (XAudio2) | Working |
 | Input — keyboard + mouse | Working — smoothed mouse-to-stick mapping |
@@ -85,24 +85,13 @@ Press `` ` `` (backtick) for the console.
 
 ---
 
-## The fix
-
-> Silent Hill: Downpour exhibits a UE3 G-buffer EDRAM-aliasing pattern that triggers a depth → 7e3 (`k_2_10_10_10_FLOAT`) ownership transfer in the rexglue HostRenderTargets path. The transfer pixel shader treats the depth bits as packed 7e3 floats and decodes them via `Float7e3To32`, producing values like `(8.1875, 0.25, 0.8125, 0.333)` from clean `(0.013, 0.012, 0.008, 0.333)` HDR scene content. Those exploded HDR values propagate through the resolve → shared-memory → texture_load → gamma → composite chain, visible at the swapchain as high-frequency red/green chromatic speckle on Murphy and other surfaces.
-
-The bug was localized via RenderDoc Pixel History on a noisy pixel in the lift scene — corruption point is **EID 9506** in a representative capture. A graphics-pipeline ownership transfer pixel shader (Pipeline State 1949) reads `xe_transfer_depth` + `xe_transfer_stencil` SRVs from a `kD24FS8 4xMSAA` source RT and writes to the `k_2_10_10_10_FLOAT 1xMSAA` HDR scene RT. Clean Xenia Canary avoids this entirely by keeping persistent host RTs and switching SRV views rather than running a format-converting transfer.
-
-The fix is a narrow cvar in the ReXGlue SDK common render target cache — `skip_depth_color_7e3_aliasing_transfers` — that drops the queued ownership transfer **only in the depth → 7e3 direction**. The reverse direction (7e3 → depth) is preserved because Downpour menu font rendering uses it legitimately; skipping that direction breaks the brightness slider screen (blue bands + ghost text).
-
-The cvar is opt-in (default `false` in the SDK). The shipped `downpour.toml.sample` enables it.
-
----
-
 ## Runtime configuration
 
 The recompiled binary reads `downpour.toml` from its working directory. A minimal config:
 
 ```toml
-# RTV chromatic-noise fix (see The fix section above).
+# RTV chromatic-noise fix - see docs/chromatic-noise-fix.md for the forensic
+# trail of how this was localized via RenderDoc Pixel History.
 skip_depth_color_7e3_aliasing_transfers = true
 
 # D3D12 path: "rtv" for the fast HostRenderTargets path; "rov" for the slow but
@@ -229,6 +218,12 @@ This is one of a small family of ReXGlue-based static-recompilation ports. The r
 - **Achievements** do not unlock anywhere (no XBL backend).
 - **Avatars** in the Xbox 360 dashboard sense are not rendered.
 - Patches in `xenia_patches.toml` (FPS unlock etc.) are **reference-only** in this port. Recomp statically translates the relevant code paths, so runtime byte patches against guest addresses do not take effect — patching at codegen time is the proper fix path.
+
+---
+
+## Technical deep-dives
+
+- 📜 [Chromatic-noise fix](docs/chromatic-noise-fix.md) — full RenderDoc Pixel History backward trace from the noisy swapchain pixel to the divergent depth → 7e3 ownership transfer (EID 9506), the narrow one-direction cvar that resolves it, and a "what NOT to retry" dead-ends list.
 
 ---
 

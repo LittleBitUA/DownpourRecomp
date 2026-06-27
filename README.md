@@ -521,7 +521,24 @@ The runtime needs the full game file tree (the XEX alone is not enough). Point a
 
 ## Technical deep-dives
 
+- 📦 [**v1.0 release overview**](docs/v1.0-release-overview.md) — what we tested (USA + Europe X360, RTX 5070 / Win 11), what ships in the zip, frame-time distribution from a representative 5-minute session (p50 = 16.58 ms, 0.17% > 50 ms), methodology for capturing logs.
+- 🚀 [**v1.0 performance journey**](docs/v1.0-performance.md) — every perf-relevant change between v0.1.1 and v1.0: ROV vs RTV inversion, PSO no-block-at-submission-end, PSO library blob cache, memexport readback triple-buffer, VFS negative cache, VRAM-aware texture cache auto-tune, fence-wait sub-bucket split, guest-CPU bucket instrumentation.
+- 🐛 [**v1.0 known issues + open follow-ups**](docs/v1.0-known-issues.md) — DoF haze, foliage cyan specks, CRITICAL spike pattern, mid-session SEVERE spikes, PSO blob portability, region issues.
 - 📜 [**Chromatic-noise fix**](docs/chromatic-noise-fix.md) — full RenderDoc Pixel History backward trace from the noisy swapchain pixel to the divergent depth → 7e3 ownership transfer (EID 9506), the narrow one-direction cvar that resolves it, and a "what NOT to retry" dead-ends list.
+
+## Companion repository: the SDK
+
+The runtime DLL that ships next to `downpour.exe` is from a Downpour-specific
+fork of the ReXGlue SDK. Source is public if you want to build it yourself,
+fork further, or upstream improvements:
+
+* **[LittleBitUA/rexglue-sdk-dpour](https://github.com/LittleBitUA/rexglue-sdk-dpour)** — `dpour-main` branch, tagged `v1.0`. Soft-fork of [rexglue/rexglue-sdk](https://github.com/rexglue/rexglue-sdk).
+
+The commit message on `dpour-v1.0` enumerates everything that fork carries:
+PSO stutter fixes, memexport readback triple-buffer + targeted fence wait,
+VFS negative-result cache, VRAM auto-tune, DualSense Level 1 adaptive
+triggers, guest-CPU stall instrumentation, colour-grade post-FX, and the
+log-to-file gate that lets the release build run completely silent.
 
 ---
 

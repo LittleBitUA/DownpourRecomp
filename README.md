@@ -439,6 +439,28 @@ Because the file you run, `downpour.exe`, is a normal Windows executable produce
 </details>
 
 <details>
+<summary><b>I get error <code>0xc0000142</code> ("The application was unable to start correctly") when launching <code>downpour.exe</code> or <code>PlayDownpour.exe</code>.</b></summary>
+
+This is `STATUS_DLL_INIT_FAILED` — a required system DLL failed to initialise on process start. In ~90 % of cases on a fresh PC the cause is a missing **Microsoft Visual C++ Redistributable (x64)**.
+
+**Fix**:
+
+1. Download and install the latest VC++ Redist x64 from Microsoft: <https://aka.ms/vs/17/release/vc_redist.x64.exe>
+2. Reboot.
+3. Launch `PlayDownpour.exe` again.
+
+Why this happens: `downpour.exe` and `rexruntimerd.dll` are built with MSVC 2022 and link against `vcruntime140.dll`, `vcruntime140_1.dll`, and `msvcp140.dll`. These DLLs ship with the VC++ Redistributable but are *not* part of a clean Windows install. Without them the loader fails before `main()` is reached, producing the `0xc0000142` dialog.
+
+If `vc_redist.x64.exe` is already installed and the error persists:
+
+- Check Windows Defender → *Protection history* in case it quarantined `rexruntimerd.dll` or `TracyClientrd.dll` (unsigned binaries sometimes get flagged). Restore + add an exclusion for the install folder.
+- Re-extract the zip from scratch into a path with **no non-ASCII characters** (some users have hit issues with paths under `C:\Users\<ім'я>` containing Ukrainian/Cyrillic glyphs).
+- Confirm the next-to-exe files are intact: `rexruntimerd.dll` ≈ 15.8 MB, `TracyClientrd.dll` ≈ 245 KB, `downpour.exe` ≈ 105 MB. A smaller size means the download was truncated.
+- Confirm Windows 10 build 1909+ (or Windows 11) — older Windows 10 builds are missing parts of the D3D12 Agility SDK that the runtime needs.
+
+</details>
+
+<details>
 <summary><b>I'm getting a crash / artefact / weird behaviour. What do I do?</b></summary>
 
 Open an issue on [GitHub Issues](https://github.com/LittleBitUA/DownpourRecomp/issues) with:

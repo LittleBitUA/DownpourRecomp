@@ -12,20 +12,20 @@
 
 ![Murphy close-up — Silent Hill: Downpour running natively on PC](docs/screenshots/murphy-closeup.png)
 
-## [⬇  Download v0.1.1 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
+## [⬇  Download v1.0 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
 
 </div>
 
 ---
 
-> [!IMPORTANT]
-> **v0.1.1 is an early preview — v1.0 is coming with major fixes.** If you're new here, consider waiting for the v1.0 release before you start playing. The rough edges in v0.1.1 (performance hitches, first-run flow) are already addressed on the development branch and will ship together as v1.0.
+> [!NOTE]
+> **v1.0 ships today.** Tested against the **USA** and **Europe** Xbox 360 releases of Silent Hill: Downpour (title id `4B4E0823`, base XEX hash `7A3D5809776EE6AB`). Title Update 1 is required and the launcher walks you through staging it on first run. Other regions / pirate dumps are untested.
 >
-> Thank you for the strong community interest, testing, and feedback over the past weeks — it's directly shaping what lands in v1.0.
+> Massive thanks to everyone who tested v0.1.1 — every report, log, and screenshot fed directly into what shipped in v1.0.
 
 ---
 
-## What's coming in v1.0
+## What's new in v1.0
 
 ### 🎮 Performance & framerate
 
@@ -83,7 +83,7 @@ Captured 2026-06-27 from the development branch. The green panel on the left is 
 
 ## Table of contents
 
-- [What's coming in v1.0](#whats-coming-in-v10)
+- [What's new in v1.0](#whats-new-in-v10)
 - [v1.0 preview screenshots](#v10-preview)
 - [What is this?](#what-is-this)
 - [Why does this exist?](#why-does-this-exist)
@@ -134,7 +134,7 @@ Option 3 is what this project exists to be.
 ## Comparison vs Xenia and the Xbox 360
 
 > [!NOTE]
-> The "DownpourRecomp" column below describes the **upcoming v1.0** feature set (development branch). The currently downloadable v0.1.1 release ships a subset — see [What's coming in v1.0](#whats-coming-in-v10) for the delta.
+> The "DownpourRecomp" column below describes **v1.0** (the current release). See [What's new in v1.0](#whats-new-in-v10) above for the full feature list.
 
 | | Xbox 360 (original) | Xenia emulator | **DownpourRecomp v1.0** |
 | --- | --- | --- | --- |
@@ -173,7 +173,7 @@ The download is **the application only**. You bring the game. To play, you need:
 
 ## How to install and play
 
-1. **Download** the latest release zip: [DownpourRecomp v0.1.1 →](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
+1. **Download** the latest release zip: [DownpourRecomp v1.0 →](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
 2. **Extract** the zip somewhere with read/write access (e.g. `C:\Games\DownpourRecomp\`).
 3. **Put your game files** into an `assets/` folder next to `downpour.exe`. The expected layout:
 
@@ -283,7 +283,7 @@ Including the game's binary or any of its data files would be copyright infringe
 
 **v1.0: yes, 60 FPS is the new default.** The Xenia community patch is a guest-memory byte patch — it works under Xenia because Xenia reads guest code every frame, but in a static recomp the relevant PowerPC instructions are already translated to native C++ at build time, so writing bytes to the guest address does nothing. v1.0 instead applies the same patch directly to the recompiled C++ source, plus sets `video_mode_refresh_rate = 120` and `vsync = true` so the game logic runs at the full guest tick and the camera matches the new frame rate. Tested through the prologue and chapter 1 without the "camera slows down over 60 FPS" artifact that affects the raw byte patch under Xenia.
 
-**v0.1.1: no.** Still capped at 30 FPS in the shipped binary. Wait for v1.0.
+**v1.0: yes.** 60 FPS is the default. The Xenia community patch is a guest-memory byte patch — under emulation Xenia reads guest code every frame so the patch sticks. In a static recomp the relevant PowerPC instructions are already translated to native C++ at build time, so writing bytes to the guest address does nothing. v1.0 applies the same patch directly to the recompiled C++ source and sets `video_mode_refresh_rate = 120` + `vsync = true` so the game logic runs at the full guest tick and the camera matches the new frame rate.
 
 Beyond 60 FPS is not currently planned — the UE3 tick code Vatra wrote was tuned for 30/60, and uncapped framerates introduce animation, physics, and camera issues that need per-system fixes.
 

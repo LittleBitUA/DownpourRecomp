@@ -210,21 +210,38 @@ That's it — you're playing *Silent Hill: Downpour* natively on PC.
 
 ## Default controls
 
-| Action | Key / Button |
-| --- | --- |
-| Move | `W` `A` `S` `D` |
-| Camera | Mouse |
-| Interact / fire | `Space` / `LMB` |
-| Aim / look | `RMB` |
-| Run | `Shift` |
-| Crouch | `C` |
-| Reload | `R` |
-| Menu | `Esc` |
-| Pause / Map | `Tab` |
-| Settings overlay | `F4` |
-| Console | `` ` `` |
+The launcher's **Controls** tab is the canonical source of truth — what you see in `PlayDownpour.exe` is what the game uses. The defaults below are tuned for mouse + keyboard play of a 3rd-person survival horror title that was designed around an Xbox 360 controller.
 
-All bindings are remappable live via F4 → Input → Keybinds.
+### Mouse + keyboard
+
+| Action | Default key | Notes |
+| --- | --- | --- |
+| Move forward / back / strafe | `W` `A` `S` `D` | Left-stick emulation with deadzone compensation |
+| Camera | Mouse | Mouse-to-right-stick mapping with smoothing + decay |
+| Attack | `LMB` | Mapped to gamepad X — primary melee / shoot |
+| Block | `RMB` | Mapped to gamepad Y |
+| Throw / shoot (RT) | `LMB` | Right-trigger action, chord with attack |
+| Lock-on / aim (LT) | `RMB` | Left-trigger action, chord with block |
+| Run / sprint | `Shift` | Right-shoulder |
+| Look back | `Z` | Left-shoulder |
+| Interact / select | `E` | Gamepad A |
+| Cancel / drop item | `G` | Gamepad B |
+| Flashlight | `F` | Left-stick press |
+| Zoom camera | `MMB` | Right-stick press |
+| Inventory / heal | `↑` | D-Pad up (also accepts `1`) |
+| D-Pad down / left / right | `↓` `←` `→` | Also accept `2` `3` `4` |
+| Open journal | `Tab` | Gamepad Back |
+| Pause menu | `Esc` | Gamepad Start |
+
+### DualSense (PS5 controller)
+
+Adaptive triggers are on by default. Right Trigger uses *Weapon* mode (click point at position 6/9 with strength 5) to give Murphy's ranged weapons a satisfying break point; Left Trigger uses *Feedback* mode (constant resistance, strength 4) for aiming / lock-on. Works over **USB and Bluetooth** — SDL3 handles the difference transparently. The launcher's Controls tab exposes all 9 trigger parameters (mode, start, end, strength) per trigger if you want to tune them.
+
+### Rebinding
+
+Open `PlayDownpour.exe` → **Controls** tab. Every action has a text field — type the key name (`W`, `LMB`, `Up`, `Shift`, etc.) and hit Save. Mouse buttons accept `LMB` / `RMB` / `MMB`. The launcher writes the change directly to `downpour.toml` next to the executable.
+
+Power-users can also press **F4 in-game** for the same cvar editor as the launcher (hot-reloadable, but doesn't survive game restart unless you Save).
 
 ---
 

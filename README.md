@@ -43,6 +43,14 @@
 - **Portable layout.** Saves, runtime cache, and shader cache all live in the game folder by default (not `Documents/downpour`). Drop the folder on a USB stick, move it to another PC — your saves and warm shader cache come with you.
 - **Linux / Wine support.** Replaced the Windows-only Bahnschrift / Segoe UI font dependency with a graceful fallback chain (Bahnschrift → Segoe → Tahoma → system sans-serif). Launcher UI is now legible in plain Proton / Wine without installing extra font packages.
 
+### 🎮 Input — mouse + keyboard, DualSense, Xbox
+
+- **Mouse-and-keyboard mode** with smoothing, decay, and dead-zone compensation. Mouse is mapped to the right stick with continuous motion (rewritten in v0.1.1 from a raw-input port that broke on every other Windows update).
+- **Full DualSense (PS5) support** over **both USB and Bluetooth** — SDL3 handles the wire-protocol differences transparently, no DualSenseX-style userland driver required.
+- **Level 1 adaptive triggers on by default.** Right Trigger is in *Weapon* mode (click-point break at 6/9 with strength 5) — Murphy's ranged attacks now have a real two-stage trigger. Left Trigger is in *Feedback* mode (constant resistance at strength 4) for aiming / lock-on. All 9 trigger parameters (mode, start, end, strength, per trigger) are exposed in the launcher's Controls tab.
+- **Xbox controllers** (One / Series / 360) work out of the box via SDL3's standard gamepad mapping.
+- **Fully rebindable** — every action is a text field in the launcher's Controls tab; type the key name (`W`, `LMB`, `Up`, `Shift`, etc.) and save. Changes round-trip back into `downpour.toml`.
+
 ### 🎨 Visuals
 
 - **Native colour-grade post-FX.** A real ASC-CDL colour grade applied as the final blit, with 7 ship-ready presets — `identity`, `downpour_cinematic` (default), `downpour_horror`, `vivid`, `noir`, `warm_cinema`, `cold_steel`. Hot-reloadable; you can dial intensity 0.0 — 1.5 to taste.

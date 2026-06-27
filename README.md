@@ -25,6 +25,24 @@
 
 ---
 
+## v1.0 preview
+
+Captured 2026-06-27 from the development branch. The green panel on the left is the diagnostic overlay (`F4` to toggle); the small `60 FPS / 16.6 ms` counter in the top-right is what matters for the v1.0 perf target.
+
+<div align="center">
+
+| Yard / twilight | Bedroom — Ukrainian localization in-game |
+| --- | --- |
+| ![Yard twilight, 60 FPS](docs/screenshots/v1-preview-yard-twilight.png) | ![Bedroom dialogue, 60 FPS, Ukrainian](docs/screenshots/v1-preview-bedroom-ua.png) |
+
+| Rusty key pickup — Ukrainian item description | |
+| --- | --- |
+| ![Rusty key pickup, 60 FPS, Ukrainian](docs/screenshots/v1-preview-rusty-key.png) | |
+
+</div>
+
+---
+
 ## Table of contents
 
 - [What is this?](#what-is-this)

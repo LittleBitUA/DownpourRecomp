@@ -69,13 +69,13 @@ Captured 2026-06-27 from the development branch. The green panel on the left is 
 
 <div align="center">
 
-| Yard / twilight | Bedroom — Ukrainian localization in-game |
+| Murphy at the *Silent Hill* sign | Yard / twilight |
 | --- | --- |
-| ![Yard twilight, 60 FPS](docs/screenshots/v1-preview-yard-twilight.png) | ![Bedroom dialogue, 60 FPS, Ukrainian](docs/screenshots/v1-preview-bedroom-ua.png) |
+| ![Murphy at the Silent Hill sign, 60 FPS](docs/screenshots/v1-preview-silent-hill-sign.png) | ![Yard twilight, 60 FPS](docs/screenshots/v1-preview-yard-twilight.png) |
 
-| Rusty key pickup — Ukrainian item description | |
+| Bedroom — Ukrainian localization in-game | Rusty key pickup — Ukrainian item description |
 | --- | --- |
-| ![Rusty key pickup, 60 FPS, Ukrainian](docs/screenshots/v1-preview-rusty-key.png) | |
+| ![Bedroom dialogue, 60 FPS, Ukrainian](docs/screenshots/v1-preview-bedroom-ua.png) | ![Rusty key pickup, 60 FPS, Ukrainian](docs/screenshots/v1-preview-rusty-key.png) |
 
 </div>
 
@@ -88,7 +88,6 @@ Captured 2026-06-27 from the development branch. The green panel on the left is 
 - [What is this?](#what-is-this)
 - [Why does this exist?](#why-does-this-exist)
 - [Comparison vs Xenia and the Xbox 360](#comparison-vs-xenia-and-the-xbox-360)
-- [Screenshots](#screenshots)
 - [What you need before playing](#what-you-need-before-playing)
 - [How to install and play](#how-to-install-and-play)
 - [Default controls](#default-controls)
@@ -148,22 +147,6 @@ Option 3 is what this project exists to be.
 | **Install size** | disc only | ~80 MiB + your dump | ~110 MiB + your dump |
 
 \* The 30 FPS cap is inside the recompiled game logic (UE3 fixed tick rate). Lifting it requires patching the game's tick code, not the runtime — see [Frequently asked questions](#frequently-asked-questions).
-
----
-
-## Screenshots
-
-<div align="center">
-
-| Title screen | Murphy close-up |
-| --- | --- |
-| ![Title screen](docs/screenshots/murphy-closeup.png) | ![Murphy close-up](docs/screenshots/block-4-intro.png) |
-
-| Prison Block 4 intro | Prison corridor |
-| --- | --- |
-| ![Prison Block 4 intro](docs/screenshots/block-4-intro.png) | ![Murphy in the prison corridor](docs/screenshots/prison-corridor.png) |
-
-</div>
 
 ---
 

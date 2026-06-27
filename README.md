@@ -25,6 +25,44 @@
 
 ---
 
+## What's coming in v1.0
+
+### 🎮 Performance & framerate
+
+- **60 FPS unlocked.** The Xbox 360 release ran the game thread at 30 FPS via a hardcoded UE3 frame-skip flag. v1.0 patches that flag at recompile time so the game logic, animation, physics, and rendering all run at the full 60 FPS your monitor can handle. Camera motion, mouse-look, and combat all feel native-PC instead of 360-locked.
+- **ROV render path warm-cache.** Modern Nvidia (RTX 30-series and newer) and AMD (RDNA 2+) GPUs run the more accurate ROV (Rasterizer-Ordered Views) path *faster* than the legacy RTV path once the shader cache is warm. v1.0 ships pre-compiled ROV shaders so you get full GPU throughput from the first run.
+- **Pre-warmed shader cache.** ~1,370 game shaders are packaged with the build and warm-loaded at startup. No 10-second "first-time-you-see-X stutter". One-off PSO compile-time storms on level load are eliminated.
+- **Memexport readback de-flooding.** The SDK-level path that reads UE3's vertex-skinning and HUD-text memexport buffers back to the CPU was rewritten with a triple-buffered ring and targeted per-submission fence waits. Per-frame fence-wait counts in steady gameplay dropped from ~18 to 0.
+- **Tuned texture cache.** Soft / hard limits raised to 3 GB / 6 GB with a 30-minute residence time, so streaming-heavy areas keep their textures resident instead of trashing the cache every camera pivot.
+
+### 🖱️ Launcher & first-run experience
+
+- **Standalone launcher (`PlayDownpour.exe`).** A native GUI launcher you open *before* the game starts — pick your game-data folder, set resolution / scale / FSR / colour-grade / keybinds / mouse sensitivity, then hit Play. No more editing TOML files by hand for first-time setup. Settings are round-tripped non-destructively so your manual `.toml` tweaks survive.
+- **In-game settings overlay (`F4`).** All cvars also reachable mid-game via the existing F4 overlay, with hot-reload on most knobs.
+- **Title Update installer fixed.** The "Start Game" button on the first-run wizard no longer hangs the window on Windows or Linux. The installer also picks up your existing TU data automatically if you point it at the right folder.
+- **Portable layout.** Saves, runtime cache, and shader cache all live in the game folder by default (not `Documents/downpour`). Drop the folder on a USB stick, move it to another PC — your saves and warm shader cache come with you.
+- **Linux / Wine support.** Replaced the Windows-only Bahnschrift / Segoe UI font dependency with a graceful fallback chain (Bahnschrift → Segoe → Tahoma → system sans-serif). Launcher UI is now legible in plain Proton / Wine without installing extra font packages.
+
+### 🎨 Visuals
+
+- **Native colour-grade post-FX.** A real ASC-CDL colour grade applied as the final blit, with 7 ship-ready presets — `identity`, `downpour_cinematic` (default), `downpour_horror`, `vivid`, `noir`, `warm_cinema`, `cold_steel`. Hot-reloadable; you can dial intensity 0.0 — 1.5 to taste.
+- **Tuned 1080p defaults.** 2× supersampling (`resolution_scale = 2`), 16× anisotropic filtering, MSAA / FXAA off (supersampling already covers anti-aliasing), FSR3 for the final present. The Xbox 360's chromatic-noise bug on the fast render path remains fixed.
+- **Localization-ready.** UI overlay and item text can be localized through the standard UE3 string tables — the v1.0 screenshots below show an in-progress Ukrainian translation as a proof of concept.
+
+### 🛡️ Stability
+
+- **Quieter logs.** PSO-stall log noise was cut ~10× by gating non-critical secondary metric warnings behind a `pso_stall_log_verbose` cvar (default off). Healthy frames no longer produce log spam; only frames above 50 ms produce a record.
+- **VFS resilience.** The virtual file-system negative-result cache uses a surgical erase strategy on path creation, so transient `temp:\` / `save:\` lookups during a save operation no longer blow away 16k cached entries and cause a multi-second stutter.
+- **No crashes / TDRs on the v1.0 path.** Extended play sessions on the development branch run without device-removed events on tested hardware (RTX 5070, Win 11).
+
+### 🛠️ For modders & technical players
+
+- **C++ source-level hooks** in the recompiled game logic (already in v0.1.1, kept and expanded).
+- **Cache versioning.** PSO and shader caches are versioned per SDK build — your warm cache survives across patch updates as long as the SDK version key matches, and is regenerated cleanly when it doesn't.
+- **Diagnostic overlay.** The green-panel debug HUD visible in the v1.0 screenshots below is shippable (`F4` to toggle) — PSO stall counts, fence waits, texture streaming, draw bucket breakdown, CPU/GPU phase timing.
+
+---
+
 ## v1.0 preview
 
 Captured 2026-06-27 from the development branch. The green panel on the left is the diagnostic overlay (`F4` to toggle); the small `60 FPS / 16.6 ms` counter in the top-right is what matters for the v1.0 perf target.
@@ -45,6 +83,8 @@ Captured 2026-06-27 from the development branch. The green panel on the left is 
 
 ## Table of contents
 
+- [What's coming in v1.0](#whats-coming-in-v10)
+- [v1.0 preview screenshots](#v10-preview)
 - [What is this?](#what-is-this)
 - [Why does this exist?](#why-does-this-exist)
 - [Comparison vs Xenia and the Xbox 360](#comparison-vs-xenia-and-the-xbox-360)

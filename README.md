@@ -19,7 +19,7 @@
 ---
 
 > [!NOTE]
-> **v1.0 ships today.** Tested against the **USA** and **Europe** Xbox 360 releases of Silent Hill: Downpour (title id `4B4E0823`, base XEX hash `7A3D5809776EE6AB`). Title Update 1 is required and the launcher walks you through staging it on first run. Other regions / pirate dumps are untested.
+> **v1.0 ships today.** Tested against the **USA** and **Europe** Xbox 360 releases of Silent Hill: Downpour (title id `4B4E0823`, base XEX hash `7A3D5809776EE6AB`). Title Update 1 is required and the launcher walks you through staging it on first run.
 >
 > Massive thanks to everyone who tested v0.1.1 — every report, log, and screenshot fed directly into what shipped in v1.0.
 
@@ -175,30 +175,34 @@ The download is **the application only**. You bring the game. To play, you need:
 
 1. **Download** the latest release zip: [DownpourRecomp v1.0 →](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
 2. **Extract** the zip somewhere with read/write access (e.g. `C:\Games\DownpourRecomp\`).
-3. **Put your game files** into an `assets/` folder next to `downpour.exe`. The expected layout:
+3. **Put your X360 game files** into an `assets/` folder next to `PlayDownpour.exe`. The expected layout after extraction + asset drop-in:
 
    ```
    C:\Games\DownpourRecomp\
-     downpour.exe
-     rexruntimerd.dll
-     TracyClientrd.dll
-     downpour.toml         ← rename from downpour.toml.sample
-     start.bat
-     assets\
-       default.xex         ← your XEX, from your dumped copy
-       nxeart
+     PlayDownpour.exe         ← launcher — start here
+     downpour.exe             ← statically-recompiled game runtime
+     rexruntimerd.dll         ← ReXGlue SDK runtime
+     downpour.toml            ← canonical v1.0 config (ships ready-to-go)
+     gamecontrollerdb.txt
+     README.txt
+     cache\                   ← shader cache (the zip ships portable PSO
+       shaders\                  descriptors; first launch builds the local
+         shareable\              GPU-vendor library blob automatically)
+         local\
+     assets\                  ← YOU PROVIDE — your dumped X360 game
+       default.xex            ← base XEX (USA / Europe, hash 7A3D5809776EE6AB)
+       default.xexp           ← Title Update 1 patch (the installer wizard
+                                 stages this for you on first run if you
+                                 point it at your XEXP file)
        SHGame\
-       AvatarAssetPack\
+         CookedXenon\         ← UE3 cooked packages (Engine.xxx, OurEngine.xxx,
+                                 Coalesced_INT.bin, level / cinematic maps)
    ```
 
-4. **Rename** `downpour.toml.sample` → `downpour.toml`. It already enables the chromatic-noise fix and sensible defaults.
-5. **Double-click `start.bat`**, or open a terminal and run:
-
-   ```powershell
-   downpour.exe --game_data_root assets
-   ```
-
-6. The game launches in fullscreen 1080p. Press **F4** in-game to open the **settings overlay** (cvars, keybinds, mouse sensitivity, render scale). Press **`** (backtick) for the **console**.
+4. **Double-click `PlayDownpour.exe`.** The launcher opens with all settings exposed in tabs — Graphics, Advanced, Mouse, Controls, Debug, UE3 Engine. Defaults are tuned for an 8 GB+ desktop GPU (60 FPS, ROV warm-cache, 2× supersampling, FSR3, DualSense adaptive triggers on).
+5. **First run only:** if Title Update 1 isn't staged yet, the launcher opens an installer wizard — point it at your `default.xexp` file and it copies it into place. Subsequent launches skip this.
+6. Click **Play**. First boot compiles the GPU-vendor shader library (~13 s on RTX 5070, longer on slower cards). Every subsequent boot is instant — the library is cached locally in `cache/shaders/local/`.
+7. The game launches in fullscreen 1080p at 60 FPS. **F4 in-game** opens the cvar overlay (same settings as the launcher, hot-reloadable). The launcher's UE3 Engine tab also exposes the engine's `SystemSettings` (shadows, motion blur, DOF, MSAA, anisotropy, etc.) by rewriting `Coalesced_INT.bin` on save.
 
 That's it — you're playing *Silent Hill: Downpour* natively on PC.
 

@@ -255,39 +255,124 @@ Power-users can also press **F4 in-game** for the same cvar editor as the launch
 
 ## Runtime configuration
 
-The recompiled binary reads `downpour.toml` from its working directory. The sample shipped with the release already has these defaults set:
+For most users the launcher's tabs cover everything you need to tweak. Power-users who edit `downpour.toml` directly — here are the v1.0 shipped defaults, grouped by what each section does. Anything not pinned in the file takes the SDK's compiled-in default.
 
 ```toml
-# Chromatic-noise fix on the fast RTV path. Safe to leave enabled for Downpour.
-# Details: docs/chromatic-noise-fix.md
-skip_depth_color_7e3_aliasing_transfers = true
+# ===== Render path & quality =====
+render_target_path_d3d12 = 'rov'              # ROV is 58 FPS vs 36 on RTV (warm cache).
+                                              # SDK auto-falls back to RTV on GPUs w/o ROV.
+resolution_scale = 2                          # 2× SSAA — sharpest image, no AA artefacts.
+native_2x_msaa = true
+anisotropic_override = 5                      # = 16× anisotropic filtering.
+swap_post_effect = 'fxaa'                     # FXAA layered on top of SSAA.
+skip_depth_color_7e3_aliasing_transfers = true   # Chromatic-noise fix (docs/chromatic-noise-fix.md).
 
-# Render path: "rtv" = fast HostRenderTargets, "rov" = slower correctness fallback
-render_target_path_d3d12 = "rtv"
+# ===== Present chain =====
+present_effect = 'fsr3'                       # FSR3 final present.
+present_fsr_quality_mode = 'nativeaa'
+d3d12_present_frame_limiter = true
+d3d12_present_frame_limiter_fps = 60.0
+d3d12_present_frame_limiter_sleep_margin_us = 1000
+d3d12_present_frame_limiter_spin_us = 150
+d3d12_allow_variable_refresh_rate_and_tearing = true
 
-# Native 1080p
+# ===== 60 FPS lock (all 3 ingredients required) =====
+video_mode_refresh_rate = 120.0               # Guest expects half-vblank ticks.
+vsync = true
+# Plus the recompile-time byte patch on the X360 frame-skip flag (built-in).
+
+# ===== Display =====
+fullscreen = true
 window_width = 1920
 window_height = 1080
-fullscreen = true
 video_mode_width = 1920
 video_mode_height = 1080
 
-# Soft present-rate cap
-d3d12_present_frame_limiter = true
+# ===== Shader-compile stutter control =====
+pso_missing_policy = 'skip'                   # Don't block render on first-encounter PSO miss.
+d3d12_pso_no_block_at_submission_end = true   # Skip per-frame wait at EndSubmission — the
+                                              # single biggest stutter fix we shipped.
+d3d12_pso_compile_budget_ms = 16.0
+d3d12_pso_block_per_draw_budget_ms = 8.0
+d3d12_pso_library_enable = true               # Persist driver-compiled microcode to disk.
 
-# Keyboard + mouse mode (hot-reloadable via F4)
+# ===== Texture cache (auto-tuned from VRAM if not pinned) =====
+texture_cache_memory_limit_render_to_texture = 128
+texture_cache_memory_limit_soft_lifetime = 1800
+# soft / hard left unset → D3D12Provider picks based on DedicatedVideoMemory.
+
+# ===== Correctness pins (do NOT flip these) =====
+gpu_allow_invalid_fetch_constants = false
+execute_unclipped_draw_vs_on_cpu = false
+readback_memexport = true                     # Required for HUD text rendering.
+
+# ===== Input — mouse + keyboard =====
 mnk_mode = true
-# mnk_sensitivity = 1.0   # raise for faster mouse, lower for slower
+input_backend = 'sdl'
+mnk_capture_mouse = true
+mnk_sensitivity = 1.0
+mnk_smoothing = 0.15
+mnk_acceleration_exponent = 1.0
+mnk_decay = 0.30
+mnk_deadzone_compensation = 4000
+mnk_invert_y = false
 
-# Path to your game files (relative to this folder)
-game_data_root = "./assets"
+# ===== Input — DualSense adaptive triggers (Level 1) =====
+dualsense_adaptive_triggers = true
+dualsense_rt_mode = 'weapon'                  # 'off' | 'feedback' | 'weapon' | 'vibration'
+dualsense_rt_start = 3
+dualsense_rt_end = 6
+dualsense_rt_strength = 5
+dualsense_lt_mode = 'feedback'
+dualsense_lt_start = 2
+dualsense_lt_end = 0
+dualsense_lt_strength = 4
 
-[log.levels]
-gpu = "info"
+# ===== Keybinds (excerpt — full list in shipped toml) =====
+keybind_a = 'E'                               # interact / select
+keybind_b = 'G'                               # cancel / drop item
+keybind_x = 'LMB'                             # attack
+keybind_y = 'RMB'                             # block
+keybind_left_trigger = 'RMB'                  # lock-on / aim
+keybind_right_trigger = 'LMB'                 # throw / shoot
+keybind_left_shoulder = 'Z'                   # look back
+keybind_right_shoulder = 'Shift'              # run / sprint
+keybind_lstick_press = 'F'                    # flashlight
+
+# ===== Audio =====
+audio_maxqframes = 16
+win32_mmcss = true
+win32_high_resolution_timer = true
+
+# ===== Logging (silent by default for release) =====
+log_to_file = false
+log_level = 'off'
+
+# ===== Diagnostics (off by default — flip in launcher Debug tab if needed) =====
+show_fps_counter = true
+show_shader_compile_indicator = false         # Opt-in only.
+d3d12_gpu_timestamp_buckets = false
+pso_capture = false
+pso_capture_dump_on_exit = false
+occlusion_query_enable = false
+
+# ===== Optional colour grade =====
+colour_grade_enable = false                   # Off; flip to true and pick a preset.
+colour_grade_preset = 'identity'              # 'cinematic', 'horror', 'vivid', 'noir',
+                                              # 'warm_cinema', 'cold_steel', 'identity'
+colour_grade_intensity = 1.0
+
+# ===== Localisation =====
+launcher_language = 'en'                      # 'en' | 'uk'
+user_language = 1
+
+# ===== Asset / data layout =====
+game_data_root = './assets'
+force_gameplay_state_active = true
 ```
 
 > [!TIP]
-> For internal supersampling (sharper at the cost of GPU time), open F4 → GPU and raise `draw_resolution_scale_x` / `draw_resolution_scale_y` to 2. That renders internally at 2160p and downscales to your output — similar to NVIDIA DSR or AMD VSR. Heavy on mid-range cards; leave at 1 for default 1080p.
+> Almost every cvar above is also exposed in `PlayDownpour.exe` — Settings tabs. Edit there and the launcher writes the same toml back without destroying any keys it doesn't recognise (good if you've added a cvar manually).
 
 ---
 
@@ -474,5 +559,9 @@ The license applies only to the host-side source under `src/`, build scripts, CM
 
 **Related projects by the same author:**
 [DPRecomp — Deadly Premonition (PC port)](https://github.com/LittleBitUA/DPRecomp)
+
+---
+
+### 🇺🇦 MADE IN UKRAINE 🇺🇦
 
 </div>

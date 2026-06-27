@@ -133,20 +133,27 @@ Option 3 is what this project exists to be.
 
 ## Comparison vs Xenia and the Xbox 360
 
-| | Xbox 360 (original) | Xenia emulator | **DownpourRecomp** |
+> [!NOTE]
+> The "DownpourRecomp" column below describes the **upcoming v1.0** feature set (development branch). The currently downloadable v0.1.1 release ships a subset — see [What's coming in v1.0](#whats-coming-in-v10) for the delta.
+
+| | Xbox 360 (original) | Xenia emulator | **DownpourRecomp v1.0** |
 | --- | --- | --- | --- |
-| **Resolution** | 720p (HDMI) | up to 4K (DSR) | up to 4K, native 1080p default |
-| **Frame rate** | 30 FPS | 30 FPS (UE3 cap) | 30 FPS (UE3 cap)\* |
+| **Resolution** | 720p (HDMI) | up to 4K (DSR) | up to 4K, native 1080p default + 2× SSAA |
+| **Frame rate** | 30 FPS | 30 FPS (UE3 cap) | **60 FPS unlocked** (recompile-time patch) |
 | **Input** | Xbox 360 controller only | XInput controllers | XInput + **native mouse & keyboard** |
+| **Settings UI** | in-game options menu | Xenia F11 / config files | **standalone launcher + in-game F4 overlay** |
 | **Disc / file requirement** | Original disc | Dumped XEX + game data | Dumped XEX + game data |
-| **GPU rendering** | Xbox 360 GPU | Xenia D3D12 / Vulkan | Xenia D3D12 backend (ported) |
+| **GPU rendering** | Xbox 360 GPU | Xenia D3D12 / Vulkan | Xenia D3D12 **ROV path** (ported, default on RTX 30+/RDNA 2+) |
 | **CPU execution** | PowerPC native | Dynamic recompiler (JIT) | **Statically recompiled to native x86-64** |
 | **CPU overhead** | none | per-frame translation | **none** |
+| **Shader cache** | n/a (native HW) | rebuilds per-driver-update | **ships pre-warmed** (~170 MB, ~1,370 PSOs) |
+| **First-run stutter** | n/a | tens of seconds of compile spikes | **eliminated** (warm cache + memexport readback de-flood) |
+| **Colour grade** | as authored | none | **7 ASC-CDL presets** (cinematic / horror / vivid / noir / …) |
+| **Linux / Wine support** | n/a | native Linux build | **runs in Proton / Wine** (font fallback for non-Windows systems) |
+| **Portable layout** | n/a | %AppData% / OS paths | **saves + cache stay in the game folder** |
 | **Chromatic-noise bug** | n/a (clean) | clean | **fixed** (see [docs](docs/chromatic-noise-fix.md)) |
 | **Modding hooks** | none | limited | C++ source-level hooks |
-| **Install size** | disc only | ~80 MiB + your dump | ~110 MiB + your dump |
-
-\* The 30 FPS cap is inside the recompiled game logic (UE3 fixed tick rate). Lifting it requires patching the game's tick code, not the runtime — see [Frequently asked questions](#frequently-asked-questions).
+| **Install size** | disc only | ~80 MiB + your dump | ~200 MiB (incl. pre-warmed shader cache) + your dump |
 
 ---
 
@@ -274,9 +281,11 @@ Including the game's binary or any of its data files would be copyright infringe
 <details>
 <summary><b>Can I unlock the frame rate above 30 FPS?</b></summary>
 
-Not at runtime in this version. The 30 FPS cap is baked into the game's UE3 tick loop in the recompiled code. The community-known Xenia patch (`xenia_patches.toml` in this repo, "Unlock FPS") is a guest-memory byte patch — it works under Xenia because Xenia reads guest code on every frame, but in a static recomp the relevant instructions are already translated to native code, so writing bytes to that guest address does nothing.
+**v1.0: yes, 60 FPS is the new default.** The Xenia community patch is a guest-memory byte patch — it works under Xenia because Xenia reads guest code every frame, but in a static recomp the relevant PowerPC instructions are already translated to native C++ at build time, so writing bytes to the guest address does nothing. v1.0 instead applies the same patch directly to the recompiled C++ source, plus sets `video_mode_refresh_rate = 120` and `vsync = true` so the game logic runs at the full guest tick and the camera matches the new frame rate. Tested through the prologue and chapter 1 without the "camera slows down over 60 FPS" artifact that affects the raw byte patch under Xenia.
 
-True 60+ FPS support would require either (a) regenerating the recomp against a pre-patched XEX, or (b) hand-patching the corresponding native function. Neither is done in v0.1.1. The "Camera movement slows down over 60 FPS" warning from the Xenia patch description still applies to this game engine.
+**v0.1.1: no.** Still capped at 30 FPS in the shipped binary. Wait for v1.0.
+
+Beyond 60 FPS is not currently planned — the UE3 tick code Vatra wrote was tuned for 30/60, and uncapped framerates introduce animation, physics, and camera issues that need per-system fixes.
 
 </details>
 

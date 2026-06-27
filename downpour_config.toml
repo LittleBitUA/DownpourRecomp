@@ -9,6 +9,40 @@
 "0x830E82F0" = { name = "sub_830E82F0" }  # tail target from 0x830ECB9C
 "0x830D2388" = { name = "sub_830D2388" }  # tail target from 0x830D24F4
 
+# TU1 codegen pass: two new tail-branch targets surfaced after the .text
+# rebuild shifted addresses; same class of GapFill miss as the base entries.
+"0x830D3678" = { name = "sub_830D3678" }  # tail target from 0x830D37E4 (TU1)
+"0x830E94B0" = { name = "sub_830E94B0" }  # tail target from 0x830EDD54 (TU1)
+
+# TU1 runtime-discovered crashes — first boot of TU1 binary (log 18:42):
+# 1) Unregistered guest function call: 0x832C0F60
+# 2) Unregistered guest function call: 0x82D4F720
+# 3) FATAL "Unresolved branch from 0x82FFB2E4 to 0x82FFB298" — internal label
+#    inside a function the codegen split incorrectly; force 0x82FFB298 to be
+#    its own function so the branch is just a regular call.
+"0x832C0F60" = { name = "sub_832C0F60" }  # TU1 indirect-call miss (run #1)
+"0x82D4F720" = { name = "sub_82D4F720" }  # TU1 indirect-call miss (run #1)
+"0x82FFB298" = { name = "sub_82FFB298" }  # TU1 internal-branch label promote (run #1)
+
+# TU1 v4 hang (log 19:33): 3 unregistered calls scanner missed (computed
+# indirect calls via non-vtable function-pointer tables, UE3 pattern).
+# Cascade ends with call to 0x00000000 (state corruption from first miss),
+# then deadlock. Adding these 3 should unblock further game logic.
+"0x8232F2B8" = { name = "sub_8232F2B8" }  # TU1 v4 hang trigger
+"0x83083130" = { name = "sub_83083130" }  # TU1 v4 hang cascade
+"0x8233DD10" = { name = "sub_8233DD10" }  # TU1 v4 hang cascade
+
+# TU1 v5 FATAL crash (log _004 04:06:27): "Unresolved call from 0x82FEBC9C
+# to 0x82FEBBE8" — backward call lands inside a function the codegen split.
+# Promote 0x82FEBBE8 to function entry. Also preemptively add the 3 "Unresolved
+# conditional branch" targets that have been logged across every iteration —
+# they have not FATAL'd yet but the pattern says they will when game hits the
+# right path.
+"0x82FEBBE8" = { name = "sub_82FEBBE8" }  # TU1 v5 FATAL fix
+"0x831F73D8" = { name = "sub_831F73D8" }  # codegen unresolved-branch warning preempt
+"0x831F794C" = { name = "sub_831F794C" }  # codegen unresolved-branch warning preempt
+"0x831F7988" = { name = "sub_831F7988" }  # codegen unresolved-branch warning preempt
+
 # Runtime-discovered indirect-call targets (bctr/vtable) missed by static
 # discovery. Same pattern as DP's Workaround #1: add as runtime crashes
 # surface each one.
@@ -256,6 +290,7 @@
 "0x82FFC240" = { name = "sub_82FFC240" }
 "0x82FFC544" = { name = "sub_82FFC544" }
 "0x82FFC554" = { name = "sub_82FFC554" }
+"0x83008448" = { name = "sub_83008448" }
 "0x83008464" = { name = "sub_83008464" }
 "0x830085F0" = { name = "sub_830085F0" }
 "0x830085FC" = { name = "sub_830085FC" }
@@ -370,6 +405,345 @@
 "0x83081EA8" = { name = "sub_83081EA8", end = 0x83081ED0 }
 "0x8233CA98" = { end = 0x8233CAC0 }
 "0x8233CAC0" = { name = "sub_8233CAC0", end = 0x8233CAF0 }
+
+
+# TU1 vtable scan (2026-06-21 evening) — batch from find_missing_vtable_funcs.py
+# against E:/DownpourRecomp/assets/default.tu1.pe.bin. Same class as the base
+# 336 entries earlier in this file: vtable-only call targets static discovery
+# misses. Adding upfront here avoids a Crash -> Add -> Rebuild loop.
+"0x82386888" = { name = "sub_82386888" }  # TU1 vtable-scan auto
+"0x823868A0" = { name = "sub_823868A0" }  # TU1 vtable-scan auto
+"0x823868AC" = { name = "sub_823868AC" }  # TU1 vtable-scan auto
+"0x823D64E8" = { name = "sub_823D64E8" }  # TU1 vtable-scan auto
+"0x824051E8" = { name = "sub_824051E8" }  # TU1 vtable-scan auto
+"0x824D5728" = { name = "sub_824D5728" }  # TU1 vtable-scan auto
+"0x824D5730" = { name = "sub_824D5730" }  # TU1 vtable-scan auto
+"0x824DE040" = { name = "sub_824DE040" }  # TU1 vtable-scan auto
+"0x824E8EA8" = { name = "sub_824E8EA8" }  # TU1 vtable-scan auto
+"0x825B9748" = { name = "sub_825B9748" }  # TU1 vtable-scan auto
+"0x826E1A50" = { name = "sub_826E1A50" }  # TU1 vtable-scan auto
+"0x828DE250" = { name = "sub_828DE250" }  # TU1 vtable-scan auto
+"0x828F6E90" = { name = "sub_828F6E90" }  # TU1 vtable-scan auto
+"0x82902A18" = { name = "sub_82902A18" }  # TU1 vtable-scan auto
+"0x8291B070" = { name = "sub_8291B070" }  # TU1 vtable-scan auto
+"0x8296B328" = { name = "sub_8296B328" }  # TU1 vtable-scan auto
+"0x8298D628" = { name = "sub_8298D628" }  # TU1 vtable-scan auto
+"0x829F5EA8" = { name = "sub_829F5EA8" }  # TU1 vtable-scan auto
+"0x829F5EC8" = { name = "sub_829F5EC8" }  # TU1 vtable-scan auto
+"0x829F5F58" = { name = "sub_829F5F58" }  # TU1 vtable-scan auto
+"0x829F5F70" = { name = "sub_829F5F70" }  # TU1 vtable-scan auto
+"0x829FDB88" = { name = "sub_829FDB88" }  # TU1 vtable-scan auto
+"0x82A0CA60" = { name = "sub_82A0CA60" }  # TU1 vtable-scan auto
+"0x82A76B20" = { name = "sub_82A76B20" }  # TU1 vtable-scan auto
+"0x82A76B30" = { name = "sub_82A76B30" }  # TU1 vtable-scan auto
+"0x82A76B68" = { name = "sub_82A76B68" }  # TU1 vtable-scan auto
+"0x82A77C20" = { name = "sub_82A77C20" }  # TU1 vtable-scan auto
+"0x82A8E5D0" = { name = "sub_82A8E5D0" }  # TU1 vtable-scan auto
+"0x82A98280" = { name = "sub_82A98280" }  # TU1 vtable-scan auto
+"0x82AA6C90" = { name = "sub_82AA6C90" }  # TU1 vtable-scan auto
+"0x82B02538" = { name = "sub_82B02538" }  # TU1 vtable-scan auto
+"0x82B03C80" = { name = "sub_82B03C80" }  # TU1 vtable-scan auto
+"0x82B052C8" = { name = "sub_82B052C8" }  # TU1 vtable-scan auto
+"0x82B26978" = { name = "sub_82B26978" }  # TU1 vtable-scan auto
+"0x82B964F0" = { name = "sub_82B964F0" }  # TU1 vtable-scan auto
+"0x82C51F98" = { name = "sub_82C51F98" }  # TU1 vtable-scan auto
+"0x82D09F08" = { name = "sub_82D09F08" }  # TU1 vtable-scan auto
+"0x82D09F30" = { name = "sub_82D09F30" }  # TU1 vtable-scan auto
+"0x82D40758" = { name = "sub_82D40758" }  # TU1 vtable-scan auto
+"0x82D40760" = { name = "sub_82D40760" }  # TU1 vtable-scan auto
+"0x82D40770" = { name = "sub_82D40770" }  # TU1 vtable-scan auto
+"0x82D42CF8" = { name = "sub_82D42CF8" }  # TU1 vtable-scan auto
+"0x82D49FD0" = { name = "sub_82D49FD0" }  # TU1 vtable-scan auto
+"0x82D49FD8" = { name = "sub_82D49FD8" }  # TU1 vtable-scan auto
+"0x82D49FE0" = { name = "sub_82D49FE0" }  # TU1 vtable-scan auto
+"0x82D49FE8" = { name = "sub_82D49FE8" }  # TU1 vtable-scan auto
+"0x82D49FF0" = { name = "sub_82D49FF0" }  # TU1 vtable-scan auto
+"0x82D4A000" = { name = "sub_82D4A000" }  # TU1 vtable-scan auto
+"0x82D4A008" = { name = "sub_82D4A008" }  # TU1 vtable-scan auto
+"0x82D4A060" = { name = "sub_82D4A060" }  # TU1 vtable-scan auto
+"0x82D4F6F8" = { name = "sub_82D4F6F8" }  # TU1 vtable-scan auto
+"0x82D4F700" = { name = "sub_82D4F700" }  # TU1 vtable-scan auto
+"0x82D4F710" = { name = "sub_82D4F710" }  # TU1 vtable-scan auto
+"0x82D4F718" = { name = "sub_82D4F718" }  # TU1 vtable-scan auto
+"0x82D50AB0" = { name = "sub_82D50AB0" }  # TU1 vtable-scan auto
+"0x82D50AC0" = { name = "sub_82D50AC0" }  # TU1 vtable-scan auto
+"0x82D50AC8" = { name = "sub_82D50AC8" }  # TU1 vtable-scan auto
+"0x82D50AD0" = { name = "sub_82D50AD0" }  # TU1 vtable-scan auto
+"0x82D50AD8" = { name = "sub_82D50AD8" }  # TU1 vtable-scan auto
+"0x82D50AE0" = { name = "sub_82D50AE0" }  # TU1 vtable-scan auto
+"0x82D50AE8" = { name = "sub_82D50AE8" }  # TU1 vtable-scan auto
+"0x82D51228" = { name = "sub_82D51228" }  # TU1 vtable-scan auto
+"0x82D51230" = { name = "sub_82D51230" }  # TU1 vtable-scan auto
+"0x82D51720" = { name = "sub_82D51720" }  # TU1 vtable-scan auto
+"0x82D54118" = { name = "sub_82D54118" }  # TU1 vtable-scan auto
+"0x82D55738" = { name = "sub_82D55738" }  # TU1 vtable-scan auto
+"0x82D563E0" = { name = "sub_82D563E0" }  # TU1 vtable-scan auto
+"0x82D5F39C" = { name = "sub_82D5F39C" }  # TU1 vtable-scan auto
+"0x82D5F3B8" = { name = "sub_82D5F3B8" }  # TU1 vtable-scan auto
+"0x82D71858" = { name = "sub_82D71858" }  # TU1 vtable-scan auto
+"0x82D71860" = { name = "sub_82D71860" }  # TU1 vtable-scan auto
+"0x82D71870" = { name = "sub_82D71870" }  # TU1 vtable-scan auto
+"0x82D72F80" = { name = "sub_82D72F80" }  # TU1 vtable-scan auto
+"0x82D72F90" = { name = "sub_82D72F90" }  # TU1 vtable-scan auto
+"0x82D748B8" = { name = "sub_82D748B8" }  # TU1 vtable-scan auto
+"0x82D748E0" = { name = "sub_82D748E0" }  # TU1 vtable-scan auto
+"0x82D90BB8" = { name = "sub_82D90BB8" }  # TU1 vtable-scan auto
+"0x82D90BBC" = { name = "sub_82D90BBC" }  # TU1 vtable-scan auto
+"0x82D90BCC" = { name = "sub_82D90BCC" }  # TU1 vtable-scan auto
+"0x82D90C90" = { name = "sub_82D90C90" }  # TU1 vtable-scan auto
+"0x82D90ED8" = { name = "sub_82D90ED8" }  # TU1 vtable-scan auto
+"0x82D90EE8" = { name = "sub_82D90EE8" }  # TU1 vtable-scan auto
+"0x82D90F48" = { name = "sub_82D90F48" }  # TU1 vtable-scan auto
+"0x82D90F7C" = { name = "sub_82D90F7C" }  # TU1 vtable-scan auto
+"0x82D90F8C" = { name = "sub_82D90F8C" }  # TU1 vtable-scan auto
+"0x82D91048" = { name = "sub_82D91048" }  # TU1 vtable-scan auto
+"0x82D911E4" = { name = "sub_82D911E4" }  # TU1 vtable-scan auto
+"0x82D911F4" = { name = "sub_82D911F4" }  # TU1 vtable-scan auto
+"0x82D91460" = { name = "sub_82D91460" }  # TU1 vtable-scan auto
+"0x82D91484" = { name = "sub_82D91484" }  # TU1 vtable-scan auto
+"0x82D91494" = { name = "sub_82D91494" }  # TU1 vtable-scan auto
+"0x82D91654" = { name = "sub_82D91654" }  # TU1 vtable-scan auto
+"0x82D919DC" = { name = "sub_82D919DC" }  # TU1 vtable-scan auto
+"0x82D91CF4" = { name = "sub_82D91CF4" }  # TU1 vtable-scan auto
+"0x82D91F94" = { name = "sub_82D91F94" }  # TU1 vtable-scan auto
+"0x82D91FA4" = { name = "sub_82D91FA4" }  # TU1 vtable-scan auto
+"0x82D92068" = { name = "sub_82D92068" }  # TU1 vtable-scan auto
+"0x82D9206C" = { name = "sub_82D9206C" }  # TU1 vtable-scan auto
+"0x82D9207C" = { name = "sub_82D9207C" }  # TU1 vtable-scan auto
+"0x82D9215C" = { name = "sub_82D9215C" }  # TU1 vtable-scan auto
+"0x82D9219C" = { name = "sub_82D9219C" }  # TU1 vtable-scan auto
+"0x82D921AC" = { name = "sub_82D921AC" }  # TU1 vtable-scan auto
+"0x82D9221C" = { name = "sub_82D9221C" }  # TU1 vtable-scan auto
+"0x82D9243C" = { name = "sub_82D9243C" }  # TU1 vtable-scan auto
+"0x82D92690" = { name = "sub_82D92690" }  # TU1 vtable-scan auto
+"0x82D927A8" = { name = "sub_82D927A8" }  # TU1 vtable-scan auto
+"0x82D927B8" = { name = "sub_82D927B8" }  # TU1 vtable-scan auto
+"0x82D92FC0" = { name = "sub_82D92FC0" }  # TU1 vtable-scan auto
+"0x82D9A7F0" = { name = "sub_82D9A7F0" }  # TU1 vtable-scan auto
+"0x82D9A808" = { name = "sub_82D9A808" }  # TU1 vtable-scan auto
+"0x82D9A828" = { name = "sub_82D9A828" }  # TU1 vtable-scan auto
+"0x82D9A9B8" = { name = "sub_82D9A9B8" }  # TU1 vtable-scan auto
+"0x82D9A9D8" = { name = "sub_82D9A9D8" }  # TU1 vtable-scan auto
+"0x82D9A9F8" = { name = "sub_82D9A9F8" }  # TU1 vtable-scan auto
+"0x82D9AA18" = { name = "sub_82D9AA18" }  # TU1 vtable-scan auto
+"0x82D9AA38" = { name = "sub_82D9AA38" }  # TU1 vtable-scan auto
+"0x82D9AA58" = { name = "sub_82D9AA58" }  # TU1 vtable-scan auto
+"0x82D9AA78" = { name = "sub_82D9AA78" }  # TU1 vtable-scan auto
+"0x82D9AA98" = { name = "sub_82D9AA98" }  # TU1 vtable-scan auto
+"0x82D9AAB8" = { name = "sub_82D9AAB8" }  # TU1 vtable-scan auto
+"0x82D9AAD8" = { name = "sub_82D9AAD8" }  # TU1 vtable-scan auto
+"0x82DA1AD8" = { name = "sub_82DA1AD8" }  # TU1 vtable-scan auto
+"0x82DABA34" = { name = "sub_82DABA34" }  # TU1 vtable-scan auto
+"0x82DABA50" = { name = "sub_82DABA50" }  # TU1 vtable-scan auto
+"0x82E7CC88" = { name = "sub_82E7CC88" }  # TU1 vtable-scan auto
+"0x82E7CCA0" = { name = "sub_82E7CCA0" }  # TU1 vtable-scan auto
+"0x82E92970" = { name = "sub_82E92970" }  # TU1 vtable-scan auto
+"0x82E92990" = { name = "sub_82E92990" }  # TU1 vtable-scan auto
+"0x82E929D8" = { name = "sub_82E929D8" }  # TU1 vtable-scan auto
+"0x82E929F8" = { name = "sub_82E929F8" }  # TU1 vtable-scan auto
+"0x82E9C550" = { name = "sub_82E9C550" }  # TU1 vtable-scan auto
+"0x82EA4868" = { name = "sub_82EA4868" }  # TU1 vtable-scan auto
+"0x82EB61E8" = { name = "sub_82EB61E8" }  # TU1 vtable-scan auto
+"0x82EB6200" = { name = "sub_82EB6200" }  # TU1 vtable-scan auto
+"0x82EB6218" = { name = "sub_82EB6218" }  # TU1 vtable-scan auto
+"0x82EB6230" = { name = "sub_82EB6230" }  # TU1 vtable-scan auto
+"0x82EB6248" = { name = "sub_82EB6248" }  # TU1 vtable-scan auto
+"0x82EB6260" = { name = "sub_82EB6260" }  # TU1 vtable-scan auto
+"0x82EB6278" = { name = "sub_82EB6278" }  # TU1 vtable-scan auto
+"0x82EB6290" = { name = "sub_82EB6290" }  # TU1 vtable-scan auto
+"0x82ED6480" = { name = "sub_82ED6480" }  # TU1 vtable-scan auto
+"0x82ED99A0" = { name = "sub_82ED99A0" }  # TU1 vtable-scan auto
+"0x82F0C588" = { name = "sub_82F0C588" }  # TU1 vtable-scan auto
+"0x82F1AB40" = { name = "sub_82F1AB40" }  # TU1 vtable-scan auto
+"0x82F1AC00" = { name = "sub_82F1AC00" }  # TU1 vtable-scan auto
+"0x82F1AC18" = { name = "sub_82F1AC18" }  # TU1 vtable-scan auto
+"0x82F3A978" = { name = "sub_82F3A978" }  # TU1 vtable-scan auto
+"0x82F3A9B0" = { name = "sub_82F3A9B0" }  # TU1 vtable-scan auto
+"0x82F3AA10" = { name = "sub_82F3AA10" }  # TU1 vtable-scan auto
+"0x82F48268" = { name = "sub_82F48268" }  # TU1 vtable-scan auto
+"0x82F789B8" = { name = "sub_82F789B8" }  # TU1 vtable-scan auto
+"0x82F89070" = { name = "sub_82F89070" }  # TU1 vtable-scan auto
+"0x82F893E8" = { name = "sub_82F893E8" }  # TU1 vtable-scan auto
+"0x82FE6204" = { name = "sub_82FE6204" }  # TU1 vtable-scan auto
+"0x82FE62B4" = { name = "sub_82FE62B4" }  # TU1 vtable-scan auto
+"0x82FE68A4" = { name = "sub_82FE68A4" }  # TU1 vtable-scan auto
+"0x82FE68F4" = { name = "sub_82FE68F4" }  # TU1 vtable-scan auto
+"0x82FE6AA8" = { name = "sub_82FE6AA8" }  # TU1 vtable-scan auto
+"0x82FE6AB4" = { name = "sub_82FE6AB4" }  # TU1 vtable-scan auto
+"0x82FE6DF8" = { name = "sub_82FE6DF8" }  # TU1 vtable-scan auto
+"0x82FE6E10" = { name = "sub_82FE6E10" }  # TU1 vtable-scan auto
+"0x82FE8FA0" = { name = "sub_82FE8FA0" }  # TU1 vtable-scan auto
+"0x82FE8FF4" = { name = "sub_82FE8FF4" }  # TU1 vtable-scan auto
+"0x82FE9054" = { name = "sub_82FE9054" }  # TU1 vtable-scan auto
+"0x82FE906C" = { name = "sub_82FE906C" }  # TU1 vtable-scan auto
+"0x82FE91B0" = { name = "sub_82FE91B0" }  # TU1 vtable-scan auto
+"0x82FE91BC" = { name = "sub_82FE91BC" }  # TU1 vtable-scan auto
+"0x82FE96BC" = { name = "sub_82FE96BC" }  # TU1 vtable-scan auto
+"0x82FE96D8" = { name = "sub_82FE96D8" }  # TU1 vtable-scan auto
+"0x82FE97EC" = { name = "sub_82FE97EC" }  # TU1 vtable-scan auto
+"0x82FE98E0" = { name = "sub_82FE98E0" }  # TU1 vtable-scan auto
+"0x82FE9C98" = { name = "sub_82FE9C98" }  # TU1 vtable-scan auto
+"0x82FE9CA4" = { name = "sub_82FE9CA4" }  # TU1 vtable-scan auto
+"0x82FE9E60" = { name = "sub_82FE9E60" }  # TU1 vtable-scan auto
+"0x82FE9E74" = { name = "sub_82FE9E74" }  # TU1 vtable-scan auto
+"0x82FEA35C" = { name = "sub_82FEA35C" }  # TU1 vtable-scan auto
+"0x82FEA49C" = { name = "sub_82FEA49C" }  # TU1 vtable-scan auto
+"0x82FEB764" = { name = "sub_82FEB764" }  # TU1 vtable-scan auto
+"0x82FEB7A4" = { name = "sub_82FEB7A4" }  # TU1 vtable-scan auto
+"0x82FECC64" = { name = "sub_82FECC64" }  # TU1 vtable-scan auto
+"0x82FECCFC" = { name = "sub_82FECCFC" }  # TU1 vtable-scan auto
+"0x82FECDDC" = { name = "sub_82FECDDC" }  # TU1 vtable-scan auto
+"0x82FECE2C" = { name = "sub_82FECE2C" }  # TU1 vtable-scan auto
+"0x82FED9F4" = { name = "sub_82FED9F4" }  # TU1 vtable-scan auto
+"0x82FEDBF0" = { name = "sub_82FEDBF0" }  # TU1 vtable-scan auto
+"0x82FEF1E8" = { name = "sub_82FEF1E8" }  # TU1 vtable-scan auto
+"0x82FEF2FC" = { name = "sub_82FEF2FC" }  # TU1 vtable-scan auto
+"0x82FF0F60" = { name = "sub_82FF0F60" }  # TU1 vtable-scan auto
+"0x82FF10AC" = { name = "sub_82FF10AC" }  # TU1 vtable-scan auto
+"0x82FF12B8" = { name = "sub_82FF12B8" }  # TU1 vtable-scan auto
+"0x82FF12F0" = { name = "sub_82FF12F0" }  # TU1 vtable-scan auto
+"0x82FF1710" = { name = "sub_82FF1710" }  # TU1 vtable-scan auto
+"0x82FF175C" = { name = "sub_82FF175C" }  # TU1 vtable-scan auto
+"0x82FF2D08" = { name = "sub_82FF2D08" }  # TU1 vtable-scan auto
+"0x82FF2D68" = { name = "sub_82FF2D68" }  # TU1 vtable-scan auto
+"0x82FF2E88" = { name = "sub_82FF2E88" }  # TU1 vtable-scan auto
+"0x82FF2E94" = { name = "sub_82FF2E94" }  # TU1 vtable-scan auto
+"0x82FF2EA4" = { name = "sub_82FF2EA4" }  # TU1 vtable-scan auto
+"0x82FF3018" = { name = "sub_82FF3018" }  # TU1 vtable-scan auto
+"0x82FF3064" = { name = "sub_82FF3064" }  # TU1 vtable-scan auto
+"0x82FF39E8" = { name = "sub_82FF39E8" }  # TU1 vtable-scan auto
+"0x82FF3A30" = { name = "sub_82FF3A30" }  # TU1 vtable-scan auto
+"0x82FF3E28" = { name = "sub_82FF3E28" }  # TU1 vtable-scan auto
+"0x82FF3E74" = { name = "sub_82FF3E74" }  # TU1 vtable-scan auto
+"0x82FF4AAC" = { name = "sub_82FF4AAC" }  # TU1 vtable-scan auto
+"0x82FF4B30" = { name = "sub_82FF4B30" }  # TU1 vtable-scan auto
+"0x82FF766C" = { name = "sub_82FF766C" }  # TU1 vtable-scan auto
+"0x82FF77D0" = { name = "sub_82FF77D0" }  # TU1 vtable-scan auto
+"0x82FF7D9C" = { name = "sub_82FF7D9C" }  # TU1 vtable-scan auto
+"0x82FF7DB8" = { name = "sub_82FF7DB8" }  # TU1 vtable-scan auto
+"0x82FF7E30" = { name = "sub_82FF7E30" }  # TU1 vtable-scan auto
+"0x82FF7E3C" = { name = "sub_82FF7E3C" }  # TU1 vtable-scan auto
+"0x82FF940C" = { name = "sub_82FF940C" }  # TU1 vtable-scan auto
+"0x82FF9460" = { name = "sub_82FF9460" }  # TU1 vtable-scan auto
+"0x82FF9494" = { name = "sub_82FF9494" }  # TU1 vtable-scan auto
+"0x82FF94AC" = { name = "sub_82FF94AC" }  # TU1 vtable-scan auto
+"0x82FF9BB0" = { name = "sub_82FF9BB0" }  # TU1 vtable-scan auto
+"0x82FF9BD0" = { name = "sub_82FF9BD0" }  # TU1 vtable-scan auto
+"0x82FF9D08" = { name = "sub_82FF9D08" }  # TU1 vtable-scan auto
+"0x82FF9D64" = { name = "sub_82FF9D64" }  # TU1 vtable-scan auto
+"0x82FF9F54" = { name = "sub_82FF9F54" }  # TU1 vtable-scan auto
+"0x82FF9FE4" = { name = "sub_82FF9FE4" }  # TU1 vtable-scan auto
+"0x82FFA0F4" = { name = "sub_82FFA0F4" }  # TU1 vtable-scan auto
+"0x82FFA0FC" = { name = "sub_82FFA0FC" }  # TU1 vtable-scan auto
+"0x82FFA108" = { name = "sub_82FFA108" }  # TU1 vtable-scan auto
+"0x82FFB490" = { name = "sub_82FFB490" }  # TU1 vtable-scan auto
+"0x82FFB4D8" = { name = "sub_82FFB4D8" }  # TU1 vtable-scan auto
+"0x82FFB904" = { name = "sub_82FFB904" }  # TU1 vtable-scan auto
+"0x82FFB938" = { name = "sub_82FFB938" }  # TU1 vtable-scan auto
+"0x82FFBA24" = { name = "sub_82FFBA24" }  # TU1 vtable-scan auto
+"0x82FFBA8C" = { name = "sub_82FFBA8C" }  # TU1 vtable-scan auto
+"0x82FFBAC0" = { name = "sub_82FFBAC0" }  # TU1 vtable-scan auto
+"0x82FFBBE0" = { name = "sub_82FFBBE0" }  # TU1 vtable-scan auto
+"0x82FFD370" = { name = "sub_82FFD370" }  # TU1 vtable-scan auto
+"0x82FFD390" = { name = "sub_82FFD390" }  # TU1 vtable-scan auto
+"0x82FFD694" = { name = "sub_82FFD694" }  # TU1 vtable-scan auto
+"0x82FFD6A4" = { name = "sub_82FFD6A4" }  # TU1 vtable-scan auto
+"0x830095B4" = { name = "sub_830095B4" }  # TU1 vtable-scan auto
+"0x83009740" = { name = "sub_83009740" }  # TU1 vtable-scan auto
+"0x8300974C" = { name = "sub_8300974C" }  # TU1 vtable-scan auto
+"0x8300B4E0" = { name = "sub_8300B4E0" }  # TU1 vtable-scan auto
+"0x8300B500" = { name = "sub_8300B500" }  # TU1 vtable-scan auto
+"0x8300B510" = { name = "sub_8300B510" }  # TU1 vtable-scan auto
+"0x8300BAE0" = { name = "sub_8300BAE0" }  # TU1 vtable-scan auto
+"0x8300C2B0" = { name = "sub_8300C2B0" }  # TU1 vtable-scan auto
+"0x8300C3C4" = { name = "sub_8300C3C4" }  # TU1 vtable-scan auto
+"0x8300C5A4" = { name = "sub_8300C5A4" }  # TU1 vtable-scan auto
+"0x8300C72C" = { name = "sub_8300C72C" }  # TU1 vtable-scan auto
+"0x8300C754" = { name = "sub_8300C754" }  # TU1 vtable-scan auto
+"0x8300CCB4" = { name = "sub_8300CCB4" }  # TU1 vtable-scan auto
+"0x8300CCD4" = { name = "sub_8300CCD4" }  # TU1 vtable-scan auto
+"0x8300CCE4" = { name = "sub_8300CCE4" }  # TU1 vtable-scan auto
+"0x8300CE4C" = { name = "sub_8300CE4C" }  # TU1 vtable-scan auto
+"0x8300CE5C" = { name = "sub_8300CE5C" }  # TU1 vtable-scan auto
+"0x8300CE68" = { name = "sub_8300CE68" }  # TU1 vtable-scan auto
+"0x83017A80" = { name = "sub_83017A80" }  # TU1 vtable-scan auto
+"0x83017AA0" = { name = "sub_83017AA0" }  # TU1 vtable-scan auto
+"0x83017AAC" = { name = "sub_83017AAC" }  # TU1 vtable-scan auto
+"0x83024598" = { name = "sub_83024598" }  # TU1 vtable-scan auto
+"0x830246F8" = { name = "sub_830246F8" }  # TU1 vtable-scan auto
+"0x83024790" = { name = "sub_83024790" }  # TU1 vtable-scan auto
+"0x830523C8" = { name = "sub_830523C8" }  # TU1 vtable-scan auto
+"0x830523E8" = { name = "sub_830523E8" }  # TU1 vtable-scan auto
+"0x83086BF8" = { name = "sub_83086BF8" }  # TU1 vtable-scan auto
+"0x83086C58" = { name = "sub_83086C58" }  # TU1 vtable-scan auto
+"0x83086C88" = { name = "sub_83086C88" }  # TU1 vtable-scan auto
+"0x83086CD8" = { name = "sub_83086CD8" }  # TU1 vtable-scan auto
+"0x83086CE0" = { name = "sub_83086CE0" }  # TU1 vtable-scan auto
+"0x83086CE8" = { name = "sub_83086CE8" }  # TU1 vtable-scan auto
+"0x83086CF0" = { name = "sub_83086CF0" }  # TU1 vtable-scan auto
+"0x83086D00" = { name = "sub_83086D00" }  # TU1 vtable-scan auto
+"0x83086D10" = { name = "sub_83086D10" }  # TU1 vtable-scan auto
+"0x83086D20" = { name = "sub_83086D20" }  # TU1 vtable-scan auto
+"0x83086D30" = { name = "sub_83086D30" }  # TU1 vtable-scan auto
+"0x83086D40" = { name = "sub_83086D40" }  # TU1 vtable-scan auto
+"0x83086D50" = { name = "sub_83086D50" }  # TU1 vtable-scan auto
+"0x83086D60" = { name = "sub_83086D60" }  # TU1 vtable-scan auto
+"0x83086D70" = { name = "sub_83086D70" }  # TU1 vtable-scan auto
+"0x83086DB0" = { name = "sub_83086DB0" }  # TU1 vtable-scan auto
+"0x83086DB8" = { name = "sub_83086DB8" }  # TU1 vtable-scan auto
+"0x83086DC0" = { name = "sub_83086DC0" }  # TU1 vtable-scan auto
+"0x83086DC8" = { name = "sub_83086DC8" }  # TU1 vtable-scan auto
+"0x83086DF0" = { name = "sub_83086DF0" }  # TU1 vtable-scan auto
+"0x83086E40" = { name = "sub_83086E40" }  # TU1 vtable-scan auto
+"0x83086E58" = { name = "sub_83086E58" }  # TU1 vtable-scan auto
+"0x83086E90" = { name = "sub_83086E90" }  # TU1 vtable-scan auto
+"0x83086EC0" = { name = "sub_83086EC0" }  # TU1 vtable-scan auto
+"0x83086ED8" = { name = "sub_83086ED8" }  # TU1 vtable-scan auto
+"0x83086EF0" = { name = "sub_83086EF0" }  # TU1 vtable-scan auto
+"0x83086F28" = { name = "sub_83086F28" }  # TU1 vtable-scan auto
+"0x83086F40" = { name = "sub_83086F40" }  # TU1 vtable-scan auto
+"0x83086FF0" = { name = "sub_83086FF0" }  # TU1 vtable-scan auto
+"0x830C6370" = { name = "sub_830C6370" }  # TU1 vtable-scan auto
+"0x830CBDE8" = { name = "sub_830CBDE8" }  # TU1 vtable-scan auto
+"0x83110E98" = { name = "sub_83110E98" }  # TU1 vtable-scan auto
+"0x83114A98" = { name = "sub_83114A98" }  # TU1 vtable-scan auto
+"0x83116338" = { name = "sub_83116338" }  # TU1 vtable-scan auto
+"0x83117828" = { name = "sub_83117828" }  # TU1 vtable-scan auto
+"0x83118528" = { name = "sub_83118528" }  # TU1 vtable-scan auto
+"0x831193F0" = { name = "sub_831193F0" }  # TU1 vtable-scan auto
+"0x8311A580" = { name = "sub_8311A580" }  # TU1 vtable-scan auto
+"0x8311C6A0" = { name = "sub_8311C6A0" }  # TU1 vtable-scan auto
+"0x8311D468" = { name = "sub_8311D468" }  # TU1 vtable-scan auto
+"0x8311FF80" = { name = "sub_8311FF80" }  # TU1 vtable-scan auto
+"0x8312B660" = { name = "sub_8312B660" }  # TU1 vtable-scan auto
+"0x8312BCA8" = { name = "sub_8312BCA8" }  # TU1 vtable-scan auto
+"0x8314B8F0" = { name = "sub_8314B8F0" }  # TU1 vtable-scan auto
+"0x8314B8F8" = { name = "sub_8314B8F8" }  # TU1 vtable-scan auto
+"0x8314B900" = { name = "sub_8314B900" }  # TU1 vtable-scan auto
+"0x8314BDC0" = { name = "sub_8314BDC0" }  # TU1 vtable-scan auto
+"0x8314BDD8" = { name = "sub_8314BDD8" }  # TU1 vtable-scan auto
+"0x8314BDF0" = { name = "sub_8314BDF0" }  # TU1 vtable-scan auto
+"0x8314BE08" = { name = "sub_8314BE08" }  # TU1 vtable-scan auto
+"0x8314BE20" = { name = "sub_8314BE20" }  # TU1 vtable-scan auto
+"0x8314E160" = { name = "sub_8314E160" }  # TU1 vtable-scan auto
+"0x8316B6F8" = { name = "sub_8316B6F8" }  # TU1 vtable-scan auto
+"0x83175038" = { name = "sub_83175038" }  # TU1 vtable-scan auto
+"0x83176EB8" = { name = "sub_83176EB8" }  # TU1 vtable-scan auto
+"0x83188F90" = { name = "sub_83188F90" }  # TU1 vtable-scan auto
+"0x83196938" = { name = "sub_83196938" }  # TU1 vtable-scan auto
+"0x83198BA0" = { name = "sub_83198BA0" }  # TU1 vtable-scan auto
+"0x83198C00" = { name = "sub_83198C00" }  # TU1 vtable-scan auto
+"0x8319C260" = { name = "sub_8319C260" }  # TU1 vtable-scan auto
+"0x831A0788" = { name = "sub_831A0788" }  # TU1 vtable-scan auto
+"0x831A07A8" = { name = "sub_831A07A8" }  # TU1 vtable-scan auto
+"0x831A08F0" = { name = "sub_831A08F0" }  # TU1 vtable-scan auto
+"0x831A0920" = { name = "sub_831A0920" }  # TU1 vtable-scan auto
+"0x831A0950" = { name = "sub_831A0950" }  # TU1 vtable-scan auto
+"0x831C9CF8" = { name = "sub_831C9CF8" }  # TU1 vtable-scan auto
+"0x831F1810" = { name = "sub_831F1810" }  # TU1 vtable-scan auto
+"0x831F8958" = { name = "sub_831F8958" }  # TU1 vtable-scan auto
+"0x831F8960" = { name = "sub_831F8960" }  # TU1 vtable-scan auto
+"0x831F8968" = { name = "sub_831F8968" }  # TU1 vtable-scan auto
 
 [[switch]]
 base = 0x82D12BE4
@@ -829,11 +1203,3 @@ labels = [
 ]
 # table=0x82081A28 base_ref=0x8304B7CC type=u8 scale=4 size=59
 
-# Summary: 32 total, 32 parsed, 0 errors
-
-
-# so codegen's GapFill rediscovers 0x8232E068 as a separate leaf function.
-
-# Shrink parent + register new function (two-entry split for crash addr)
-"0x8232E038" = { end = 0x8232E068 }
-"0x8232E068" = { name = "sub_8232E068", end = 0x8232E080 }

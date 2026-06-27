@@ -2,11 +2,17 @@
 
 [project]
 name = "downpour"
-sdk_version = "0.8.1.7"
+sdk_version = "0.8.2.19"
 game_root = "assets"
 
 [entrypoint]
-file_path = "assets/default.xex"
+# TU1 build: codegen runs against the merged TU1 XEX.
+# `default.tu1.xex` was produced offline by `xex_merge.exe` (a stripped-down
+# build of XenonRecomp's XexPatcher); see project_downpour_tu1_migration.md.
+# Base `default.xex` (hash 7A3D5809776EE6AB) is kept in assets/ for reference
+# and for the runtime installer wizard's payload verification.
+file_path = "assets/default.tu1.xex"
+patched_file_path = "assets/default.tu1.xex"
 out_directory_path = "generated/default"
 includes = [
   "downpour_config.toml",

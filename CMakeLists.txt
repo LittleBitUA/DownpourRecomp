@@ -13,6 +13,7 @@ include(generated/rexglue.cmake)
 # Sources
 set(DOWNPOUR_SOURCES
     src/main.cpp
+    src/downpour_title_update_installer.cpp
 )
 
 if(WIN32)
@@ -22,3 +23,10 @@ else()
 endif()
 
 rexglue_setup_target(downpour)
+
+# Title-update installer wizard needs WinHTTP (download) and Common Dialogs
+# (file picker) on Windows. On other platforms the installer uses curl and
+# GTK, which the SDK already wires up.
+if(WIN32)
+    target_link_libraries(downpour PRIVATE winhttp comdlg32)
+endif()

@@ -774,6 +774,46 @@ void ShowTitleUpdateInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig 
       drawer, std::move(options), std::move(fetch), []() { return PickTitleUpdateFile(); },
       std::move(install),
       [runtime_paths = std::move(runtime_paths), complete = std::move(complete)]() mutable {
+        // After staging TU1 we used to call the SDK's resume callback,
+        // which deferred ConstructRuntime + LaunchModule onto the next UI
+        // tick (rex::ui::WindowedAppContext::CallInUIThreadDeferred).
+        // In practice that path still hung on Win32 — UE3's main loop
+        // never yields back to the swapchain thread cleanly when
+        // LaunchModule is called inline. Simpler and more reliable:
+        // restart the process. The fresh launch sees TU1 already
+        // installed (IsTitleUpdateInstalled == true), skips the wizard,
+        // and boots straight into the game.
+        //
+        // We still keep `complete` and `runtime_paths` captured so the
+        // non-Windows fallback below has a chance to work the old way.
+#if defined(_WIN32)
+        wchar_t exe_path[MAX_PATH];
+        DWORD len = GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+        if (len > 0 && len < MAX_PATH) {
+          // Reuse our current command line verbatim so any --flags
+          // (game_data_root override, dev cvars, etc.) survive.
+          std::wstring cmd = GetCommandLineW();
+          // CreateProcessW needs a mutable buffer for lpCommandLine.
+          std::vector<wchar_t> cmd_buf(cmd.begin(), cmd.end());
+          cmd_buf.push_back(L'\0');
+          STARTUPINFOW si{};
+          si.cb = sizeof(si);
+          PROCESS_INFORMATION pi{};
+          if (CreateProcessW(exe_path, cmd_buf.data(), nullptr, nullptr, FALSE,
+                             0, nullptr, nullptr, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            REXLOG_INFO(
+                "Title update installed; restarting downpour.exe to pick up "
+                "the freshly-staged payload. Process exits now.");
+            ExitProcess(0);
+          }
+          REXLOG_ERROR(
+              "Failed to spawn fresh downpour.exe after TU install (Win32 "
+              "error {}); falling back to inline resume callback.",
+              GetLastError());
+        }
+#endif
         if (complete) {
           complete(std::move(runtime_paths));
         }

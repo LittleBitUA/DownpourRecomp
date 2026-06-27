@@ -18,6 +18,13 @@
 
 ---
 
+> [!IMPORTANT]
+> **v0.1.1 is an early preview — v1.0 is coming with major fixes.** If you're new here, consider waiting for the v1.0 release before you start playing. The rough edges in v0.1.1 (performance hitches, first-run flow) are already addressed on the development branch and will ship together as v1.0.
+>
+> Thank you for the strong community interest, testing, and feedback over the past weeks — it's directly shaping what lands in v1.0.
+
+---
+
 ## Table of contents
 
 - [What is this?](#what-is-this)

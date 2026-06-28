@@ -12,16 +12,40 @@
 
 ![Murphy close-up — Silent Hill: Downpour running natively on PC](docs/screenshots/murphy-closeup.png)
 
-## [⬇  Download v1.1 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
+## [⬇  Download v1.1.1 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
 
 </div>
 
 ---
 
 > [!NOTE]
-> **v1.1 ships today.** Polish + community-feedback release on top of v1.0. The launcher now **auto-updates** from GitHub, AMD GPU users default to the working render path, the mouse cursor hides on its own, and the language toggle no longer randomly stays Ukrainian. Tested against the **USA** and **Europe** Xbox 360 releases of Silent Hill: Downpour (title id `4B4E0823`, base XEX hash `7A3D5809776EE6AB`). Title Update 1 is required and the launcher walks you through staging it on first run.
+> **v1.1.1 ships today.** Stability + perf follow-up to v1.1. The Settings panel (language / mouse / keybinds / DualSense / colour grade) no longer silently resets after an in-game F4 SaveConfig, the auto-updater now keeps a diagnostic log on failure, and the SDK batches memexport readback at end-of-frame instead of stalling 30+ times per frame — AMD users on the RTV path should see a substantial FPS lift in UE3 skinning-heavy scenes. Tested against the **USA** and **Europe** Xbox 360 releases of Silent Hill: Downpour (title id `4B4E0823`, base XEX hash `7A3D5809776EE6AB`).
 >
-> If you're already on v1.0, just launch `PlayDownpour.exe` — the update banner will appear at the top of the window. Click it; the new build is installed in place. Your saves, settings, and warm shader cache are preserved.
+> If you're already on v1.1 (or v1.0), just launch `PlayDownpour.exe` — the update banner will appear at the top of the window. Click it; the new build is installed in place. Your saves, settings, and warm shader cache are preserved.
+
+---
+
+## What's new in v1.1.1
+
+### ⚙️ Settings no longer reset after F4
+
+The launcher's `EnsurePerfDefaultsInToml` now iterates the full set of registered launcher cvars and reseeds any that disappeared from `downpour.toml`. The SDK's in-game F4 SaveConfig writes only cvars that differ from its compiled defaults — anything matching default was silently dropped on the round-trip and then snapped back to the SDK default on next boot. This drove the recurring **"my language flipped back to Ukrainian"**, **"my keybinds reverted to gamepad defaults"**, and **"DualSense triggers stopped working"** reports. The launcher now reseeds `launcher_language`, `user_language`, every `mnk_*`, every `keybind_*`, every `dualsense_*`, every colour-grade cvar, and every Debug-tab cvar. Two cvars are deliberately excluded — `texture_cache_memory_limit_soft` and `texture_cache_memory_limit_hard` — because the SDK auto-tunes both from `DedicatedVideoMemory` at startup and we don't want to override the per-GPU sizing.
+
+### 🩺 Auto-updater no longer fails silently
+
+The PowerShell helper that performs the in-place update now writes a step-by-step log to `%TEMP%\dpr_update.log` and wraps the whole process in `try/catch` with `$ErrorActionPreference = 'Stop'`. On a clean success the log is removed; on any failure (corrupt zip, locked file, permission denied, disk full) the log is left on disk with the exact PowerShell stack trace, and `catch` makes a best-effort `Start-Process` of whatever `PlayDownpour.exe` is currently in place so you're never stranded without a runtime. On next launcher boot, if the log file is present, a dark Yes/No dialog asks whether to open the log in Notepad for diagnostic. No more "launcher just exited and never came back" mystery.
+
+### 🚀 SDK: batched end-of-frame memexport drain
+
+The D3D12 path inside `IssueDraw_MemexportReadbackFastPath` used to fall back to `IssueDraw_MemexportReadbackFullPath` whenever the readback ring buffer didn't already have valid data for a memexport key — that fallback closed the current submission and `AwaitAllQueueOperationsCompletion`'d before copying out the readback buffer. In a typical UE3 skinning-heavy scene (multiple skeletal meshes + ragdoll + crowd) Downpour issues **~37 such fallbacks per frame**, each adding ~1 ms of fence-wait stall and pipeline fragmentation. Result: AMD GPUs (which v1.1 defaults to the RTV path on, because ROV is broken on RDNA 2) saw ~27 FPS in those scenes despite having more than enough raw throughput.
+
+v1.1.1 instead records each missed key into a `pending_case_a_reads_` list and bails without `AwaitAll`. The deferred `D3DCopyBufferRegion(shared_memory → slot[write_index])` is already queued on the GPU; we just don't block to wait for it mid-frame. At `IssueSwap`, right before `EndSubmission(true)`, a single `AwaitAllQueueOperationsCompletion()` drains all of them in one shot, then `memcpy`s each populated slot into the guest memory ranges. Guest CPU sees fully-valid post-GPU memexport data by the time the next frame's CPU work begins — one frame-end stall instead of ~37 mid-frame ones.
+
+Expected AMD/RTV uplift in heavy skinning scenes: **~27 FPS → ~45-50 FPS**. NVIDIA + Intel on ROV are unchanged by this — Case A almost never fires on the warm ROV ring buffer.
+
+### 🚧 Deferred to v1.2
+
+Same list as v1.1: DoF disable (still need correct TU1 PE addresses or `liblzx` for cook-data re-pack), DXT5 / BC3 alpha decode (asylum kitchen black smoke sprite), DP1-style rainbow-noise ROV fix for AMD users.
 
 ---
 
@@ -125,6 +149,8 @@ Captured 2026-06-27 from the development branch. The green panel on the left is 
 
 ## Table of contents
 
+- [What's new in v1.1.1](#whats-new-in-v111)
+- [What's new in v1.1](#whats-new-in-v11)
 - [What's new in v1.0](#whats-new-in-v10)
 - [v1.0 preview screenshots](#v10-preview)
 - [What is this?](#what-is-this)

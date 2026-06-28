@@ -12,16 +12,42 @@
 
 ![Murphy close-up — Silent Hill: Downpour running natively on PC](docs/screenshots/murphy-closeup.png)
 
-## [⬇  Download v1.1.1 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
+## [⬇  Download v1.1.2 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
 
 </div>
 
 ---
 
 > [!NOTE]
-> **v1.1.1 ships today.** Stability + perf follow-up to v1.1. The Settings panel (language / mouse / keybinds / DualSense / colour grade) no longer silently resets after an in-game F4 SaveConfig, the auto-updater now keeps a diagnostic log on failure, and the SDK batches memexport readback at end-of-frame instead of stalling 30+ times per frame — AMD users on the RTV path should see a substantial FPS lift in UE3 skinning-heavy scenes. Tested against the **USA** and **Europe** Xbox 360 releases of Silent Hill: Downpour (title id `4B4E0823`, base XEX hash `7A3D5809776EE6AB`).
+> **v1.1.2 ships today.** Community-feedback follow-up: WM_INPUT raw-mouse plumbing in the SDK (mouselook now feels native, not stick-emulator-tier), VSync no longer silently overridden by the tearing swap-chain path on NVIDIA setups, and fresh installs on < 8 GiB VRAM GPUs default to 1x SSAA instead of 2x so RTX 3050 / Steam Deck / Iris Xe installs don't slideshow on first boot. Tested against the **USA** and **Europe** Xbox 360 releases of Silent Hill: Downpour (title id `4B4E0823`, base XEX hash `7A3D5809776EE6AB`).
 >
-> If you're already on v1.1 (or v1.0), just launch `PlayDownpour.exe` — the update banner will appear at the top of the window. Click it; the new build is installed in place. Your saves, settings, and warm shader cache are preserved.
+> If you're already on v1.1.x (or v1.0), just launch `PlayDownpour.exe` — the update banner will appear at the top of the window. Click it; the new build is installed in place. Your saves, settings, and warm shader cache are preserved.
+
+---
+
+## What's new in v1.1.2
+
+### 🖱️ Raw-mouse input
+
+The Win32Window in the SDK now calls `RegisterRawInputDevices` on startup and handles `WM_INPUT` raw-mouse messages. Gaming mice emit at ~1000 Hz with sub-pixel HID counts; the previous `WM_MOUSEMOVE` path delivered integer-pixel deltas at the monitor refresh rate, which made slow mouse motion feel like the right stick was being dragged through molasses with discrete jumps. The MnK driver now consumes raw deltas through a new `OnRawMouseInput` listener method and stops accumulating `WM_MOUSEMOVE` pixel deltas once raw has started arriving (avoids double-counting). Raw counts are pre-scaled by 8 to roughly match the magnitude of the previous pixel-delta stream, so `mnk_sensitivity` values tuned in v1.1.x still feel right.
+
+Defaults adjusted to match the smoother input source:
+- `mnk_smoothing`: 0.15 → 0.10 (less EMA lag on already-smooth raw input)
+- `mnk_decay`: 0.30 → 0.10 (sharper stop on input cessation)
+
+Existing users whose `downpour.toml` pins these values keep their settings. To pick up the new defaults: open the launcher → Settings → Mouse, manually set 0.10 / 0.10, save.
+
+### 🖥️ VSync no longer silently overridden
+
+`d3d12_allow_variable_refresh_rate_and_tearing` default flipped from `true` to `false`. Community report from a NVIDIA RTX 3050 user — `vsync = true` was silently ignored because the variable-refresh / tearing swap-chain path took precedence at present time. User had to engage VSync at the NVIDIA Control Panel level just to get tearless presentation. Trade-off: G-Sync / FreeSync users no longer get VRR pacing by default. They can flip it back via launcher Settings → Advanced or by setting `d3d12_allow_variable_refresh_rate_and_tearing = true` in `downpour.toml`.
+
+### 📉 Auto-tune of resolution scale for low-end GPUs
+
+The launcher now reads the primary GPU's `DedicatedVideoMemory` via DXGI. On GPUs with under 8 GiB (RTX 3050, GTX 1650, Steam Deck Van Gogh APU) or on Intel integrated graphics (Iris Xe / Arc Lite), fresh installs seed `resolution_scale = "1"` (native 1280×720) instead of the default `"2"` (2560×1440 SSAA). Discrete RTX 30xx 8GB+, RX 6700+, Arc A750+ users continue to get the sharper 2x default. v1.1.x upgraders keep their existing toml value either way.
+
+### 🚧 Deferred to v1.2
+
+Visual artifacts noted in community playtest (blue lights on foliage / barbed wire / transition-zone black-screen flashes / crash to desktop after first Screamer) all still tracked — most need RenderDoc captures from affected users to diagnose. DoF disable + DXT5/BC3 alpha + DP1 rainbow-noise ROV fix still in the v1.2 queue.
 
 ---
 
@@ -149,6 +175,7 @@ Captured 2026-06-27 from the development branch. The green panel on the left is 
 
 ## Table of contents
 
+- [What's new in v1.1.2](#whats-new-in-v112)
 - [What's new in v1.1.1](#whats-new-in-v111)
 - [What's new in v1.1](#whats-new-in-v11)
 - [What's new in v1.0](#whats-new-in-v10)

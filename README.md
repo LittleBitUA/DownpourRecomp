@@ -12,14 +12,18 @@
 
 ![Murphy close-up — Silent Hill: Downpour running natively on PC](docs/screenshots/murphy-closeup.png)
 
-## [⬇  Download v1.1.3 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
+## [⬇  Download v1.1.4 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
 
 </div>
 
 ---
 
 > [!NOTE]
-> **v1.1.3 ships today** as a mouse-calibration hotfix on v1.1.2. The hardcoded raw-input divider in v1.1.2 was too aggressive for default Windows pointer settings (pointer ballistics was inflating WM_MOUSEMOVE deltas more than expected). v1.1.3 exposes the magnitude as a tunable cvar `mnk_raw_input_scale` (default 0.5, surfaced in launcher Settings → Mouse) so each user can dial mouselook to their preferred feel.
+> **v1.1.4 ships today** as the real root-cause fix for the v1.1.2-era "mouse very slow" reports. The SDK had a hardcoded `kBaseScale = 1500` multiplier that combined with the raw-input scale to saturate the controller stick on sub-millimetre mouse motion — which is why setting `mnk_sensitivity` from 0.6 → 6.0 produced zero observable change (the stick was already capped at int16 max regardless). v1.1.4 replaces the constant with a new tunable cvar `mnk_stick_scale` (default `150`, 10× lower), and tunes `mnk_raw_input_scale` default `0.5 → 0.20` to compensate. Sensitivity finally does what users expect: 1mm of mouse = ~5% stick, 1cm = ~50%, 3cm+ = saturation.
+>
+> If you're already on v1.1.x: launch `PlayDownpour.exe` and click the pill banner — v1.1.4 installs in place. After upgrade, if you'd cranked Sensitivity high in v1.1.3 to compensate for the saturation, bring it back to 1.0-2.0 and dial Raw Input Scale to taste.
+>
+> **Previously: v1.1.3 ships today** as a mouse-calibration hotfix on v1.1.2. The hardcoded raw-input divider in v1.1.2 was too aggressive for default Windows pointer settings (pointer ballistics was inflating WM_MOUSEMOVE deltas more than expected). v1.1.3 exposes the magnitude as a tunable cvar `mnk_raw_input_scale` (default 0.5, surfaced in launcher Settings → Mouse) so each user can dial mouselook to their preferred feel.
 >
 > If you're already on v1.1.x, launch `PlayDownpour.exe` and click the pill banner — v1.1.3 installs in place. If mouselook still feels off after upgrading, open Settings → Mouse → "Raw Input Scale" and adjust (lower = slower, higher = faster).
 >
@@ -40,6 +44,45 @@
 > | 400 DPI office mouse | **1.50 – 3.00** |
 >
 > Other mouse knobs on the same tab — **Sensitivity**, **Smoothing**, **Stick Decay**, **Acceleration Curve**, **Deadzone Compensation**, **Invert Y** — also tune freely. Press *Save & Close* when you're happy with the feel. Settings persist across updates.
+
+---
+
+## What's new in v1.1.4
+
+### 🐭 Root-cause fix for "mouse very slow" — stick saturation
+
+v1.1.3 only fixed the surface symptom (calibration of raw HID counts → `mouse_dx_`). The actual root cause was deeper: a hardcoded `kBaseScale = 1500` multiplier inside [`mnk_input_driver.cpp`](https://github.com/LittleBitUA/rexglue-sdk-dpour/blob/dpour-main/src/input/mnk/mnk_input_driver.cpp). The right-stick value pipeline is:
+
+```
+stick_target = curved(mouse_dx_) × mnk_sensitivity × kBaseScale
+stick_target = clamp(stick_target, -32767, +32767)   ← int16 saturation
+```
+
+With `kBaseScale = 1500` and `mnk_raw_input_scale = 0.5`, even **1 mm of physical mouse motion at 1600 DPI** produced a `stick_target` of ~280,000 — saturated to 32,767 regardless. Multiplying by `mnk_sensitivity = 6.0` only made the pre-clamp value bigger; the post-clamp output was already capped. So community reports of "sensitivity 6.0 = no change" were accurate: sensitivity has no effect past saturation.
+
+The actual feel users were complaining about wasn't our pipeline — it was the **game's max-stick turn rate** under the saturated controller emulation. The game expects a slowly-tilted analog stick for camera fine-tuning, so even max stick deflection produces a relatively slow turn.
+
+### Fix
+
+`kBaseScale` is now the cvar **`mnk_stick_scale`** (default `150`, 10× lower than the v1.1.3 constant). The previous magnitude is reachable by users who want it (range 10 – 3000). Combined with the lower `mnk_raw_input_scale` default `0.20`:
+
+| Mouse motion (1600 DPI) | mouse_dx_ | stick (sens 0.6) | stick (sens 3.0) |
+|---|---|---|---|
+| 0.5 mm | 6 | 540 (1.6 %) | 2,700 (8 %) |
+| 1 mm | 13 | 1,170 (3.6 %) | 5,850 (18 %) |
+| 1 cm | 126 | 11,340 (35 %) | 56,700 → **saturated** |
+| 3 cm | 378 | 34,020 → **saturated** | saturated |
+| 5 cm | 630 | saturated | saturated |
+
+Sensitivity now controls slope from "twitchy" (3.0) to "deliberate" (0.6) for the same physical mouse range. The user's hardware DPI tunes via Raw Input Scale; the game's turn-rate-vs-stick-deflection curve tunes via Sensitivity.
+
+### Migration
+
+If you cranked `mnk_sensitivity` high in v1.1.3 to compensate for the saturation: bring it back down to 1.0-2.0 after upgrade. Open launcher → Settings → Mouse → set `Mouse Sensitivity = 1.0`, `Raw Input Scale = 0.20`, `Stick Scale = 150.0` (defaults), Save, relaunch. Tune from there.
+
+### WM_MOUSEMOVE fallback (Wine, VMs)
+
+Setups where `RegisterRawInputDevices` doesn't deliver `WM_INPUT` (some Wine prefixes, virtual machines, remote desktop) use the pixel-delta fallback path. Pixel deltas are smaller magnitude than raw HID counts, so the new `kBaseScale = 150` makes them feel slow. Fix: bump `Stick Scale` to 500-1500 in launcher Settings.
 
 ---
 
@@ -212,6 +255,7 @@ Captured 2026-06-27 from the development branch. The green panel on the left is 
 
 ## Table of contents
 
+- [What's new in v1.1.4](#whats-new-in-v114)
 - [What's new in v1.1.3](#whats-new-in-v113)
 - [What's new in v1.1.2](#whats-new-in-v112)
 - [What's new in v1.1.1](#whats-new-in-v111)

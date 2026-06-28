@@ -12,16 +12,50 @@
 
 ![Murphy close-up — Silent Hill: Downpour running natively on PC](docs/screenshots/murphy-closeup.png)
 
-## [⬇  Download v1.0 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
+## [⬇  Download v1.1 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
 
 </div>
 
 ---
 
 > [!NOTE]
-> **v1.0 ships today.** Tested against the **USA** and **Europe** Xbox 360 releases of Silent Hill: Downpour (title id `4B4E0823`, base XEX hash `7A3D5809776EE6AB`). Title Update 1 is required and the launcher walks you through staging it on first run.
+> **v1.1 ships today.** Polish + community-feedback release on top of v1.0. The launcher now **auto-updates** from GitHub, AMD GPU users default to the working render path, the mouse cursor hides on its own, and the language toggle no longer randomly stays Ukrainian. Tested against the **USA** and **Europe** Xbox 360 releases of Silent Hill: Downpour (title id `4B4E0823`, base XEX hash `7A3D5809776EE6AB`). Title Update 1 is required and the launcher walks you through staging it on first run.
 >
-> Massive thanks to everyone who tested v0.1.1 — every report, log, and screenshot fed directly into what shipped in v1.0.
+> If you're already on v1.0, just launch `PlayDownpour.exe` — the update banner will appear at the top of the window. Click it; the new build is installed in place. Your saves, settings, and warm shader cache are preserved.
+
+---
+
+## What's new in v1.1
+
+### 🆕 Auto-updates
+
+- **GitHub-driven in-place update.** On boot the launcher checks the releases endpoint; if a newer tag is available, a pill-shaped notification appears at the top of the window. Clicking it downloads the release zip with a live progress dialog, then a hidden PowerShell helper waits for the launcher to exit, copies the new binaries over the old install (preserving `assets/`, `user/`, `logs/`, `downpour.toml`, `downpour.toml.backup`, and `launcher.ini`), and relaunches `PlayDownpour.exe`. No installer wizard, no `chocolatey`, no Microsoft Store dependency.
+- **All the dialogs match the launcher theme** — dark grey background, Bahnschrift / Segoe UI text. No more bright-white Win32 MessageBoxes interrupting the title-screen mood.
+
+### 🛠️ Render-path fixes from community feedback
+
+- **AMD GPU vendor detection.** RDNA 2 (Steam Deck Van Gogh + RX 6000) and earlier AMD architectures produced unplayable rendering artifacts on the ROV pixel-shader path — multiple users reported single-digit FPS and full-screen colour garbage. v1.1's launcher reads the DXGI adapter vendor ID on first run and pins `render_target_path_d3d12 = "rtv"` automatically when the primary GPU is AMD. NVIDIA + Intel installs still default to ROV, which remains the warm-cache perf winner there.
+- The v1.0 toml's pinned `render_target_path_d3d12 = "rov"` has been removed from the shipped config so the vendor seed actually fires on fresh installs.
+
+### 🐛 Bug fixes
+
+- **Mouse cursor stuck on screen.** `mnk_capture_mouse` defaulted to `false` in the SDK, leaving the system cursor visible during gameplay until the user manually flipped it. Default is now `true` — captured and hidden as soon as `mnk_mode = true` and the window has focus.
+- **Launcher language: English-selected-but-Ukrainian-displayed.** The `LoadLauncherLanguageFromToml` path only stripped `"..."` quotes, not `'...'`, while the SDK's F4 SaveConfig writes single-quoted strings. After any F4 save the launcher couldn't parse its own `launcher_language` value, fell through to the legacy `launcher.lang` sidecar, and locked itself to Ukrainian if that legacy file existed. Both quote styles are now stripped (with a `while` loop so double-wrapped legacy values like `"'en'"` also unwrap cleanly).
+- **First-run button label.** Reads `UNPACK GAME` / `РОЗПАКУВАТИ ГРУ` until `assets/default.xex` exists; switches to `PLAY` once your ISO has been extracted. Width auto-adjusts.
+
+### 🧹 Configuration cleanup
+
+- `native_2x_msaa` is no longer seeded into fresh `downpour.toml` files. UE3's deferred light prepass on Xenon doesn't use guest MSAA, so the cvar only ever decided whether the host emulated MSAA via 2× MSAA or two samples of 4× MSAA — neither code path is reached for Downpour. Removed to stop confusing the cvar set with knobs that do nothing.
+
+### 📚 Documentation
+
+- `0xc0000142` ("The application was unable to start correctly") FAQ entry added — typically means the user is missing the [Microsoft Visual C++ Redistributable x64](https://aka.ms/vs/17/release/vc_redist.x64.exe). Direct link in README, plus secondary causes (Defender quarantine, non-ASCII install path, truncated download).
+
+### 🚧 Deferred to v1.1.x / v1.2
+
+- **DoF disable ("ефект скла").** A community contact identified two PowerPC addresses for the BlurKernelSize handler; v1.1 attempted to patch them, but they appear to be base-XEX offsets while our recomp generates from the TU1 PE — the same offsets in TU1 hit unrelated instructions. Reverted byte-perfect. Still tracked; once we can map base XEX ↔ TU1 addresses for that function the patch is a 2-line change.
+- **DXT5 / BC3 alpha decode bug** (asylum kitchen black smoke sprite). Forensic complete; ~1-day SDK fix scoped.
+- **DP1-style ROV rainbow-noise fix** for AMD users. Adding it would let AMD users enjoy ROV's perf advantage too. Lives on a parked `dp1-main` SDK fork and requires a new EDRAM-byte conversion compute shader (~4-5 h focused session).
 
 ---
 

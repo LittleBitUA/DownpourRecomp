@@ -12,7 +12,7 @@
 
 ![Murphy close-up — Silent Hill: Downpour running natively on PC](docs/screenshots/murphy-closeup.png)
 
-## [⬇  Download v1.1.4 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
+## [⬇  Download v1.1.5 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
 
 </div>
 

@@ -32,18 +32,60 @@
 > If you're already on v1.1.x (or v1.0), just launch `PlayDownpour.exe` — the update banner will appear at the top of the window. Click it; the new build is installed in place. Your saves, settings, and warm shader cache are preserved.
 
 > [!TIP]
-> **Mouse feels too slow or too fast? You can tune it.**
+> ## 🐭 Mouse tuning guide
 >
-> Open the launcher, click **Settings → Mouse**, and adjust **"Raw Input Scale"** (lower = slower, higher = faster). The default `0.5` is calibrated for ~1600 DPI gaming mice; users on other hardware should dial it in:
+> If mouselook feels too slow, too fast, jumpy, or laggy — **everything is user-tunable in the launcher**. Open `PlayDownpour.exe` → click **Settings** → **Mouse** tab.
 >
-> | Your mouse DPI | Try this scale |
+> ### What each field does
+>
+> | Field | What it controls | Sensible range |
+> |---|---|---|
+> | **Mouse Sensitivity** | Linear multiplier on turn rate | `0.6` (deliberate) – `3.0` (twitchy). Default `0.7`. |
+> | **Mouse Smoothing** | EMA filter — higher = smoother but laggier | `0.05` – `0.20`. Default `0.10`. |
+> | **Mouse Acceleration Curve** | `1.0` = linear. `>1.0` = small motions slow, fast flicks amplified | Default `1.0`. Try `1.3` – `1.8` if you want acceleration. |
+> | **Stick Decay (after stop)** | How fast the stick re-centres when the mouse stops | `0.05` – `0.20`. Default `0.10`. |
+> | **Deadzone Compensation** | Smooth ramp so tiny motions still cross the stick deadzone | Default `4000`. Don't usually need to touch. |
+> | **Invert Mouse Y** | — | Off by default. |
+> | **Raw Input Scale (mouse)** | Pre-multiplier on raw HID counts. **Calibrate to your mouse DPI.** | See DPI table below. Default `0.20`. |
+> | **Stick Scale (advanced)** | Mouse-to-stick base multiplier. Bump up if Wine / VM / RDP and `WM_INPUT` doesn't fire on your setup. | `150` (default) – `1500` (full bypass). |
+>
+> ### Raw Input Scale by mouse DPI (with default Stick Scale `150`)
+>
+> Most gaming mice ship at 1600 DPI from the box. Software like Logitech G HUB / Razer Synapse / SteelSeries Engine shows it under DPI / Sensitivity settings.
+>
+> | Your mouse DPI | Try this Raw Input Scale |
 > |---|---|
-> | 3200+ DPI gaming mouse | **0.20 – 0.35** |
-> | 1600 DPI gaming mouse | **0.40 – 0.65** (default region) |
-> | 800 DPI mouse | **0.70 – 1.20** |
-> | 400 DPI office mouse | **1.50 – 3.00** |
+> | 3200+ DPI gaming mouse | **0.08 – 0.15** |
+> | 1600 DPI gaming mouse | **0.15 – 0.30** (default region) |
+> | 800 DPI mouse | **0.30 – 0.60** |
+> | 400 DPI office mouse | **0.70 – 1.50** |
 >
-> Other mouse knobs on the same tab — **Sensitivity**, **Smoothing**, **Stick Decay**, **Acceleration Curve**, **Deadzone Compensation**, **Invert Y** — also tune freely. Press *Save & Close* when you're happy with the feel. Settings persist across updates.
+> ### Recommended tuning sequence
+>
+> 1. **Set Sensitivity to `1.0`** (start from a sane baseline).
+> 2. **Smoothing `0.10`, Stick Decay `0.10`** if you upgraded from v1.0 / v1.1 / v1.1.1 (those had `0.15` / `0.30` as defaults; the launcher preserves your existing values across upgrade).
+> 3. **Look up your mouse DPI and set Raw Input Scale from the table.**
+> 4. **Save & Close** → closes the launcher and writes to `downpour.toml`.
+> 5. Start the game. Walk into an open area. Sweep the camera.
+> 6. **Still too slow / fast?**
+>    - Slow: bump Sensitivity (`1.0 → 2.0 → 3.0`), or bump Raw Input Scale one notch up.
+>    - Too fast / twitchy: drop Sensitivity (`1.0 → 0.6`), or drop Raw Input Scale one notch down.
+> 7. **At max settings (Sensitivity 3.0 + high Raw Input Scale) and STILL too slow?** Bump **Stick Scale** from `150` to `300` / `500` / `1500`. Each doubling makes the whole pipeline twice as fast. This is also the lever for Wine / VM setups where `WM_INPUT` raw mouse isn't being delivered.
+>
+> ### Direct toml edit (alternative)
+>
+> If you'd rather skip the GUI, edit `downpour.toml` next to `PlayDownpour.exe` in any text editor. Example "fast and responsive" preset for a 1600 DPI mouse:
+>
+> ```toml
+> mnk_sensitivity = 2.0
+> mnk_smoothing = 0.08
+> mnk_decay = 0.08
+> mnk_acceleration_exponent = 1.2
+> mnk_raw_input_scale = 0.25
+> mnk_stick_scale = 200.0
+> ```
+>
+> Save the file, relaunch the game. All cvars hot-reload on next process start; the launcher's auto-seed system preserves your values across releases.
 
 ---
 

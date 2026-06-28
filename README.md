@@ -27,6 +27,20 @@
 >
 > If you're already on v1.1.x (or v1.0), just launch `PlayDownpour.exe` — the update banner will appear at the top of the window. Click it; the new build is installed in place. Your saves, settings, and warm shader cache are preserved.
 
+> [!TIP]
+> **Mouse feels too slow or too fast? You can tune it.**
+>
+> Open the launcher, click **Settings → Mouse**, and adjust **"Raw Input Scale"** (lower = slower, higher = faster). The default `0.5` is calibrated for ~1600 DPI gaming mice; users on other hardware should dial it in:
+>
+> | Your mouse DPI | Try this scale |
+> |---|---|
+> | 3200+ DPI gaming mouse | **0.20 – 0.35** |
+> | 1600 DPI gaming mouse | **0.40 – 0.65** (default region) |
+> | 800 DPI mouse | **0.70 – 1.20** |
+> | 400 DPI office mouse | **1.50 – 3.00** |
+>
+> Other mouse knobs on the same tab — **Sensitivity**, **Smoothing**, **Stick Decay**, **Acceleration Curve**, **Deadzone Compensation**, **Invert Y** — also tune freely. Press *Save & Close* when you're happy with the feel. Settings persist across updates.
+
 ---
 
 ## What's new in v1.1.3

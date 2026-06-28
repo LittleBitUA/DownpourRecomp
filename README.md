@@ -139,6 +139,35 @@ Option 3 is what this project exists to be.
 
 ---
 
+## How this was built — transparency note
+
+This project uses AI assistance (Claude Code) alongside hands-on reverse-engineering and engineering work. Some people have asked, fairly, where the line falls. The honest answer:
+
+**Hands-on work that drove every key decision:**
+
+- **Ghidra reverse-engineering** of the base X360 XEX and TU1 PE — chasing the depth-of-field "ефект скла" through `sub_829F2A78`, the `USE_DOF*` shader macros, the `bEnableDOF` UE3 FName, and finally 13 distinct `BlurKernelSize` byte offsets across `Engine.xxx` + `OurEngine.xxx`. Eleven different DoF-disable approaches were tried and individually verified; see [docs/v1.0-dof-investigation.md](docs/v1.0-dof-investigation.md) for the full forensic.
+- **RenderDoc captures and pixel-history bisection** — the backward trace from the chromatic-noise pixel through to the EID 9506 depth → 7e3 ownership-transfer ([docs/chromatic-noise-fix.md](docs/chromatic-noise-fix.md)), the EID 7117 DXT5/BC3 alpha-decode forensic localising SRVs [417] + [767] ([docs/v1.0-dxt5-alpha-bug.md](docs/v1.0-dxt5-alpha-bug.md)), the DP1 rainbow-noise step-through across EIDs 8378 → 8432 → 8448 → 8631 (in the companion DPRecomp).
+- **~55 instrumented playtest sessions** with frame-time logs analysed by hand — the canonical p50 = 16.57 ms / p90 = 17.53 ms / 0.17 % > 50 ms numbers in [docs/v1.0-release-overview.md](docs/v1.0-release-overview.md) come from session 055 on the real test bench (Intel i5-13400F + RTX 5070 + Win 11).
+- **A/B testing** every render-path decision — ROV vs RTV (warm-cache win for ROV measured directly: 58 FPS vs 36 FPS on the same scene), `resolution_scale` 1 / 2 / 3 visual + perf comparisons, SSAO dither precision on shadowed regions, the `readback_memexport` HUD-text regression catch.
+- **Manual identification of community recipes** — the `BlurKernelSize = 0` lead from the UE3 modding community, the Xenia 60 FPS NOP + byte-patch with the camera-correct half-vblank fallback, the X360 LZX wrapper format mismatch versus Gildor PC output.
+
+**Where AI assistance was used:**
+
+- C++ implementation of SDK additions once the design was decided — pipeline-stall metrics, Class B guest-CPU instrumentation, VRAM-aware texture-cache auto-tune, DualSense L1 adaptive-trigger plumbing, the `log_to_file` cvar gate.
+- HLSL shader writing — the colour-grade post-FX with seven ASC-CDL presets.
+- CMake / build automation, TOML round-trip code in the launcher, font-fallback chain for non-Windows runtime, repetitive boilerplate.
+- Documentation drafts (these `docs/*` files), commit messages, this README. Every word was reviewed by a human before merging; technical claims are grounded in real measurements or RenderDoc captures cited above.
+
+**Decisions that were never delegated:**
+
+- What renders incorrectly and what the user actually sees. The hardware test bench is real and named honestly; an earlier docs draft that said "AMD Ryzen 9 16C / 32T" was a fabrication, caught by the user, corrected in commit [`fcccf14`](https://github.com/LittleBitUA/DownpourRecomp/commit/fcccf14). The current `Intel Core i5-13400F (10C / 16T, 6P + 4E, Raptor Lake) + RTX 5070` line is the actual hardware.
+- What ships and what doesn't. Two DoF-disable attempts were code-complete and shipped-as-binaries before the user playtested and found regressions; both were reverted byte-perfect rather than left in. The current state of every "Deferred to v1.0.1" item in [docs/v1.0-known-issues.md](docs/v1.0-known-issues.md) is reality, not aspiration.
+- Architecture trade-offs (ROV vs RTV defaults, EDRAM emulation cost, when to break upstream compatibility) — decided by the human, with AI used to enumerate options.
+
+If something feels off about a claim in these docs, open an issue and we'll either back it up with the underlying capture / log / measurement, or correct the docs. That's what transparency means here.
+
+---
+
 ## Comparison vs Xenia and the Xbox 360
 
 > [!NOTE]

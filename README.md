@@ -12,16 +12,20 @@
 
 ![Murphy close-up — Silent Hill: Downpour running natively on PC](docs/screenshots/murphy-closeup.png)
 
-## [⬇  Download v1.1.5 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
+## [⬇  Download v1.1.6 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
 
 </div>
 
 ---
 
 > [!NOTE]
-> **v1.1.4 ships today** as the real root-cause fix for the v1.1.2-era "mouse very slow" reports. The SDK had a hardcoded `kBaseScale = 1500` multiplier that combined with the raw-input scale to saturate the controller stick on sub-millimetre mouse motion — which is why setting `mnk_sensitivity` from 0.6 → 6.0 produced zero observable change (the stick was already capped at int16 max regardless). v1.1.4 replaces the constant with a new tunable cvar `mnk_stick_scale` (default `150`, 10× lower), and tunes `mnk_raw_input_scale` default `0.5 → 0.20` to compensate. Sensitivity finally does what users expect: 1mm of mouse = ~5% stick, 1cm = ~50%, 3cm+ = saturation.
+> **v1.1.6 ships today** as a critical hotfix on three fronts. **(1) Pre-update save backup** — after a community report of save-data loss during the v1.1.4 → v1.1.5 auto-update (root cause not pinned down; our PowerShell update script provably never deletes user data, but one user lost everything anyway), every auto-update now snapshots `user/` + `downpour.toml` + `launcher.ini` into a zip in `%TEMP%` BEFORE applying the new binaries. Worst case, you can hand-restore from `%TEMP%\dpr_user_backup_v<your-version>.zip`. **(2) Use Raw Input toggle** — new Mouse-tab checkbox lets you fall back to the v1.1.1 `WM_MOUSEMOVE` + Windows-pointer-ballistics path. High-DPI gaming mice (16k+ DPI) where the raw-input path felt worse after every cvar tuning attempt can recover the v1.1.1 feel by unticking this. **(3) Launcher sliders** — Mouse Sensitivity, Smoothing, Acceleration Curve, Stick Decay, Raw Input Scale, Stick Scale and other ranged numeric fields now have a draggable trackbar next to the numeric edit field — like every other modern game's mouse settings.
 >
-> If you're already on v1.1.x: launch `PlayDownpour.exe` and click the pill banner — v1.1.4 installs in place. After upgrade, if you'd cranked Sensitivity high in v1.1.3 to compensate for the saturation, bring it back to 1.0-2.0 and dial Raw Input Scale to taste.
+> If you're already on v1.1.x: launch `PlayDownpour.exe` and click the pill banner — v1.1.6 installs in place. The backup safety net activates automatically.
+>
+> **Previously: v1.1.5** — cosmetic title fix. The Win11 taskbar / Alt-Tab caption kept saying "v1.0" through every release because the title string was hardcoded at v1.0 ship time. v1.1.5 composes the title dynamically from `kLauncherVersion` so every future release auto-updates the title everywhere.
+>
+> **Previously: v1.1.4** — real root-cause fix for the v1.1.2-era "mouse very slow" reports. The SDK had a hardcoded `kBaseScale = 1500` multiplier that combined with the raw-input scale to saturate the controller stick on sub-millimetre mouse motion — which is why setting `mnk_sensitivity` from 0.6 → 6.0 produced zero observable change (the stick was already capped at int16 max regardless). v1.1.4 replaces the constant with a new tunable cvar `mnk_stick_scale` (default `150`, 10× lower), and tunes `mnk_raw_input_scale` default `0.5 → 0.20` to compensate. Sensitivity finally does what users expect: 1mm of mouse = ~5% stick, 1cm = ~50%, 3cm+ = saturation.
 >
 > **Previously: v1.1.3 ships today** as a mouse-calibration hotfix on v1.1.2. The hardcoded raw-input divider in v1.1.2 was too aggressive for default Windows pointer settings (pointer ballistics was inflating WM_MOUSEMOVE deltas more than expected). v1.1.3 exposes the magnitude as a tunable cvar `mnk_raw_input_scale` (default 0.5, surfaced in launcher Settings → Mouse) so each user can dial mouselook to their preferred feel.
 >
@@ -86,6 +90,66 @@
 > ```
 >
 > Save the file, relaunch the game. All cvars hot-reload on next process start; the launcher's auto-seed system preserves your values across releases.
+
+---
+
+## What's new in v1.1.6
+
+### 🛟 Pre-update save backup — defence against unverified data loss
+
+One v1.1.4 → v1.1.5 user reported that after auto-updating they "lost all of their Downpour files and progress". The auto-update PowerShell script provably never deletes any of `user/`, `assets/`, `downpour.toml`, or `launcher.ini` — it only copies six specific files (`PlayDownpour.exe`, `downpour.exe`, `rexruntimerd.dll`, `TracyClientrd.dll`, `gamecontrollerdb.txt`, `README.txt`) over the existing install plus refreshing the shareable shader cache. We could not reproduce the loss and the user couldn't recover the `dpr_update.log` (the script removes it on success, leaving it only on failure).
+
+Whatever happened in that one report, the right answer is a safety net. v1.1.6's update script now runs an explicit pre-update step:
+
+```powershell
+# (inside the PS update script)
+$items = @()
+foreach ($n in @('user','downpour.toml','launcher.ini','downpour.toml.backup')) {
+  $p = Join-Path $dest $n
+  if (Test-Path $p) { $items += $p }
+}
+if ($items.Count -gt 0) {
+  Compress-Archive -LiteralPath $items -DestinationPath $backup -Force
+}
+```
+
+Where `$backup` is `%TEMP%\dpr_user_backup_v<your-current-version>.zip`. So **every auto-update from v1.1.6 onward leaves a zip of your saves + settings in `%TEMP%`** before touching anything. The zip persists across runs and is overwritten only by another update from the same version. If anything ever goes wrong, that zip is your one-click restore: unzip it back into your install directory.
+
+You can verify the backup exists immediately after any update by opening `%TEMP%\dpr_user_backup_v1.1.6.zip` (the version baked into the filename is the version you were *running*, not updating to).
+
+### 🐭 New Mouse setting: **Use Raw Input** (default ON)
+
+The v1.1.2+ raw-input path bypasses Windows pointer ballistics ("Enhance pointer precision") in favour of direct HID counts at ~1 kHz polling. For most users this feels much better than the original v1.1.1 `WM_MOUSEMOVE` path. But on **extremely high-DPI gaming mice (16,000+ DPI)** at least one user reported that no amount of `Raw Input Scale` + `Stick Scale` tuning recovered the feel they had on v1.1.1. Their report:
+
+> *"I went back to 1.1.1 and my mouse works better there."*
+
+If you're in that camp, uncheck the new **"Use Raw Input"** checkbox at the top of Settings → Mouse. The driver will then pipe `WM_MOUSEMOVE` pixel deltas through the same `mnk_sensitivity` / `mnk_smoothing` / `mnk_decay` / `mnk_acceleration_exponent` pipeline (without raw deltas double-counting). You get back the Windows-ballistics-aware behaviour that high-DPI mice were calibrated against by their manufacturer firmware.
+
+Net effect: every user, regardless of DPI or pointer-precision configuration, can find a working mouse feel.
+
+### 🎛️ Launcher sliders — "повзунок" style
+
+Until v1.1.5 every numeric value in launcher Settings was a plain text edit box. v1.1.6 pairs each ranged numeric field with a draggable Win32 trackbar (`msctls_trackbar32`) just like every native game's option screen. The numeric edit field stays — so you can still type a precise value — but you can drag the slider for the common "feel my way to the right value" workflow.
+
+Applies to all `kFloat` and ranged `kInt` cvars: Mouse Sensitivity, Mouse Smoothing, Mouse Acceleration Curve, Stick Decay, Raw Input Scale, Stick Scale, Deadzone Compensation, DualSense trigger parameters, resolution scale, FPS cap, frame budget, and the engine-side UE3 shadow/anisotropy/LOD-bias sliders.
+
+Drag the slider → numeric field updates. Type in the numeric field → slider position updates. Save reads the numeric field as before; everything round-trips cleanly through `downpour.toml`.
+
+### Other fixes
+
+* Window title's `kLauncherVersion` baseline + VERSIONINFO PE resource bumped to `1.1.6.0` (Win11 taskbar shows the right version on first launch).
+
+---
+
+## What's new in v1.1.5
+
+The Win11 taskbar / Alt-Tab caption was reading `Silent Hill: Downpour v1.0 | «Little Bit»` through every release since v1.0 ship — the title string was hardcoded once and never updated even though we bumped `kLauncherVersion` five times. Same for the in-canvas top-right corner version label, and the PE `VERSIONINFO` resource (PE properties → `FileVersion` stayed at `1.0.0.0` from v1.0 through v1.1.4).
+
+v1.1.5 makes all three driven from a single source: at runtime, `wWinMain` composes the full window caption as `kWindowTitle + L" " + kLauncherVersion + L" | «Little Bit»"`. The in-canvas corner string uses the same `kLauncherVersion`. The `resources.rc` `VERSIONINFO` block is bumped to `1.1.5.0`.
+
+Every future release now only needs `kLauncherVersion` bumped (one line) + four numbers in `resources.rc` — title, taskbar caption, Alt-Tab, jump-list, in-canvas label, auto-update probe, log header, and PE properties all derive from the new constant.
+
+After upgrade your Win11 pinned taskbar entry may still display the OLD title because Windows caches it by EXE path. Unpin and re-pin to refresh, or accept it'll show correctly in Alt-Tab + the running window caption.
 
 ---
 
@@ -297,6 +361,8 @@ Captured 2026-06-27 from the development branch. The green panel on the left is 
 
 ## Table of contents
 
+- [What's new in v1.1.6](#whats-new-in-v116)
+- [What's new in v1.1.5](#whats-new-in-v115)
 - [What's new in v1.1.4](#whats-new-in-v114)
 - [What's new in v1.1.3](#whats-new-in-v113)
 - [What's new in v1.1.2](#whats-new-in-v112)

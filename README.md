@@ -12,16 +12,39 @@
 
 ![Murphy close-up — Silent Hill: Downpour running natively on PC](docs/screenshots/murphy-closeup.png)
 
-## [⬇  Download v1.1.2 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
+## [⬇  Download v1.1.3 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
 
 </div>
 
 ---
 
 > [!NOTE]
-> **v1.1.2 ships today.** Community-feedback follow-up: WM_INPUT raw-mouse plumbing in the SDK (mouselook now feels native, not stick-emulator-tier), VSync no longer silently overridden by the tearing swap-chain path on NVIDIA setups, and fresh installs on < 8 GiB VRAM GPUs default to 1x SSAA instead of 2x so RTX 3050 / Steam Deck / Iris Xe installs don't slideshow on first boot. Tested against the **USA** and **Europe** Xbox 360 releases of Silent Hill: Downpour (title id `4B4E0823`, base XEX hash `7A3D5809776EE6AB`).
+> **v1.1.3 ships today** as a mouse-calibration hotfix on v1.1.2. The hardcoded raw-input divider in v1.1.2 was too aggressive for default Windows pointer settings (pointer ballistics was inflating WM_MOUSEMOVE deltas more than expected). v1.1.3 exposes the magnitude as a tunable cvar `mnk_raw_input_scale` (default 0.5, surfaced in launcher Settings → Mouse) so each user can dial mouselook to their preferred feel.
+>
+> If you're already on v1.1.x, launch `PlayDownpour.exe` and click the pill banner — v1.1.3 installs in place. If mouselook still feels off after upgrading, open Settings → Mouse → "Raw Input Scale" and adjust (lower = slower, higher = faster).
+>
+> **Previously: v1.1.2 ships today.** Community-feedback follow-up: WM_INPUT raw-mouse plumbing in the SDK (mouselook now feels native, not stick-emulator-tier), VSync no longer silently overridden by the tearing swap-chain path on NVIDIA setups, and fresh installs on < 8 GiB VRAM GPUs default to 1x SSAA instead of 2x so RTX 3050 / Steam Deck / Iris Xe installs don't slideshow on first boot. Tested against the **USA** and **Europe** Xbox 360 releases of Silent Hill: Downpour (title id `4B4E0823`, base XEX hash `7A3D5809776EE6AB`).
 >
 > If you're already on v1.1.x (or v1.0), just launch `PlayDownpour.exe` — the update banner will appear at the top of the window. Click it; the new build is installed in place. Your saves, settings, and warm shader cache are preserved.
+
+---
+
+## What's new in v1.1.3
+
+### 🐭 Mouse-calibration hotfix
+
+v1.1.2 hardcoded a divide-by-8 scale on raw HID mouse deltas. The premise was that an 800 DPI mouse produces ~800 counts/inch vs ~96 pixels/inch from `WM_MOUSEMOVE` on a 96-DPI screen → ~8x ratio. What the premise missed is that Windows applies **pointer ballistics** to `WM_MOUSEMOVE` deltas by default (the "Enhance pointer precision" setting), inflating them substantially at higher mouse velocities. Raw input has no ballistics, so a divide-by-8 felt much slower in motion than the pre-raw pixel path.
+
+v1.1.3 replaces the hardcoded divider with a tunable cvar `mnk_raw_input_scale` (default `0.5`), surfaced in launcher **Settings → Mouse → "Raw Input Scale"**. Suggested starting values by mouse DPI:
+
+| Mouse DPI | Suggested scale |
+|---|---|
+| 3200+ DPI gaming mouse | 0.20 – 0.35 |
+| 1600 DPI gaming mouse | 0.40 – 0.65 |
+| 800 DPI mouse | 0.70 – 1.20 |
+| 400 DPI office mouse | 1.50 – 3.00 |
+
+Existing `mnk_sensitivity` settings still work as before — `mnk_raw_input_scale` is a separate pre-stage that normalises raw count magnitude to the pixel-delta scale `mnk_sensitivity` was originally tuned for.
 
 ---
 
@@ -175,6 +198,7 @@ Captured 2026-06-27 from the development branch. The green panel on the left is 
 
 ## Table of contents
 
+- [What's new in v1.1.3](#whats-new-in-v113)
 - [What's new in v1.1.2](#whats-new-in-v112)
 - [What's new in v1.1.1](#whats-new-in-v111)
 - [What's new in v1.1](#whats-new-in-v11)

@@ -420,6 +420,12 @@ struct PassSlot {
   // kColorFormat when unknown). The PSO built for a draw in this pass must name
   // the format of the target the replay will bind, or D3D12 rejects the pair.
   DXGI_FORMAT rtv_format = kColorFormat;
+  // The replay binds this pass with NO depth buffer (the back buffer under
+  // own-device - the console itself binds it RHISetRenderTarget(GD3DBackBuffer,
+  // NULL)). A PSO that names a DSV format while no DSV is bound is a draw the
+  // hardware silently discards - which blacked out every menu and UI quad the
+  // moment the direct bind went in.
+  bool no_depth = false;
   std::uint32_t draws = 0;
   // The viewport in force while this pass was drawing. Sizing the native target
   // from "the last viewport anyone set" made it flip between the scene's, the
@@ -2732,12 +2738,16 @@ void DeviceSetRenderTarget(std::uint32_t index, std::uint32_t surface_object,
         fmt = meta->second.dxgi;
       }
       g_passes[g_pass_current].rtv_format = fmt;
+      g_passes[g_pass_current].no_depth = false;
     } else if (is_backbuffer && OwnDeviceMode()) {
       // The back-buffer pass binds the presenter's own image in this mode, so
-      // its PSOs must name the presenter's format, not ours.
+      // its PSOs must name the presenter's format, not ours - and NO depth
+      // format, because the bind carries no DSV.
       g_passes[g_pass_current].rtv_format = rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+      g_passes[g_pass_current].no_depth = true;
     } else {
       g_passes[g_pass_current].rtv_format = kColorFormat;
+      g_passes[g_pass_current].no_depth = false;
     }
     if (g_pass_count != before) {
       static std::uint32_t announced = 0;
@@ -3404,6 +3414,7 @@ bool CaptureDraw(const std::uint8_t* base, const DrawDesc& d) {
   // scene - but resolve only the pass we actually render. The counting has to
   // happen for all of them or the choice would be self-fulfilling.
   DXGI_FORMAT pass_rtv_format = kColorFormat;
+  bool pass_no_depth = false;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_pass_current < kMaxPasses) {
@@ -3412,6 +3423,7 @@ bool CaptureDraw(const std::uint8_t* base, const DrawDesc& d) {
       // DeviceSetRenderTarget from the surface's own record - the PSO below
       // must name it or D3D12 refuses the pipeline/target pair at replay.
       pass_rtv_format = g_passes[g_pass_current].rtv_format;
+      pass_no_depth = g_passes[g_pass_current].no_depth;
     }
     // Reference shape: EVERY pass is captured and rendered into its own native
     // target. The old "resolve only the voted pass" filter is gone - it was
@@ -3461,9 +3473,19 @@ bool CaptureDraw(const std::uint8_t* base, const DrawDesc& d) {
   // and it is what fills our depth buffer so the base pass tests against the
   // same occlusion the guest sees.
   key.rtv_format = d.ps != nullptr ? static_cast<std::uint32_t>(pass_rtv_format) : 0;
-  key.dsv_format = kDepthFormat;
-  key.depth_enable = state.depth_enable ? 1 : 0;
-  key.depth_write = state.depth_write ? 1 : 0;
+  // A pass the replay binds without a DSV must not name one in the PSO: a
+  // pipeline that declares a depth format while no depth buffer is bound is a
+  // draw the hardware silently discards. That was every menu and UI quad, the
+  // moment the back buffer became the presenter's image.
+  if (pass_no_depth) {
+    key.dsv_format = 0;
+    key.depth_enable = 0;
+    key.depth_write = 0;
+  } else {
+    key.dsv_format = kDepthFormat;
+    key.depth_enable = state.depth_enable ? 1 : 0;
+    key.depth_write = state.depth_write ? 1 : 0;
+  }
   key.depth_func = static_cast<std::uint8_t>(state.depth_func);
   // DPOUR_NR_DRAW_NOCULL: draw both faces. If a scene that renders nothing
   // starts rendering with this on, the winding or the cull field is wrong -
@@ -3679,12 +3701,14 @@ void CaptureUPBegin(const std::uint8_t* base, const UPDraw& u) {
 
   std::uint32_t pass_now;
   DXGI_FORMAT pass_rtv_format = kColorFormat;
+  bool pass_no_depth = false;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     pass_now = g_pass_current;
     if (g_pass_current < kMaxPasses) {
       ++g_passes[g_pass_current].draws;
       pass_rtv_format = g_passes[g_pass_current].rtv_format;
+      pass_no_depth = g_passes[g_pass_current].no_depth;
     }
   }
 
@@ -3749,9 +3773,16 @@ void CaptureUPBegin(const std::uint8_t* base, const UPDraw& u) {
   key.ps_hash = d.ps != nullptr ? d.ps->ucode_hash : 0;
   key.decl_hash = dpour_pipeline::DeclHash(layout);
   key.rtv_format = d.ps != nullptr ? static_cast<std::uint32_t>(pass_rtv_format) : 0;
-  key.dsv_format = kDepthFormat;
-  key.depth_enable = state.depth_enable ? 1 : 0;
-  key.depth_write = state.depth_write ? 1 : 0;
+  // Same rule as the indexed path: no DSV bound means no DSV named.
+  if (pass_no_depth) {
+    key.dsv_format = 0;
+    key.depth_enable = 0;
+    key.depth_write = 0;
+  } else {
+    key.dsv_format = kDepthFormat;
+    key.depth_enable = state.depth_enable ? 1 : 0;
+    key.depth_write = state.depth_write ? 1 : 0;
+  }
   key.depth_func = static_cast<std::uint8_t>(state.depth_func);
   // DPOUR_NR_DRAW_NOCULL: draw both faces. If a scene that renders nothing
   // starts rendering with this on, the winding or the cull field is wrong -

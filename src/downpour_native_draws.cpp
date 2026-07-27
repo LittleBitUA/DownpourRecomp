@@ -943,38 +943,20 @@ REX_HOOK_RAW(sub_829CDDC0) {
   }
 }
 
-// The MSAA block brackets - the game's own statement of where the scene is.
-// Identified by call fingerprint against XeD3DCommands.cpp:
-//   sub_829CB2F8 = RHIMSAABeginRendering  (BeginTiling sub_82D28D48 + the
-//                  first-tile Clear sub_82D27328 under tile predication)
-//   sub_829CB568 = RHIMSAAEndRendering    (four D3DDevice::Resolve sub_82D27A70
-//                  calls - colour+depth for each of two tiles - then EndTiling)
-// The original runs FIRST for Begin so that everything it binds is in place
-// before the marker; the marker runs FIRST for End so post-block resolves are
-// already outside the bracket.
-REX_EXTERN(__imp__sub_829CB2F8);
-REX_HOOK_RAW(sub_829CB2F8) {
-  __imp__sub_829CB2F8(ctx, base);
-  if (NativeActive()) {
-    dpour_scene::SceneBlockBegin();
-  }
-  if (HooksEnabled()) {
-    static std::atomic<std::uint64_t> _cnt{0};
-    CountAndLog(_cnt, "RHIMSAABeginRendering", 500);
-  }
-}
-
-REX_EXTERN(__imp__sub_829CB568);
-REX_HOOK_RAW(sub_829CB568) {
-  if (NativeActive()) {
-    dpour_scene::SceneBlockEnd();
-  }
-  if (HooksEnabled()) {
-    static std::atomic<std::uint64_t> _cnt{0};
-    CountAndLog(_cnt, "RHIMSAAEndRendering", 500);
-  }
-  __imp__sub_829CB568(ctx, base);
-}
+// The MSAA block brackets (sub_829CB2F8 / sub_829CB568) USED TO BE HOOKED HERE.
+// They are gone, and the reason is in the game's own source rather than in a
+// measurement: Downpour ships with GUseTilingCode = FALSE, and the engineers
+// wrote why next to it (XeD3DDevice.cpp:115-118 - "MSAA at 720p is disabled by
+// default, as the quality improvements from allowing normal shadows on the
+// dominant light in the base pass are better than 2xMSAA"). With tiling off,
+// RHIMSAABeginRendering and RHIMSAAEndRendering are never called at all.
+//
+// So these hooks never fired, and the scene-block machinery behind them - a
+// bracket that was supposed to say "everything drawn between these IS the
+// scene" - never ran either. It cost us real time anyway: the pass diversion it
+// once performed was one of the three roots found on 26.07, and it stayed in
+// the file afterwards as something to reason about. Neither reference has any
+// equivalent, because neither reference asks which draws are "the scene".
 // RHICreateTargetableSurface(SizeX, SizeY, Format, ResolveTargetTexture,
 // Flags, UsageStr) - but the FSurfaceRHIRef return travels through a hidden
 // sret pointer (the recomp starts with `mr r22,r3`), so on entry r3 is the

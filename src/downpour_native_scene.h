@@ -103,15 +103,10 @@ void DeviceSetDepthStencil(std::uint32_t surface_object);
 // DPOUR_NR_DRAW_NODEVRT). The RHI hook stands down when they do.
 bool DeviceRtEnabled();
 
-// The MSAA block brackets, from the game's own frame structure
-// (XeD3DCommands.cpp: RHIMSAABeginRendering / RHIMSAAEndRendering). Everything
-// drawn between them IS the scene - not a guess, the game says so. This matters
-// because RHIMSAABeginRendering binds its EDRAM colour surface through the
-// DEVICE's SetRenderTarget (SetMainpassRenderTargets, inlined), never through
-// RHISetRenderTarget - so the pass tracker above cannot see the scene's own
-// target switch at all, and a vote based on it picks wrong.
-void SceneBlockBegin();
-void SceneBlockEnd();
+// (SceneBlockBegin / SceneBlockEnd were here. Removed: Downpour ships with
+// GUseTilingCode = FALSE, so the MSAA bracket they hooked is never called, and
+// neither reference has an equivalent - neither asks which draws are "the
+// scene". See the note where the hooks used to live, downpour_native_draws.cpp.)
 
 // RHICreateTargetableSurface hook: Downpour ships with GUseTilingCode = FALSE
 // (XeD3DDevice.cpp:118 says so in as many words), so the MSAA block above

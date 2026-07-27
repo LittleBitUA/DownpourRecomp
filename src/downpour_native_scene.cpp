@@ -417,15 +417,9 @@ std::uint32_t g_pass_count = 0;
 std::uint32_t g_pass_current = 0;
 std::uint32_t g_published_pass = 0;
 // The last slot is reserved for the scene as marked by the MSAA block hooks
-// (RHIMSAABeginRendering..EndRendering). The scene's EDRAM colour surface is
-// bound through the device, not through RHISetRenderTarget, so no colour
-// address ever identifies it - the bracket does. kScenePassColor is the slot's
-// stand-in "colour" (an impossible guest address).
-// RETIRED. Deliberately outside [0, kMaxPasses) so it can never collide with a
-// real slot now that PassSlotFor is free to hand out every one of them: the
-// reserved scene slot no longer exists, and nothing routes here.
-constexpr std::uint32_t kScenePassSlot = 0xFFFFFFFEu;
-constexpr std::uint32_t kScenePassColor = 0xFFFFFFFFu;
+// (The reserved "scene pass" slot and its stand-in colour are DELETED, with
+// the MSAA bracket that fed them: Downpour ships GUseTilingCode = FALSE, so the
+// bracket never ran, and no reference asks which draws are "the scene".)
 // UE3's ESceneDepthPriorityGroup: 0 = UnrealEdBackground, 1 = World,
 // 2 = Foreground. Measured live: 119815 world against 2441 foreground.
 constexpr std::uint8_t kSDPGWorld = 1;
@@ -433,7 +427,6 @@ constexpr std::uint8_t kSDPGWorld = 1;
 // passes through RHICreateTargetableSurface, so it has no created surface
 // object to key on; this reserved key stands in for it.
 constexpr std::uint32_t kBackbufferKey = 0xB0BACBADu;
-bool g_scene_marked = false;  // the scene target was bound this frame
 // The surface pair the scene pass drew into last frame. Only draws going there
 // get resolved in full.
 //
@@ -983,109 +976,22 @@ NativeTarget* GetOrCreateRegTarget(ID3D12Device* device, std::uint32_t key, std:
   return &ins->second;
 }
 
-// --- scene injection ---------------------------------------------------------
-// The pipeline that replaces the game's scene resolve with our own image:
-//   render thread: scene target -> readback buffer (one in flight)
-//                  finished readback -> handed to the worker
-//   worker thread: RGBA16F rows -> the resolve texture's own layout
-//                  (7e3 / tiled / endian - dpour_tex::EncodeColorForGuestTexture)
-//   guest thread:  OnResolveScene memcpy's the encoded bytes into guest memory
-//                  INSTEAD of the game's resolve running at all
-// One frame of latency by construction; the scene is one frame late inside the
-// game's own post chain, which moves everything consistently and is invisible.
-std::atomic<const std::uint8_t*> g_guest_base{nullptr};
-ComPtr<ID3D12Resource> g_readback;
-std::uint32_t g_rb_w = 0, g_rb_h = 0, g_rb_pitch = 0;  // render thread only
-std::uint64_t g_rb_fence_value = 0;
-bool g_rb_busy = false;
-std::mutex g_inj_mutex;
-std::condition_variable g_inj_cv;
-std::vector<std::uint8_t> g_inj_input;  // raw RGBA16F rows for the worker
-std::uint32_t g_inj_in_w = 0, g_inj_in_h = 0, g_inj_in_pitch = 0;
-std::uint64_t g_inj_in_seq = 0;
-std::vector<std::uint8_t> g_inj_out;  // encoded bytes in the texture's layout
-dpour_tex::EncodedSurface g_inj_desc{};
-std::uint64_t g_inj_out_seq = 0;
-std::uint64_t g_inj_done_seq = 0;
+// (The scene-injection pipeline was here: render our target, read it back,
+// re-encode it into the guest texture's own 7e3/tiled/endian layout on a
+// worker thread, and memcpy it over the game's resolve. ~100 lines, a
+// readback buffer, a condition variable and a worker thread - all
+// unreachable: the worker was never started and the injection counter never
+// moved. It solved "how do we hand our image back to the emulated pipeline",
+// a question the references never face because there is no emulated pipeline
+// to hand anything to.)
 std::atomic<std::uint64_t> g_injections{0};
-std::atomic<std::uint64_t> g_inj_encode_fail{0};
-std::atomic<bool> g_inj_thread_up{false};
 
 bool InjectEnabled() {
   static const bool on = [] {
     const char* v = std::getenv("DPOUR_NR_DRAW_INJECT");
-    return v != nullptr && v[0] != '\0' && v[0] != '0';
+    return v != nullptr && v[0] != 0 && v[0] != '0';
   }();
   return on;
-}
-
-void InjectWorker() {
-  std::vector<std::uint8_t> in;
-  std::vector<std::uint8_t> out;
-  std::uint32_t w = 0, h = 0, pitch = 0;
-  std::uint64_t seq = 0;
-  for (;;) {
-    {
-      std::unique_lock<std::mutex> lk(g_inj_mutex);
-      g_inj_cv.wait(lk, [&] { return g_inj_in_seq > seq; });
-      seq = g_inj_in_seq;
-      in.swap(g_inj_input);
-      w = g_inj_in_w;
-      h = g_inj_in_h;
-      pitch = g_inj_in_pitch;
-    }
-    const std::uint8_t* base = g_guest_base.load(std::memory_order_relaxed);
-    const std::uint32_t tex = g_scene_resolve_texture.load(std::memory_order_relaxed);
-    if (base == nullptr || tex == 0 || in.empty()) {
-      continue;
-    }
-    dpour_tex::EncodedSurface desc{};
-    if (!dpour_tex::EncodeColorForGuestTexture(base, tex, in.data(), pitch, w, h, out, desc)) {
-      g_inj_encode_fail.fetch_add(1, std::memory_order_relaxed);
-      continue;
-    }
-    std::lock_guard<std::mutex> lk(g_inj_mutex);
-    g_inj_out.swap(out);
-    g_inj_desc = desc;
-    g_inj_out_seq = seq;
-  }
-}
-
-void StartInjectThreadOnce() {
-  if (!g_inj_thread_up.exchange(true, std::memory_order_relaxed)) {
-    std::thread(InjectWorker).detach();
-  }
-}
-
-bool EnsureReadback(ID3D12Device* device, std::uint32_t w, std::uint32_t h) {
-  const std::uint32_t pitch = (w * 8u + 255u) & ~255u;
-  if (g_readback && g_rb_w == w && g_rb_h == h) {
-    return true;
-  }
-  if (g_rb_busy) {
-    return false;  // a copy into the old buffer is still in flight
-  }
-  g_readback.Reset();
-  D3D12_HEAP_PROPERTIES heap{};
-  heap.Type = D3D12_HEAP_TYPE_READBACK;
-  D3D12_RESOURCE_DESC rd{};
-  rd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-  rd.Width = static_cast<std::uint64_t>(pitch) * h;
-  rd.Height = 1;
-  rd.DepthOrArraySize = 1;
-  rd.MipLevels = 1;
-  rd.SampleDesc.Count = 1;
-  rd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &rd,
-                                             D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
-                                             IID_PPV_ARGS(&g_readback)))) {
-    g_readback.Reset();
-    return false;
-  }
-  g_rb_w = w;
-  g_rb_h = h;
-  g_rb_pitch = pitch;
-  return true;
 }
 
 // The viewport the guest set most recently: what a draw being captured right now
@@ -2550,7 +2456,6 @@ void BeginFrame() {
   g_up_frame_count.store(0, std::memory_order_relaxed);
   g_pass_count = 1;
   g_pass_current = 0;
-  g_scene_marked = false;
   g_frame_scene_color = 0;  // the base pass renames it every frame
   g_vs_rev_cached = ~0ull;
   g_ps_rev_cached = ~0ull;
@@ -2632,26 +2537,13 @@ void SetRenderTarget(std::uint32_t color_guest, std::uint32_t depth_guest,
   }
   // A pending UP draw belongs to the pass that was current at its Begin; close
   // it before the pass changes underneath it.
+  //
+  // (A scene-colour special case stood here - recognising "DefaultColor" binds
+  // and RETURNING before the pass tracker below, a leftover of the deleted
+  // scene-slot machinery. It meant a scene bind on this fallback path kept the
+  // PREVIOUS pass current, charging the world's draws to whatever was bound
+  // before. The reference treats every bind the same, so now we do too.)
   CloseUPPending();
-  // Binding a surface the game itself created as the scene colour target
-  // ("DefaultColor" or an alias) IS the start of the scene - the same statement
-  // the MSAA bracket makes on the tiling path, coming through the path Downpour
-  // actually uses (GUseTilingCode=FALSE -> BeginRenderingSceneColor -> here).
-  // Matched on the raw surface OBJECT, not the ref pointer: the refs binding
-  // carries live in GSceneRenderTargets' static array and never equal the
-  // heap object the create hook saw.
-  if (color_object != 0) {
-    for (const auto& slot : g_scene_color_aliases) {
-      const std::uint32_t alias = slot.load(std::memory_order_relaxed);
-      if (alias == 0) {
-        break;
-      }
-      if (alias == color_object) {
-        SceneBlockBegin();
-        return;
-      }
-    }
-  }
   std::lock_guard<std::mutex> lock(g_mutex);
   const std::uint32_t before = g_pass_count;
   g_pass_current = PassSlotFor(color_guest, depth_guest);
@@ -2728,37 +2620,6 @@ void DeviceSetDepthStencil(std::uint32_t surface_object) {
   }
 }
 
-void SceneBlockBegin() {
-  if (!Enabled()) {
-    return;
-  }
-  CloseUPPending();
-  static std::atomic<bool> announced{false};
-  if (!announced.exchange(true, std::memory_order_relaxed)) {
-    REXLOG_INFO("[native-scene] MSAA block seen - bracket noted, pass routing untouched");
-  }
-  std::lock_guard<std::mutex> lock(g_mutex);
-  // THE BRACKET IS NOT A TARGET. It used to set g_pass_current = kScenePassSlot
-  // here, and that one line was the whole white/stale-menu bug:
-  //
-  //   RHIMSAABeginRendering's original runs FIRST in our hook, and its first act
-  //   is GDirect3DDevice->SetRenderTarget - so DeviceSetRenderTarget had already
-  //   routed the pass to the surface the game actually bound. Overwriting it
-  //   afterwards sent every draw of the block into one shared g_color instead,
-  //   so the guest surface never got a NativeTarget, so the resolve that reads
-  //   it found nothing in g_reg_targets and skipped ("4 of 13 queued"), so the
-  //   destination texture kept whatever was in it - the loading screen - and the
-  //   menu's composition quads sampled stale and never-written textures. Ghost
-  //   loading content and a white screen are the same bug seen twice.
-  //
-  // MSAA/tiling is a console constraint, and the reference answer to a console
-  // constraint is Marathon's: neutralise it, do not model it. Their SurfaceSize
-  // hook returns 0 with the comment "We return 0 to always disable tiling"; they
-  // do not grow a special target out of the tiling bracket, and neither do we.
-  // Downpour runs GUseTilingCode=FALSE anyway. The bracket is recorded for the
-  // stats line and nothing else - the game's own binds route every draw.
-  g_scene_marked = true;
-}
 
 namespace {
 // Reads a NUL-terminated UTF-16BE guest string of printable ASCII into out.
@@ -3088,17 +2949,6 @@ void OnTargetableSurfaceCreated(const std::uint8_t* base, std::uint32_t sret,
   }
 }
 
-void SceneBlockEnd() {
-  if (!Enabled()) {
-    return;
-  }
-  (void)0;
-  // Nothing to undo. Forcing g_pass_current = 0 here was the mirror image of the
-  // Begin bug: slot 0 is a real surface's slot, so post-block draws were pushed
-  // into an unrelated target until the game's next bind happened to fix it. The
-  // game re-targets through RHISetRenderTarget when it wants a different target,
-  // and until then the current bind is still the current bind.
-}
 
 void NoteViewProj(const std::uint8_t* base, std::uint32_t matrix_guest) {
   if (!Enabled() || !VsProbeEnabled() || base == nullptr || !GuestAddrPlausible(matrix_guest) ||
@@ -3654,94 +3504,6 @@ bool CaptureDraw(const std::uint8_t* base, const DrawDesc& d) {
     // slot) is deleted: it decided which pass "is" the frame, and no reference
     // has such a decision because none can be right.
     out.pass = g_pass_current;
-#if 0  // === DELETED 2026-07-26: our own invention, see the note above ===
-    // THE ENGINE DECIDES WHAT THE SCENE IS.
-    //
-    // FMeshDrawingPolicy::DrawMesh ran immediately before this draw and told us
-    // what the mesh is; SDPG_World geometry that carries a pixel shader IS the
-    // world, whatever surface the D3D layer happens to have bound. That last
-    // part is the whole point: in gameplay Downpour renders the world into one
-    // of eighteen surfaces all created under the name "AuxColor" (1024x720 -
-    // the screen-percentage buffer), not into "DefaultColor", so every
-    // name-based and target-based rule we have tried reported an idle scene
-    // while the world was being drawn in front of it.
-    if (dpour_ue3::Enabled()) {
-      const dpour_ue3::MeshItem* m = dpour_ue3::CurrentMesh();
-      if (m != nullptr) {
-        out.dpg = static_cast<std::uint8_t>(m->depth_priority_group());
-        // THE DEPTH PREPASS BELONGS TO THE SCENE TOO.
-        //
-        // UE3 draws the world twice: a position-only prepass that fills depth,
-        // then the base pass, which tests EQUAL against it and writes no depth
-        // of its own. Taking only the shaded half left our depth buffer at its
-        // clear value, so every base-pass pixel failed the equality test -
-        // measured exactly that way: 131 world draws issued, depth buffer
-        // uniformly unwritten, screen black.
-        //
-        // Shadow-depth passes are ALSO world geometry with no pixel shader, and
-        // they must not land here - they would fill our depth from a light's
-        // point of view. They are told apart by the depth surface they target:
-        // the prepass shares the base pass's depth surface, a shadow map does
-        // not. The base pass teaches us which one that is; on the very first
-        // frame it is not known yet and the prepass is skipped, which costs one
-        // frame and nothing else.
-        const bool world = out.dpg == kSDPGWorld;
-        const std::uint32_t depth_now =
-            g_pass_current < kMaxPasses ? g_passes[g_pass_current].depth_object : 0;
-        const std::uint32_t color_now =
-            g_pass_current < kMaxPasses ? g_passes[g_pass_current].color_object : 0;
-        bool take = false;
-        // WORLD GEOMETRY IS NOT THE SAME THING AS THE BASE PASS.
-        //
-        // The engine draws the same world meshes again in the lighting pass
-        // (into LightAttenuation), in shadow projections and in translucency.
-        // Taking every SDPG_World draw put all of them into one target, where
-        // the later ones overwrote the base pass with their own near-zero
-        // output: 178 shaded draws, nine million pixels rasterised, and a
-        // colour buffer of exactly zero.
-        //
-        // In a UE3 frame the base pass is the FIRST place world geometry is
-        // shaded into a colour surface - the prepass before it writes no
-        // colour, and everything that draws the world again comes later. So the
-        // first shaded world draw of the frame names the surface, and the rest
-        // of the frame is admitted only if it agrees.
-        if (world && out.ps_hash != 0 && color_now != 0) {
-          if (g_frame_scene_color == 0) {
-            g_frame_scene_color = color_now;
-          }
-          take = color_now == g_frame_scene_color;
-          if (take) {
-            g_scene_depth_object = depth_now;  // this is the scene's depth surface
-          }
-        } else if (world && depth_now != 0 && depth_now == g_scene_depth_object) {
-          take = true;  // the camera depth prepass
-          ++g_scene_prepass_draws;
-        }
-        if (take) {
-          out.pass = kScenePassSlot;
-          g_scene_marked = true;
-          ++g_passes[kScenePassSlot].draws;
-          // The scene target takes the viewport the world is being drawn with -
-          // 1024x720 in gameplay, not the 1280x720 the back buffer uses.
-          g_passes[kScenePassSlot].view_w = g_view_w.load(std::memory_order_relaxed);
-          g_passes[kScenePassSlot].view_h = g_view_h.load(std::memory_order_relaxed);
-          // Depth state of what we let into the scene, so "the base pass tests
-          // EQUAL and writes nothing" is a measurement and not a story.
-          g_scene_depth_func[state.depth_func & 15u].fetch_add(1, std::memory_order_relaxed);
-          if (state.depth_write) {
-            g_scene_depth_writes.fetch_add(1, std::memory_order_relaxed);
-          }
-          // NOT here: the probe logs dozens of lines and walks guest memory,
-          // and this is inside g_mutex - the lock the render thread needs to
-          // pick up the frame. Holding it that long stretches the frame far
-          // enough to re-open the buffer race that cost us a TDR already.
-          probe_now = VsProbeEnabled() && out.ps_hash != 0;
-          probe_color = color_now;
-          probe_depth = depth_now;
-        }
-      }
-    }
-#endif  // === END DELETED 2026-07-26 ===
     g_staging.push_back(out);
   }
   if (probe_now) {
@@ -5328,12 +5090,6 @@ void LogStats() {
                          i == g_published_pass ? "*" : "",
                          g_passes[i].is_backbuffer ? "bb:" : "", g_passes[i].color,
                          g_passes[i].draws, g_passes[i].view_w, g_passes[i].view_h);
-    }
-    // Whether the frame carried an MSAA block at all. It routes nothing now, so
-    // it is pure information: it says which part of the game we are in.
-    if (n > 0 && n < 340) {
-      n += std::snprintf(line + n, sizeof(line) - n, " | msaa-block:%s",
-                         g_scene_marked ? "yes" : "no");
     }
     REXLOG_INFO("[native-scene] {}", line);
   }

@@ -496,6 +496,60 @@ std::atomic<std::uint64_t> g_decoded{0};
 std::atomic<std::uint64_t> g_rejected{0};
 // Entries dropped because the guest freed their memory (AddUnusedXeResource).
 std::atomic<std::uint64_t> g_invalidated_by_free{0};
+
+// WHY the white fallback was served, per cause. Measured 28.07 with the NODRAW
+// probe: the frame executes and clears black, so the standing white screen IS a
+// draw sampling this slot - which makes "who got white, and why" the exact
+// question, and a colour is not an answer.
+enum WhiteReason : std::uint32_t {
+  kWhiteBadPtr = 0,      // implausible RHI pointer
+  kWhiteNoFetch,         // fetch constant would not resolve
+  kWhiteBadFormat,       // format we cannot describe
+  kWhiteHeapFull,        // slot/byte budget exhausted
+  kWhiteDecodeBudget,    // per-frame decode cap (transient by design)
+  kWhiteDecodeFailed,    // DecodeLevel said no
+  kWhiteReasonCount
+};
+std::atomic<std::uint64_t> g_white_served[kWhiteReasonCount]{};
+// First distinct offenders, so the log names textures rather than counts.
+struct WhiteOffender {
+  std::uint32_t base = 0;
+  std::uint32_t fmt = 0;
+  std::uint32_t w = 0, h = 0;
+  std::uint32_t reason = 0;
+};
+std::mutex g_white_mutex;
+WhiteOffender g_white_offenders[12];
+std::uint32_t g_white_offender_count = 0;
+
+std::uint32_t ServeWhite(std::uint32_t reason, std::uint32_t base_addr, std::uint32_t fmt,
+                         std::uint32_t w, std::uint32_t h) {
+  if (reason < kWhiteReasonCount) {
+    g_white_served[reason].fetch_add(1, std::memory_order_relaxed);
+  }
+  if (reason != kWhiteDecodeBudget) {  // transient, would flood the table
+    std::lock_guard<std::mutex> lock(g_white_mutex);
+    bool known = false;
+    for (std::uint32_t i = 0; i < g_white_offender_count; ++i) {
+      if (g_white_offenders[i].base == base_addr && g_white_offenders[i].reason == reason) {
+        known = true;
+        break;
+      }
+    }
+    if (!known && g_white_offender_count < 12) {
+      g_white_offenders[g_white_offender_count++] = WhiteOffender{base_addr, fmt, w, h, reason};
+      REXLOG_WARN("[native-tex] WHITE served: base {:#x} fmt {} {}x{} reason {} ({})", base_addr,
+                  fmt, w, h, reason,
+                  reason == kWhiteBadPtr        ? "bad ptr"
+                  : reason == kWhiteNoFetch     ? "no fetch"
+                  : reason == kWhiteBadFormat   ? "bad format"
+                  : reason == kWhiteHeapFull    ? "heap full"
+                  : reason == kWhiteDecodeFailed ? "decode failed"
+                                                 : "?");
+    }
+  }
+  return kWhiteSlot;
+}
 std::atomic<std::uint32_t> g_logged_details{0};
 std::uint64_t g_frame = 0;
 std::uint32_t g_last_pick_slot = 0;
@@ -1036,7 +1090,7 @@ std::uint32_t GuestBaseAddress(const std::uint8_t* base, std::uint32_t texture_g
 
 std::uint32_t Acquire(const std::uint8_t* base, std::uint32_t texture_rhi_guest) {
   if (base == nullptr || !GuestAddrPlausible(texture_rhi_guest)) {
-    return kWhiteSlot;
+    return ServeWhite(kWhiteBadPtr, texture_rhi_guest, 0, 0, 0);
   }
 
   // The fetch constant is resolved BEFORE the render-target lookup now, because
@@ -1044,7 +1098,7 @@ std::uint32_t Acquire(const std::uint8_t* base, std::uint32_t texture_rhi_guest)
   // the object, is what the engine shares between render targets.
   Fetch fetch{};
   if (!ResolveFetch(base, texture_rhi_guest, fetch)) {
-    return kWhiteSlot;
+    return ServeWhite(kWhiteNoFetch, texture_rhi_guest, 0, 0, 0);
   }
 
   // Reference behaviour first: a texture the game resolves a render target
@@ -1059,7 +1113,8 @@ std::uint32_t Acquire(const std::uint8_t* base, std::uint32_t texture_rhi_guest)
 
   FormatInfo info{};
   if (!DescribeFormat(fetch.format(), info)) {
-    return kWhiteSlot;
+    return ServeWhite(kWhiteBadFormat, fetch.base_address(), fetch.format(), fetch.width(),
+                      fetch.height());
   }
 
   // Identity of the actual pixels, not of the RHI wrapper.
@@ -1073,10 +1128,12 @@ std::uint32_t Acquire(const std::uint8_t* base, std::uint32_t texture_rhi_guest)
       return it->second.slot;
     }
     if (g_next_slot >= kHeapSize || g_bytes >= kMaxTextureBytes) {
-      return kWhiteSlot;
+      return ServeWhite(kWhiteHeapFull, fetch.base_address(), fetch.format(), fetch.width(),
+                        fetch.height());
     }
     if (g_decodes_this_frame >= kMaxDecodesPerFrame) {
-      return kWhiteSlot;  // try again next frame; keeps warm-up smooth
+      // Transient by design; counted but never listed as an offender.
+      return ServeWhite(kWhiteDecodeBudget, fetch.base_address(), 0, 0, 0);
     }
   }
 
@@ -1111,7 +1168,8 @@ std::uint32_t Acquire(const std::uint8_t* base, std::uint32_t texture_rhi_guest)
   }
   if (!ok && min_level == 0u) {
     g_rejected.fetch_add(1, std::memory_order_relaxed);
-    return kWhiteSlot;
+    return ServeWhite(kWhiteDecodeFailed, fetch.base_address(), fetch.format(), fetch.width(),
+                      fetch.height());
   }
 
   // Mip levels 1..max_level live under mip_address, each aligned to 4 KB, with
@@ -1142,7 +1200,8 @@ std::uint32_t Acquire(const std::uint8_t* base, std::uint32_t texture_rhi_guest)
 
   if (pending.levels.empty()) {
     g_rejected.fetch_add(1, std::memory_order_relaxed);
-    return kWhiteSlot;
+    return ServeWhite(kWhiteDecodeFailed, fetch.base_address(), fetch.format(), fetch.width(),
+                      fetch.height());
   }
 
   // Diagnostics + optional dump of the decoded base level.
@@ -1490,6 +1549,14 @@ void LogStats() {
               g_decoded.load(std::memory_order_relaxed), g_bytes / (1024 * 1024),
               g_rejected.load(std::memory_order_relaxed), g_next_slot,
               g_invalidated_by_free.load(std::memory_order_relaxed));
+  REXLOG_INFO("[native-tex] WHITE served: bad-ptr={} no-fetch={} bad-format={} heap-full={} "
+              "decode-budget={} decode-failed={}",
+              g_white_served[kWhiteBadPtr].load(std::memory_order_relaxed),
+              g_white_served[kWhiteNoFetch].load(std::memory_order_relaxed),
+              g_white_served[kWhiteBadFormat].load(std::memory_order_relaxed),
+              g_white_served[kWhiteHeapFull].load(std::memory_order_relaxed),
+              g_white_served[kWhiteDecodeBudget].load(std::memory_order_relaxed),
+              g_white_served[kWhiteDecodeFailed].load(std::memory_order_relaxed));
 }
 
 // ------------------------------------------------- scene injection (write) --

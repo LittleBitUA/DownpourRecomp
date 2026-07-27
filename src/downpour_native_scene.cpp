@@ -534,6 +534,7 @@ DXGI_FORMAT DxgiFromPixelFormat(std::uint32_t pf) {
 // (EnvOn and OwnDeviceMode are defined later in this namespace; the definition
 // sits after them.)
 bool SurfaceFormatOn();
+bool OwnDeviceMode();
 extern float g_depth_clear;  // defined with the scene targets below
 std::mutex g_reg_mutex;
 std::unordered_map<std::uint32_t, SurfaceMeta> g_surface_meta;       // surface obj -> size

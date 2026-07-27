@@ -1196,6 +1196,10 @@ std::atomic<std::uint64_t> g_scene_pixels{0};
 std::atomic<std::uint64_t> g_scene_pixel_frames{0};
 std::atomic<std::uint32_t> g_scene_issued{0};
 std::atomic<std::uint32_t> g_scene_issued_shaded{0};
+// Replays that ended with the presenter's image bound and handed back - i.e.
+// frames whose pixels are OURS. The difference between this and the replay
+// count is the number of frames the presenter had to fill some other way.
+std::atomic<std::uint64_t> g_guestout_direct_frames{0};
 
 // THE COMMAND PROCESSOR'S OWN SUBMISSION COUNTERS, LATCHED PER CALLBACK.
 //
@@ -4339,6 +4343,7 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   // composite's source held the game's two UberPostProcess quads, which SAMPLE
   // textures rather than carry pixels, so a missing link showed as white.
   bool guestout_is_bound = false;
+  bool guestout_ever_bound = false;
   const auto transition_guest_output = [&](D3D12_RESOURCE_STATES from,
                                            D3D12_RESOURCE_STATES to) {
     D3D12_RESOURCE_BARRIER b{};
@@ -4348,6 +4353,59 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
     b.Transition.StateBefore = from;
     b.Transition.StateAfter = to;
     dl->D3DResourceBarrier(1, &b);
+  };
+  // Bind the presenter's image as the render target - the reference's
+  // BeginCommandList acquires the swapchain texture FIRST and the back buffer
+  // is simply that texture (video.cpp:1557/1597); it is not something that gets
+  // bound only if a back-buffer draw happens to exist. A replay that never
+  // reached this bind returned false, the presenter fell back to decoding guest
+  // memory the Xenos never rasterised, and the screen was WHITE on every frame
+  // whose snapshot lacked a back-buffer item - which measurement says is most
+  // of them. Bound at replay start, the frame has a black floor and whatever
+  // back-buffer draws exist land on it.
+  const auto bind_guest_output_direct = [&]() -> bool {
+    if (out_res == nullptr || g_guestout_failed.load(std::memory_order_relaxed)) {
+      return false;
+    }
+    if (!g_guestout_rtv_heap) {
+      D3D12_DESCRIPTOR_HEAP_DESC hd{};
+      hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+      hd.NumDescriptors = kPassFrames;
+      if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_guestout_rtv_heap)))) {
+        REXLOG_ERROR("[native-scene] guest-output RTV heap creation failed");
+        g_guestout_failed.store(true, std::memory_order_relaxed);
+        return false;
+      }
+    }
+    static std::uint32_t bb_ring = 0;
+    const std::uint32_t ring = bb_ring++ % kPassFrames;
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvh = g_guestout_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    rtvh.ptr += static_cast<SIZE_T>(ring) * rtv_stride;
+    D3D12_RENDER_TARGET_VIEW_DESC rv{};
+    rv.Format = rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+    rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+    device->CreateRenderTargetView(out_res, &rv, rtvh);
+    if (!guestout_is_bound) {
+      transition_guest_output(rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+                              D3D12_RESOURCE_STATE_RENDER_TARGET);
+      guestout_is_bound = true;
+    }
+    if (!guestout_ever_bound) {
+      // Once per replay, not once per bind: the guest's own Clear is dropped in
+      // this mode, so the image starts from ours.
+      dl->D3DClearRenderTargetView(rtvh, clear_color, 0, nullptr);
+      guestout_ever_bound = true;
+    }
+    // No depth: the game's final composition is full-screen quads, and the
+    // console binds its back buffer with a null depth surface too
+    // (XeD3DViewport.cpp:85, RHISetRenderTarget(GD3DBackBuffer, NULL)).
+    dl->D3DOMSetRenderTargets(1, &rtvh, FALSE, nullptr);
+    const D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(width), static_cast<float>(height),
+                            0.0f, 1.0f};
+    const D3D12_RECT sc{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+    dl->RSSetViewport(vp);
+    dl->RSSetScissorRect(sc);
+    return true;
   };
   const auto close_current = [&]() {
     if (current_reg != nullptr) {
@@ -4429,43 +4487,7 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
       // the way the references do. Only under own-device: with the emulated
       // pipeline still running, its frame and ours would fight over the same
       // texture.
-      if (OwnDeviceMode() && out_res != nullptr && !g_guestout_failed.load(std::memory_order_relaxed)) {
-        if (!g_guestout_rtv_heap) {
-          D3D12_DESCRIPTOR_HEAP_DESC h{};
-          h.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-          h.NumDescriptors = kPassFrames;
-          if (FAILED(device->CreateDescriptorHeap(&h, IID_PPV_ARGS(&g_guestout_rtv_heap)))) {
-            REXLOG_ERROR("[native-scene] guest-output RTV heap creation failed");
-            g_guestout_failed.store(true, std::memory_order_relaxed);
-            return false;
-          }
-        }
-        static std::uint32_t bb_ring = 0;
-        const std::uint32_t ring = bb_ring++ % kPassFrames;
-        D3D12_CPU_DESCRIPTOR_HANDLE rtvh =
-            g_guestout_rtv_heap->GetCPUDescriptorHandleForHeapStart();
-        rtvh.ptr += static_cast<SIZE_T>(ring) * rtv_stride;
-        D3D12_RENDER_TARGET_VIEW_DESC rv{};
-        rv.Format = rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat;
-        rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-        device->CreateRenderTargetView(out_res, &rv, rtvh);
-        if (!guestout_is_bound) {
-          transition_guest_output(rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
-                                  D3D12_RESOURCE_STATE_RENDER_TARGET);
-          guestout_is_bound = true;
-          // The guest's own Clear is dropped in this mode, so the image starts
-          // from ours - once per replay, not once per bind.
-          dl->D3DClearRenderTargetView(rtvh, clear_color, 0, nullptr);
-        }
-        // No depth: the game's final composition is full-screen quads, and the
-        // console's back buffer is bound with a null depth surface too
-        // (XeD3DViewport.cpp:85, RHISetRenderTarget(GD3DBackBuffer, NULL)).
-        dl->D3DOMSetRenderTargets(1, &rtvh, FALSE, nullptr);
-        const D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(width),
-                                static_cast<float>(height), 0.0f, 1.0f};
-        const D3D12_RECT sc{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
-        dl->RSSetViewport(vp);
-        dl->RSSetScissorRect(sc);
+      if (OwnDeviceMode() && bind_guest_output_direct()) {
         current_reg = nullptr;
         score_target(out_res, width, kBackbufferKey);
         return true;
@@ -4788,6 +4810,18 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   // passes feeding each other (shadow maps, the base pass, the post-process
   // chain), and dropping all but one leaves the survivor reading targets that
   // were never rendered.
+  //
+  // Under own-device the presenter's image is bound and cleared FIRST, before
+  // any item - the reference acquires the swapchain texture at frame start
+  // (BeginCommandList, video.cpp:1557) and everything else happens on top of
+  // it. The first item's own pass bind replaces it immediately; what this buys
+  // is that a replay whose snapshot carries no back-buffer item still OWNS the
+  // frame (black, plus whatever did draw) instead of returning false and
+  // letting the presenter show guest memory the Xenos never rasterised - which
+  // was the standing white screen.
+  if (OwnDeviceMode()) {
+    bind_guest_output_direct();
+  }
   for (std::size_t item_index = 0; item_index < items.size(); ++item_index) {
     const SceneDraw& it = items[item_index];
     if (issued >= max_draws) {
@@ -5030,10 +5064,10 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
                             rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
     guestout_is_bound = false;
     guestout_drawn = true;
-    static std::atomic<bool> told{false};
-    if (!told.exchange(true, std::memory_order_relaxed)) {
-      REXLOG_INFO("[native-scene] back buffer IS the presented texture - composite retired");
-    }
+    // A counter, not a one-shot line: the one-shot version could not answer
+    // "how many frames took this path", which was exactly the question the last
+    // white-screen session needed answered.
+    g_guestout_direct_frames.fetch_add(1, std::memory_order_relaxed);
   } else if (GuestOutMode() && last_target_res != nullptr) {
     guestout_drawn = CompositeToGuestOutput(device, dl, out_res, width, height, last_target_res);
   }
@@ -5209,9 +5243,10 @@ void LogStats() {
               g_up_captured.load(std::memory_order_relaxed),
               g_up_dropped.load(std::memory_order_relaxed),
               g_up_capped.load(std::memory_order_relaxed));
-  REXLOG_INFO("[native-scene] composite source: {:#x} with {} draws",
+  REXLOG_INFO("[native-scene] composite source: {:#x} with {} draws | direct-to-output frames: {}",
               g_comp_source_key.load(std::memory_order_relaxed),
-              g_comp_source_draws.load(std::memory_order_relaxed));
+              g_comp_source_draws.load(std::memory_order_relaxed),
+              g_guestout_direct_frames.load(std::memory_order_relaxed));
   // The numbers that say whether any of this reaches the screen, and whether
   // what reaches it can paint at all.
   REXLOG_INFO(

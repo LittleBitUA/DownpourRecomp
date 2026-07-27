@@ -66,6 +66,13 @@ void BeginFrame(std::uint64_t frame);
 // beside it is exactly the parallel timeline the references do not have.
 void Flush(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandList* cmd);
 void RetireUploads(std::uint64_t completed_fence, std::uint64_t submitted_fence);
+
+// The guest freed the memory at `addr` (AddUnusedXeResource, the one choke
+// point every retiring resource passes through - XeD3DResources.cpp:118). Any
+// cached buffer keyed on that address describes memory that will be reused for
+// something else within a frame, so it must not be served again. This is the
+// role UnleashedRecomp's DestructResource command plays (video.cpp:2157).
+void InvalidateGuestAddress(std::uint32_t addr);
 void LogStats();
 
 }  // namespace dpour_vbuf

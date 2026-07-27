@@ -462,6 +462,11 @@ struct Pending {
 struct Entry {
   std::uint32_t slot = kInvalidSlot;
   ComPtr<ID3D12Resource> texture;
+  // Where the pixels lived in guest memory (fetch.base_address(), 4KB-aligned),
+  // kept so a guest free (AddUnusedXeResource) can find and drop every entry
+  // decoded from that allocation. The XOR-mixed cache key cannot be searched by
+  // address, so the invalidation walks - the cache is bounded by kHeapSize.
+  std::uint32_t guest_base = 0;
 };
 
 struct RetiringUpload {
@@ -489,6 +494,8 @@ std::atomic<std::uint32_t> g_sampler_slots[16] = {};
 std::atomic<std::uint32_t> g_fresh_mask{0};
 std::atomic<std::uint64_t> g_decoded{0};
 std::atomic<std::uint64_t> g_rejected{0};
+// Entries dropped because the guest freed their memory (AddUnusedXeResource).
+std::atomic<std::uint64_t> g_invalidated_by_free{0};
 std::atomic<std::uint32_t> g_logged_details{0};
 std::uint64_t g_frame = 0;
 std::uint32_t g_last_pick_slot = 0;
@@ -1176,6 +1183,7 @@ std::uint32_t Acquire(const std::uint8_t* base, std::uint32_t texture_rhi_guest)
   g_decoded.fetch_add(1, std::memory_order_relaxed);
   Entry entry;
   entry.slot = pending.slot;
+  entry.guest_base = fetch.base_address();
   const std::uint32_t slot = pending.slot;
   g_cache.emplace(key, std::move(entry));
   g_pending.push_back(std::move(pending));
@@ -1344,6 +1352,30 @@ void Flush(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandList* cmd)
   }
 }
 
+void InvalidateGuestAddress(std::uint32_t addr) {
+  if (addr == 0) {
+    return;
+  }
+  // AddUnusedXeResource hands over the allocation's base; texture fetches store
+  // a 4KB-aligned base too, so the match is on the page-aligned address.
+  const std::uint32_t page = addr & ~0xFFFu;
+  std::lock_guard<std::mutex> lock(g_mutex);
+  for (auto it = g_cache.begin(); it != g_cache.end();) {
+    if (it->second.guest_base == page && it->second.guest_base != 0) {
+      // The SRV heap slot is NOT reclaimed - the allocator is monotonic. That
+      // leaks one slot per invalidated texture, which is the price of never
+      // serving pixels from memory the guest has already handed to something
+      // else. The heap holds kHeapSize slots; the stats line reports the count
+      // so a session that ever exhausts it names the culprit instead of
+      // silently going white.
+      it = g_cache.erase(it);
+      g_invalidated_by_free.fetch_add(1, std::memory_order_relaxed);
+    } else {
+      ++it;
+    }
+  }
+}
+
 void RetireUploads(std::uint64_t completed_fence, std::uint64_t submitted_fence) {
   std::lock_guard<std::mutex> lock(g_mutex);
   for (auto& r : g_retiring) {
@@ -1444,9 +1476,10 @@ std::uint64_t GpuHandleAt(std::uint32_t slot) {
 
 void LogStats() {
   std::lock_guard<std::mutex> lock(g_mutex);
-  REXLOG_INFO("[native-tex] textures={} ({} MB) rejected={} slots_used={}",
+  REXLOG_INFO("[native-tex] textures={} ({} MB) rejected={} slots_used={} freed_by_guest={}",
               g_decoded.load(std::memory_order_relaxed), g_bytes / (1024 * 1024),
-              g_rejected.load(std::memory_order_relaxed), g_next_slot);
+              g_rejected.load(std::memory_order_relaxed), g_next_slot,
+              g_invalidated_by_free.load(std::memory_order_relaxed));
 }
 
 // ------------------------------------------------- scene injection (write) --

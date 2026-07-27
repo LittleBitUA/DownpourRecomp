@@ -45,6 +45,7 @@
 #include "downpour_native_shaders.h"  // translated DXIL for the game's own shaders
 #include "downpour_native_tex.h"   // native texture cache
 #include "downpour_native_ue3.h"   // the engine's own mesh stream (data-driven layer)
+#include "downpour_native_vbuffers.h"  // host vertex/index buffers + guest-free invalidation
 #include "downpour_shader_dump.h"  // harvest Xenos shader containers
 
 namespace {
@@ -752,6 +753,45 @@ REX_HOOK_RAW(sub_829CAE50) {
     }
   }
   __imp__sub_829CAE50(ctx, base);
+}
+
+// --- resource lifetime: the DestructResource of this game ---------------------
+//
+// UnleashedRecomp hooks DestructResource (video.cpp:7800) and defers the
+// destruction until the GPU has finished the frame (ProcDestructResource ->
+// g_tempResources). Downpour's equivalent choke point is AddUnusedXeResource
+// (XeD3DResources.cpp:118): EVERY resource the game retires - dynamic
+// vertex-buffer orphans, destructed textures, freed surfaces - passes through
+// it, carrying the allocation's base address, and DeleteUnusedXeResources frees
+// the queue one frame later, after which the address is reused.
+//
+// Resolved by content, not guess:
+//   sub_829CF628 = AddUnusedXeResource(r3 = IDirect3DResource9* or null,
+//                  r4 = BaseAddress, r5 = SecondaryAddress, ...) - appends to
+//                  the double-buffered queue at 0x837CCFC0 (base +/- frame*12)
+//                  and adds the size to the counter at 0x837AB344. Six callers,
+//                  all inside the RHI module.
+//   sub_829CF7A8 = DeleteUnusedXeResources - walks the PREVIOUS frame's queue
+//                  (BlockUntilNotBusy per entry) and swaps the buffers; called
+//                  from RHIEndDrawingViewport right before XePerformSwap, which
+//                  is exactly where the reference's DestructTempResources sits
+//                  in its own frame.
+//
+// The hook invalidates our caches AT RETIREMENT TIME - one frame before the
+// address can be reused - so a draw captured after the free can never be served
+// bytes that now belong to a different resource. This closes, at the reference's
+// own choke point, the address-reuse family of bugs: the AuxColor 128x128 that
+// answered for a later 1024x720, and the dynamic orphans that made "buffer size
+// unknown" the single largest draw loss (22900 in one run).
+REX_EXTERN(__imp__sub_829CF628);
+REX_HOOK_RAW(sub_829CF628) {
+  // r4 = BaseAddress. r5 is a BOOL, not an address - the vertex-buffer
+  // allocator's own call site reads `li r5,1` with r3=0 and the base in r4.
+  if (NativeActive() && ctx.r4.u32 != 0) {
+    dpour_vbuf::InvalidateGuestAddress(ctx.r4.u32);
+    dpour_tex::InvalidateGuestAddress(ctx.r4.u32);
+  }
+  __imp__sub_829CF628(ctx, base);
 }
 
 // RHISetRenderTarget(NewRenderTarget, NewDepthStencilTarget) - XeD3DCommands.cpp:668.

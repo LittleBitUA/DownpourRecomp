@@ -85,6 +85,8 @@ std::atomic<std::uint64_t> g_uploaded{0};
 std::atomic<std::uint64_t> g_refreshed{0};
 std::atomic<std::uint64_t> g_rejected{0};
 std::atomic<std::uint64_t> g_deferred{0};
+// Buffers dropped because the guest freed their memory (AddUnusedXeResource).
+std::atomic<std::uint64_t> g_invalidated{0};
 double g_frame_budget_ms = 0.0;
 
 // Guest pointers come out of D3D resource fields, so nothing may be read without
@@ -394,6 +396,34 @@ void Flush(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandList* cmd)
   }
 }
 
+void InvalidateGuestAddress(std::uint32_t addr) {
+  if (addr == 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(g_mutex);
+  // Both keys the address can appear under (vertex and index), erased outright.
+  // The D3D12 resources inside still belong to in-flight frames, so they go
+  // through g_retiring exactly like a dynamic-slot refresh does: fence 0 here,
+  // and RetireUploads stamps it submitted+8 - the same slack that covers the
+  // staging->published->replay window for every other retirement.
+  for (const bool is_index : {false, true}) {
+    auto it = g_buffers.find(MakeKey(addr, is_index));
+    if (it == g_buffers.end()) {
+      continue;
+    }
+    for (auto& slot : it->second.slot) {
+      if (slot) {
+        Retiring r;
+        r.resource = std::move(slot);
+        r.fence = 0;
+        g_retiring.push_back(std::move(r));
+      }
+    }
+    g_buffers.erase(it);
+    g_invalidated.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 void RetireUploads(std::uint64_t completed_fence, std::uint64_t submitted_fence) {
   std::lock_guard<std::mutex> lock(g_mutex);
   for (auto& r : g_retiring) {
@@ -419,11 +449,13 @@ void RetireUploads(std::uint64_t completed_fence, std::uint64_t submitted_fence)
 
 void LogStats() {
   std::lock_guard<std::mutex> lock(g_mutex);
-  REXLOG_INFO("[native-vbuf] {} buffers ({} MB), {} refreshes, {} rejected, {} deferred",
+  REXLOG_INFO("[native-vbuf] {} buffers ({} MB), {} refreshes, {} rejected, {} deferred, "
+              "{} invalidated by guest free",
               g_uploaded.load(std::memory_order_relaxed), g_bytes / (1024 * 1024),
               g_refreshed.load(std::memory_order_relaxed),
               g_rejected.load(std::memory_order_relaxed),
-              g_deferred.load(std::memory_order_relaxed));
+              g_deferred.load(std::memory_order_relaxed),
+              g_invalidated.load(std::memory_order_relaxed));
 }
 
 }  // namespace dpour_vbuf

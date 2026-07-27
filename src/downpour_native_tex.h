@@ -81,6 +81,12 @@ bool EnsureHeap(ID3D12Device* device);
 void Flush(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandList* cmd);
 // Retire upload staging buffers whose copies have completed.
 void RetireUploads(std::uint64_t completed_fence, std::uint64_t submitted_fence);
+
+// The guest freed the allocation at `addr` (AddUnusedXeResource). Every cache
+// entry decoded from that memory is dropped so it cannot be served again -
+// the DestructResource role from UnleashedRecomp (video.cpp:2157), applied to
+// the texture cache.
+void InvalidateGuestAddress(std::uint32_t addr);
 ID3D12DescriptorHeap* Heap();
 std::uint64_t GpuHandleAt(std::uint32_t slot);
 // Shared bindless-heap allocation, used by the vertex-stream module too: the

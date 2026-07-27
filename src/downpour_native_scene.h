@@ -237,6 +237,31 @@ struct UPDraw {
 };
 void CaptureUPBegin(const std::uint8_t* base, const UPDraw& u);
 
+// Close the pending UP capture NOW, copying its bytes while they are still
+// valid. The device-level capture cannot do this - it opens at BeginVertices,
+// before the game has written anything - so it defers to the next captured
+// event. The API-level capture below has no such problem: RHIDrawPrimitiveUP is
+// handed a buffer the caller has already filled, so the copy happens inside the
+// call, which is what UnleashedRecomp's DrawPrimitiveUP hook does.
+void CaptureUPEnd();
+
+// DPOUR_NR_UP_API (implied by DPOUR_NR_OWN_DEVICE): capture user-pointer draws
+// at the RHI entry points the references hook - RHIDrawPrimitiveUP
+// (sub_829CA900) and RHIDrawIndexedPrimitiveUP (sub_829CAE50) - instead of at
+// the device's BeginVertices one level below.
+//
+// This is not a refinement, it removes a blocker that was self-inflicted.
+// Hooking BeginVertices meant the guest's UP submission could never be dropped:
+// Begin IS the allocation, it returns the pointer the game then writes into, so
+// declining it hands back null and the game breaks. UnleashedRecomp
+// (video.cpp:7840) and MarathonRecomp both hook DrawPrimitiveUP, the API entry,
+// where the data is the CALLER's and returning early costs nothing.
+//
+// When on, the BeginVertices hooks stand down: the RHI entry above them calls
+// straight into BeginVertices, so capturing at both would record every UP draw
+// twice.
+bool UpAtApiLevel();
+
 // --- render thread ----------------------------------------------------------
 void Render(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* cmd,
             std::uint32_t width, std::uint32_t height);

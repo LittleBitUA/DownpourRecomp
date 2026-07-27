@@ -1920,6 +1920,11 @@ bool SkipGuestDraws() {
 // that have to drop the guest's packet writers.
 bool OwnDevice() { return OwnDeviceMode(); }
 
+bool UpAtApiLevel() {
+  static const bool on = EnvOn("DPOUR_NR_UP_API") || OwnDeviceMode();
+  return on;
+}
+
 namespace {
 // Diagnostic gates, both default OFF.
 //
@@ -3745,6 +3750,11 @@ bool CaptureDraw(const std::uint8_t* base, const DrawDesc& d) {
   g_drawn.fetch_add(1, std::memory_order_relaxed);
   return true;
 }
+
+// Defined here, below CloseUPPending, because that is where the pending slot
+// lives. The API-level hooks call Begin then End back to back: the caller's
+// buffer is already full, so there is nothing to wait for.
+void CaptureUPEnd() { CloseUPPending(); }
 
 void CaptureUPBegin(const std::uint8_t* base, const UPDraw& u) {
   if (!Enabled() || base == nullptr || NoUPCapture()) {

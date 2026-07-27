@@ -596,7 +596,10 @@ REX_HOOK_RAW(sub_82D1E250) {
   const std::uint32_t count = ctx.r5.u32;
   const std::uint32_t stride = ctx.r6.u32;
   __imp__sub_82D1E250(ctx, base);
-  if (NativeActive() && dpour_scene::Enabled() && ctx.r3.u32 != 0) {
+  // Stand down when the capture runs at the RHI entry above: that entry calls
+  // straight into here, so capturing at both records every UP draw twice.
+  if (NativeActive() && dpour_scene::Enabled() && !dpour_scene::UpAtApiLevel() &&
+      ctx.r3.u32 != 0) {
     dpour_scene::UPDraw u;
     FillCommonDrawInputs(u.d, prim);
     u.d.indexed = false;
@@ -621,8 +624,9 @@ REX_HOOK_RAW(sub_82D1E758) {
   // [r1+84], which is where the Xenon ABI puts it.
   const std::uint32_t out_vtx_ref = GuestReadBE32(base, ctx.r1.u32 + 84);
   __imp__sub_82D1E758(ctx, base);
-  if (NativeActive() && dpour_scene::Enabled() && ctx.r3.u32 == 0 &&
-      GuestAddrPlausible(out_idx_ref) && GuestAddrPlausible(out_vtx_ref)) {
+  // Same stand-down as the non-indexed entry above.
+  if (NativeActive() && dpour_scene::Enabled() && !dpour_scene::UpAtApiLevel() &&
+      ctx.r3.u32 == 0 && GuestAddrPlausible(out_idx_ref) && GuestAddrPlausible(out_vtx_ref)) {
     dpour_scene::UPDraw u;
     FillCommonDrawInputs(u.d, prim);
     u.d.indexed = true;
@@ -638,6 +642,116 @@ REX_HOOK_RAW(sub_82D1E758) {
       dpour_tex::NextDraw();
     }
   }
+}
+
+// --- user-pointer draws, AT THE ENTRY THE REFERENCES HOOK ---------------------
+//
+// UnleashedRecomp hooks DrawPrimitiveUP (video.cpp:7840) and MarathonRecomp does
+// the same; neither goes anywhere near BeginVertices or the command ring. We had
+// been hooking one level below, at the device, and that is where "the UP draws
+// cannot be suppressed" came from - a blocker of our own making, since Begin IS
+// the allocation and declining it hands the game a null pointer.
+//
+// Here the data belongs to the CALLER and is already written, so the capture
+// copies it on the spot and, when we own the device, the call simply does not
+// go through: no BeginVertices, no allocation, no packets.
+//
+//   RHIDrawPrimitiveUP(PrimType, NumPrimitives, VertexData, Stride)
+//     = sub_829CA900   (XeD3DCommands.cpp:1146)
+//   RHIDrawIndexedPrimitiveUP(PrimType, MinVertexIndex, NumVertices,
+//                             NumPrimitives, IndexData, IndexStride,
+//                             VertexData, VertexStride)
+//     = sub_829CAE50   (XeD3DCommands.cpp:1269)
+
+// UE3's EPrimitiveType -> the Xenon D3DPRIMITIVETYPE, from the game's own
+// GetD3DPrimitiveType (XeD3DCommands.cpp:803). Note this is the CONSOLE's
+// enumeration, where TRIANGLESTRIP is 6 and QUADLIST is 13 - not the PC one.
+static std::uint32_t D3DPrimFromUE3(std::uint32_t ue3) {
+  switch (ue3) {
+    case 0: return 4;   // PT_TriangleList  -> D3DPT_TRIANGLELIST
+    case 1: return 6;   // PT_TriangleStrip -> D3DPT_TRIANGLESTRIP
+    case 2: return 2;   // PT_LineList      -> D3DPT_LINELIST
+    case 3: return 13;  // PT_QuadList      -> D3DPT_QUADLIST
+    default: return 0;  // tessellated patches and anything else: not ours
+  }
+}
+
+// GetPrimitiveTypeCount (XeD3DCommands.cpp:1022), verbatim.
+static std::uint32_t VertexCountFromPrims(std::uint32_t ue3, std::uint32_t prims) {
+  switch (ue3) {
+    case 0: return prims * 3;
+    case 1: return prims + 2;
+    case 2: return prims * 2;
+    case 3: return prims * 4;
+    default: return 0;
+  }
+}
+
+REX_EXTERN(__imp__sub_829CA900);
+REX_HOOK_RAW(sub_829CA900) {
+  const std::uint32_t ue3_prim = ctx.r3.u32;
+  const std::uint32_t num_prims = ctx.r4.u32;
+  const std::uint32_t vtx_guest = ctx.r5.u32;
+  const std::uint32_t stride = ctx.r6.u32;
+  if (NativeActive() && dpour_scene::Enabled() && dpour_scene::UpAtApiLevel()) {
+    const std::uint32_t d3d_prim = D3DPrimFromUE3(ue3_prim);
+    const std::uint32_t vtx_count = VertexCountFromPrims(ue3_prim, num_prims);
+    if (d3d_prim != 0 && vtx_count != 0 && GuestAddrPlausible(vtx_guest)) {
+      dpour_scene::UPDraw u;
+      FillCommonDrawInputs(u.d, d3d_prim);
+      u.d.indexed = false;
+      u.vtx_guest = vtx_guest;
+      u.vtx_count = vtx_count;
+      u.vtx_stride = stride;
+      dpour_scene::CaptureUPBegin(base, u);
+      dpour_scene::CaptureUPEnd();  // the caller's buffer is full NOW
+      dpour_tex::NextDraw();
+    }
+    if (dpour_scene::OwnDevice()) {
+      return;  // never reaches BeginVertices, so nothing is allocated or queued
+    }
+  }
+  __imp__sub_829CA900(ctx, base);
+}
+
+REX_EXTERN(__imp__sub_829CAE50);
+REX_HOOK_RAW(sub_829CAE50) {
+  const std::uint32_t ue3_prim = ctx.r3.u32;
+  const std::uint32_t min_vtx = ctx.r4.u32;
+  const std::uint32_t num_vertices = ctx.r5.u32;
+  const std::uint32_t num_prims = ctx.r6.u32;
+  const std::uint32_t idx_guest = ctx.r7.u32;
+  const std::uint32_t idx_stride = ctx.r8.u32;
+  const std::uint32_t vtx_guest = ctx.r9.u32;
+  const std::uint32_t vtx_stride = ctx.r10.u32;
+  if (NativeActive() && dpour_scene::Enabled() && dpour_scene::UpAtApiLevel()) {
+    const std::uint32_t d3d_prim = D3DPrimFromUE3(ue3_prim);
+    const std::uint32_t idx_count = VertexCountFromPrims(ue3_prim, num_prims);
+    if (d3d_prim != 0 && idx_count != 0 && num_vertices != 0 &&
+        GuestAddrPlausible(vtx_guest) && GuestAddrPlausible(idx_guest)) {
+      dpour_scene::UPDraw u;
+      FillCommonDrawInputs(u.d, d3d_prim);
+      u.d.indexed = true;
+      u.vtx_guest = vtx_guest;
+      u.vtx_count = num_vertices;
+      u.vtx_stride = vtx_stride;
+      u.idx_guest = idx_guest;
+      u.idx_count = idx_count;
+      u.idx_32bit = (idx_stride == 4);
+      // The RHI negates MinVertexIndex before handing it to the device, because
+      // the device rebases the indices onto the copied vertex range. We copy the
+      // caller's vertices from index 0, so the rebase is ours to apply and it
+      // has the same sign the device sees.
+      u.base_vertex = -static_cast<std::int32_t>(min_vtx);
+      dpour_scene::CaptureUPBegin(base, u);
+      dpour_scene::CaptureUPEnd();
+      dpour_tex::NextDraw();
+    }
+    if (dpour_scene::OwnDevice()) {
+      return;
+    }
+  }
+  __imp__sub_829CAE50(ctx, base);
 }
 
 // RHISetRenderTarget(NewRenderTarget, NewDepthStencilTarget) - XeD3DCommands.cpp:668.
@@ -748,8 +862,32 @@ REX_HOOK_RAW(sub_829C8BD8) {
   __imp__sub_829C8BD8(ctx, base);
 }
 
-DPOUR_RHI_LOGHOOK(sub_829CAF60, "RHIClear", 500)
 DPOUR_RHI_LOGHOOK(sub_829CE888, "RHICopyFromResolveTarget", 500)
+
+// RHIClear - XeD3DCommands.cpp:1410, the API entry UnleashedRecomp hooks as
+// `Clear` (video.cpp:7831). Under own-device the guest's clear is dropped: it
+// clears EDRAM for a frame nobody assembles, and our own targets are cleared by
+// the replay, per target and per replay.
+//
+// The device-level Clear (sub_82D27328) is hooked as well and does the same, but
+// only as a backstop for clears that reach the device without passing through
+// here - the API entry is the one that matches the references.
+REX_EXTERN(__imp__sub_829CAF60);
+REX_HOOK_RAW(sub_829CAF60) {
+  if (NativeActive() && dpour_scene::Enabled() && dpour_scene::OwnDevice()) {
+    static std::atomic<std::uint64_t> dropped{0};
+    const std::uint64_t n = dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || n == 1000) {
+      REXLOG_INFO("[native-draw] own-device: RHIClear dropped x{}", n);
+    }
+    return;
+  }
+  if (HooksEnabled()) {
+    static std::atomic<std::uint64_t> _cnt{0};
+    CountAndLog(_cnt, "RHIClear", 500);
+  }
+  __imp__sub_829CAF60(ctx, base);
+}
 
 // D3DDevice::Clear = sub_82D27328 - a PACKET WRITER (it reaches the command
 // buffer through sub_82D26BE8; see the classification in

@@ -1098,6 +1098,18 @@ std::uint32_t Acquire(const std::uint8_t* base, std::uint32_t texture_rhi_guest)
   // the object, is what the engine shares between render targets.
   Fetch fetch{};
   if (!ResolveFetch(base, texture_rhi_guest, fetch)) {
+    // THE RESOLVE LINK DOES NOT NEED THE FETCH. The census named the white
+    // painter: all twelve offenders were resolve-destination textures
+    // (0x411c1c00 and family - the same keys the "resolve link" lines carry),
+    // failing here and going white WITHOUT the link ever being consulted,
+    // because the fetch resolve had been moved in front of it. The link is
+    // keyed on the texture OBJECT precisely so it works when nothing else
+    // does - it is the reference's ProcSetTexture serving the surface. Ask it
+    // before surrendering to white.
+    const std::uint32_t rt_slot = dpour_scene::RtBackedSrvSlot(texture_rhi_guest, 0);
+    if (rt_slot != kInvalidSlot) {
+      return rt_slot;
+    }
     return ServeWhite(kWhiteNoFetch, texture_rhi_guest, 0, 0, 0);
   }
 

@@ -160,11 +160,17 @@ std::atomic<std::int32_t> g_fetch_offset{-1};
 
 bool ReadFetchAt(const std::uint8_t* base, std::uint32_t d3d, std::uint32_t off,
                  BufferFetch& out) {
+  // DPOUR_NR_VB_STRICT=1: A/B probe, default-OFF. Restores the pre-eb2612a
+  // 0xC0000000 fetch ceiling - i.e. drops the world's 0xF3xxxxxx buffers again
+  // while keeping every other change - so a visual regression can be pinned to
+  // "the newly admitted draws" versus everything else with one 60-second run.
+  static const bool strict = EnvOn("DPOUR_NR_VB_STRICT");
   const std::uint32_t f0 = LoadBE32(base + d3d + off);
   const std::uint32_t f1 = LoadBE32(base + d3d + off + 4);
   const std::uint32_t addr = f0 & 0xFFFFFFFCu;
   const std::uint64_t bytes = static_cast<std::uint64_t>((f1 >> 2) & 0xFFFFFFu) * 4ull;
-  if (!GuestAddrPlausible(addr) || bytes < 4 || bytes > (48ull << 20)) {
+  if (!GuestAddrPlausible(addr) || (strict && addr >= 0xC0000000u) || bytes < 4 ||
+      bytes > (48ull << 20)) {
     return false;
   }
   out.addr = addr;

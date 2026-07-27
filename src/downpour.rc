@@ -1,0 +1,7 @@
+// Windows resource script for downpour.exe
+// dpour-fork 2026-07-03: adds the Silent Hill: Downpour icon so the exe
+// shows the marketing icon in Explorer, task bar, and Alt-Tab. Icon file
+// is the same icon.ico the launcher (PlayDownpour.exe) already ships.
+
+// Windows uses the lowest-numbered icon (ID 1) as the application icon.
+IDI_ICON1 ICON "downpour.ico"

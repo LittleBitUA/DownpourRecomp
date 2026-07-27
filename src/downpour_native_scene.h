@@ -49,6 +49,16 @@ bool NativeOnly();
 // reproduced, so the Xenos emulation stops rasterising them.
 bool SkipGuestDraws();
 
+// DPOUR_NR_OWN_DEVICE: the Unleashed/Marathon arrangement - we own the device,
+// the guest's submissions never reach the GPU, and there is no emulated frame
+// to fall back to or compose with. Implies the guest-output replacement.
+//
+// Callers outside this module use it to drop the guest's PACKET WRITERS. Which
+// functions those are was measured, not guessed: of the 74 device functions the
+// game's RHI calls, 39 reach the command buffer and 35 only update the device's
+// register shadow (reference_downpour_device_api_classification).
+bool OwnDevice();
+
 // --- guest render thread ----------------------------------------------------
 void BeginFrame();
 void EndFrame();

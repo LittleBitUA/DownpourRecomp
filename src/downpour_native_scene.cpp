@@ -646,6 +646,78 @@ bool IsSceneColorSurface(std::uint32_t surface) {
   return false;
 }
 
+// DPOUR_NR_OWN_DEVICE=1. THE UNLEASHED/MARATHON ARRANGEMENT: we own the device,
+// so the guest's own submissions do not reach the GPU and there is no emulated
+// frame at all - ours is the frame, not a replacement for one.
+//
+// Decided 27.07.2026 after establishing that our architecture was a third one,
+// present in no reference: we hooked like Unleashed but called __imp__ through,
+// so both pipelines ran. That is where the doubled frame time came from, where
+// the question "which pass is the frame" came from (it does not exist in
+// Unleashed or Marathon), and where the white screens came from - they appear on
+// the SEAM between the two pipelines.
+//
+// WHAT THIS COVERS TODAY: the indexed and non-indexed draws, which we reproduce
+// in full. Measured groundwork in reference_downpour_device_api_classification:
+// of the 74 device functions the game's RHI calls, 39 write GPU packets and 35
+// only update the device's register shadow. The 35 can keep running untouched -
+// that is precisely why reading the shadow was the right way to recover state.
+//
+// WHAT IT DOES NOT COVER YET, and the reason is structural rather than
+// unfinished work: the user-pointer draws cannot be suppressed at our hook.
+// BeginVertices IS the allocation - it hands the game the pointer it then
+// memcpy's into - so declining it returns null and the game breaks. Their
+// publish is the inlined [dev+13844] -> [dev+48] store at each call site, which
+// is not a function and cannot be hooked. Suppressing UP work needs the device
+// replaced further down, not a flag here.
+//
+// DEFAULT OFF, and it must stay off until someone has watched the game with it
+// on: it decides what reaches the screen.
+bool OwnDeviceMode() {
+  static const bool on = EnvOn("DPOUR_NR_OWN_DEVICE");
+  return on;
+}
+
+// === DPOUR MIGRATION 2026-07-27: what own-device mode RETIRES ==================
+//
+// Everything listed here exists to negotiate with an emulated frame. Once the
+// guest's submissions no longer reach the GPU there is no such frame, the
+// negotiation has no other side, and all of it comes out. It is left standing
+// until own-device mode has been watched and reaches parity, because until then
+// the old path is the only one that produces a picture at all - deleting it
+// first would leave nothing to compare against and nothing to fall back to.
+//
+// DELETE, in this order, once own-device mode is confirmed:
+//
+//   YieldWithoutSceneOn / the yield block in RenderRecorded
+//       skate3's arrangement: hand the frame back to the emulator on menus,
+//       loading and movies. There is nothing to hand it back to.
+//
+//   GuestOutMode / DPOUR_NR_DRAW_GUESTOUT and the "REPLACED natively" log
+//       "replacement" stops being a concept; ours is simply the frame.
+//
+//   BackbufferPrioEnabled + the draw-count vote in EndFrame
+//       the whole "which pass is the frame" question, which - as the reference
+//       comparison finally made plain - does not exist in Unleashed or Marathon,
+//       because every guest surface has its own target and the back buffer is
+//       the swapchain texture. It was never a question about this game; it was a
+//       question about our own architecture.
+//
+//   InjectEnabled + the readback/encode pipeline (already idle)
+//       writing our image back into guest memory so the emulated pipeline could
+//       carry it. No emulated pipeline, no readback.
+//
+//   NativeOnly / DPOUR_NR_DRAW_ONLY
+//       "composite opaquely so the native image is all there is to see" is what
+//       own-device mode is, permanently.
+//
+// KEEP - these are properties of the GAME, not of the old arrangement:
+//   the target registry and CanonicalSurface (the EDRAM alias is real, the
+//   game's own engineers documented the tile map), the resolve links and copies,
+//   RB_COLOR_MASK translation, the state shadow reader, everything in the
+//   capture path.
+// === END DPOUR MIGRATION 2026-07-27 ==========================================
+
 // DPOUR_NR_YIELD_NO_SCENE=1. Yield the frame to the emulated output when the
 // game drew nothing into its own scene colour surface.
 //
@@ -1844,6 +1916,10 @@ bool SkipGuestDraws() {
   return on;
 }
 
+// Public face of OwnDeviceMode(), for the hooks in downpour_native_draws.cpp
+// that have to drop the guest's packet writers.
+bool OwnDevice() { return OwnDeviceMode(); }
+
 namespace {
 // Diagnostic gates, both default OFF.
 //
@@ -2304,7 +2380,11 @@ bool NoUPCapture() {
 // screen then shows OUR frame (with per-frame fallback to the emulated one),
 // instead of the overlay composite painted over the emulated frame.
 bool GuestOutMode() {
-  static const bool on = EnvFlag("DPOUR_NR_DRAW_GUESTOUT");
+  // Implied by own-device mode: if the guest's draws never reached the GPU,
+  // ours is the only image there is, so it must be what the presenter shows.
+  // Having to set two variables to get one coherent state is how a run ends up
+  // half-migrated and impossible to read.
+  static const bool on = EnvFlag("DPOUR_NR_DRAW_GUESTOUT") || OwnDeviceMode();
   return on;
 }
 
@@ -2714,6 +2794,12 @@ std::uint32_t SceneResolveTexture() {
 }
 
 bool ShouldSkipGuestDraw() {
+  // OWN-DEVICE MODE: a draw we reproduced does not also go to the emulated GPU.
+  // Unconditional, because in this mode there is no emulated frame to protect -
+  // see OwnDeviceMode() for what it does and does not cover.
+  if (OwnDeviceMode()) {
+    return true;
+  }
   if (!SkipGuestDraws()) {
     return false;
   }
@@ -4170,7 +4256,10 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   // ...and the same question asked properly (see YieldWithoutSceneOn): a frame
   // with draws in it is not a frame with a SCENE in it. The intro movies have
   // draws and no scene, and publishing them is what puts white on screen.
-  if (YieldWithoutSceneOn()) {
+  // ...but NOT when we own the device. Yielding means "let the emulated frame
+  // through", and in own-device mode there is no emulated frame to let through -
+  // the guest's draws never reached the GPU. Yielding there would show nothing.
+  if (YieldWithoutSceneOn() && !OwnDeviceMode()) {
     bool scene_drew = false;
     for (std::uint32_t p = 0; p < kMaxPasses; ++p) {
       if (passes_snap[p].draws != 0 && IsSceneColorSurface(passes_snap[p].color_object)) {

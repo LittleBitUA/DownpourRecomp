@@ -751,6 +751,31 @@ REX_HOOK_RAW(sub_829C8BD8) {
 DPOUR_RHI_LOGHOOK(sub_829CAF60, "RHIClear", 500)
 DPOUR_RHI_LOGHOOK(sub_829CE888, "RHICopyFromResolveTarget", 500)
 
+// D3DDevice::Clear = sub_82D27328 - a PACKET WRITER (it reaches the command
+// buffer through sub_82D26BE8; see the classification in
+// reference_downpour_device_api_classification), and group 2 of the own-device
+// migration after the draws themselves.
+//
+// Under DPOUR_NR_OWN_DEVICE the guest's clear is dropped: it clears EDRAM for an
+// emulated frame that, in that mode, nobody assembles or shows. Our own targets
+// are cleared by the replay itself, per target and per replay, so nothing here
+// is needed to make our image whole.
+//
+// Outside that mode this hook is entirely pass-through - the emulated frame is
+// still the frame, and clearing is part of drawing it.
+REX_EXTERN(__imp__sub_82D27328);
+REX_HOOK_RAW(sub_82D27328) {
+  if (NativeActive() && dpour_scene::Enabled() && dpour_scene::OwnDevice()) {
+    static std::atomic<std::uint64_t> dropped{0};
+    const std::uint64_t n = dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n == 1 || n == 1000 || n == 100000) {
+      REXLOG_INFO("[native-draw] own-device: guest Clear dropped x{}", n);
+    }
+    return;
+  }
+  __imp__sub_82D27328(ctx, base);
+}
+
 // RHICopyToResolveTarget(SourceSurface, bKeepOriginalSurface, &ResolveParams) -
 // XeD3DRenderTarget.cpp:397. When the source is the scene colour surface and
 // injection is on, dpour_scene writes the NATIVE image into the resolve texture

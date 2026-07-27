@@ -80,7 +80,13 @@ bool EnvOn(const char* name) {
   return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
 
-inline bool GuestAddrPlausible(std::uint32_t a) { return a >= 0x1000u && a < 0xC0000000u; }
+// The whole 32-bit guest space except the null page. The previous upper bound
+// of 0xC0000000 was an invention, and it cost the world: appPhysicalAlloc hands
+// out vertex memory at 0xF3xxxxxx, so every static mesh whose data lives there
+// failed ResolveBuffer with fetch == BaseAddress == 0xF3... - 1744 of the 3577
+// dropped draws in the 28.07 census. Safety against bad pointers is
+// SpanReadable's page probe, not an address-range guess.
+inline bool GuestAddrPlausible(std::uint32_t a) { return a >= 0x1000u; }
 
 bool SpanReadable(const void* p, std::size_t n) {
   MEMORY_BASIC_INFORMATION mbi{};
@@ -177,8 +183,20 @@ bool ReadFetchAt(const std::uint8_t* base, std::uint32_t d3d, std::uint32_t off,
 //
 // `rhi_object` is optional and used only to learn/confirm the offset;
 // `d3d_object` is what the device was actually handed.
+// Why ResolveBuffer said no, for the census below. The reference has no
+// equivalent of this whole mechanism - Unleashed's SetStreamSource receives the
+// buffer as its own host struct (video.cpp:5116) because creation is hooked
+// (video.cpp:3160), so "the bound buffer cannot be read" is a failure class
+// that exists only here, where the game owns creation and we read its structs.
+enum : std::uint8_t {
+  kVbFailNone = 0,
+  kVbFailD3dBad = 1,      // the D3D struct pointer itself is implausible/unreadable
+  kVbFailNoKey = 2,       // no RHI BaseAddress to verify against, learned offset missed
+  kVbFailMismatch = 3,    // fetch constant found, but no offset matched BaseAddress
+};
+
 bool ResolveBuffer(const std::uint8_t* base, std::uint32_t rhi_object, std::uint32_t d3d_object,
-                   BufferFetch& out) {
+                   BufferFetch& out, std::uint8_t* fail_reason = nullptr) {
   std::uint32_t d3d = d3d_object;
   std::uint32_t known_addr = 0;
   if (GuestAddrPlausible(rhi_object) && ObjectReadable(base, rhi_object, 20)) {
@@ -188,6 +206,9 @@ bool ResolveBuffer(const std::uint8_t* base, std::uint32_t rhi_object, std::uint
     }
   }
   if (!GuestAddrPlausible(d3d) || !ObjectReadable(base, d3d, 64)) {
+    if (fail_reason != nullptr) {
+      *fail_reason = kVbFailD3dBad;
+    }
     return false;
   }
 
@@ -198,6 +219,9 @@ bool ResolveBuffer(const std::uint8_t* base, std::uint32_t rhi_object, std::uint
     }
   }
   if (known_addr == 0) {
+    if (fail_reason != nullptr) {
+      *fail_reason = kVbFailNoKey;
+    }
     return false;  // nothing to verify against, and the learned offset did not fit
   }
   for (const std::uint32_t off : {24u, 28u, 20u, 32u, 16u}) {
@@ -207,7 +231,81 @@ bool ResolveBuffer(const std::uint8_t* base, std::uint32_t rhi_object, std::uint
       return true;
     }
   }
+  // Refused after every offset: the device stream was bound by something that
+  // never went through RHISetStreamSource, so the two shadows name different
+  // buffers. Measured 28.07: these are FGPUMemMove's memexport defrag draws
+  // (XeD3DUtil.cpp:137 - a stack-built D3D struct, stride 64). They MUST stay
+  // uncaptured: a captured draw is a suppressed guest submission under
+  // own-device, and suppressing the defrag pass corrupts the memory it moves.
+  if (fail_reason != nullptr) {
+    *fail_reason = kVbFailMismatch;
+  }
   return false;
+}
+
+// Census of draws dropped because the bound vertex buffer could not be
+// resolved. Same idea as the white-texture census that found the resolve-link
+// hole: the counter alone said "11827 vb object" during gameplay while the
+// world stayed white, and named nothing. Keyed by the RHI object (or the D3D
+// object when the RHI shadow is empty), keeps the raw fetch dwords at +24 so
+// the print can say whether the fetch was absent, out of clamp, or pointing at
+// different memory than the RHI object's BaseAddress.
+struct VbFailEntry {
+  std::uint32_t key = 0;
+  std::uint32_t rhi = 0;
+  std::uint32_t d3d = 0;
+  std::uint32_t known_addr = 0;
+  std::uint32_t raw0 = 0;  // BE dword at d3d+24
+  std::uint32_t raw1 = 0;  // BE dword at d3d+28
+  std::uint32_t stream = 0;
+  std::uint32_t stride = 0;
+  std::uint8_t reason = kVbFailNone;
+  std::uint64_t count = 0;
+};
+std::mutex g_vbfail_mutex;
+VbFailEntry g_vbfail[12];
+std::atomic<std::uint64_t> g_vbfail_reason[4] = {};
+
+void NoteVbObjFail(const std::uint8_t* base, std::uint32_t stream, std::uint32_t rhi,
+                   std::uint32_t d3d, std::uint32_t stride, std::uint8_t reason) {
+  g_vbfail_reason[reason < 4 ? reason : 0].fetch_add(1, std::memory_order_relaxed);
+  const std::uint32_t key = rhi != 0 ? rhi : d3d;
+  std::lock_guard<std::mutex> lock(g_vbfail_mutex);
+  VbFailEntry* slot = nullptr;
+  for (auto& e : g_vbfail) {
+    if (e.count != 0 && e.key == key) {
+      slot = &e;
+      break;
+    }
+    if (slot == nullptr && e.count == 0) {
+      slot = &e;
+    }
+  }
+  if (slot == nullptr) {
+    return;  // table full - the top offenders are already named
+  }
+  slot->key = key;
+  slot->rhi = rhi;
+  slot->d3d = d3d;
+  slot->stream = stream;
+  slot->stride = stride;
+  slot->reason = reason;
+  slot->known_addr = 0;
+  slot->raw0 = 0;
+  slot->raw1 = 0;
+  if (GuestAddrPlausible(rhi) && ObjectReadable(base, rhi, 20)) {
+    slot->known_addr = LoadBE32(base + rhi + 12);
+  }
+  const std::uint32_t d3d_eff =
+      GuestAddrPlausible(d3d) ? d3d
+      : (slot->known_addr != 0 && GuestAddrPlausible(rhi) && ObjectReadable(base, rhi, 20))
+          ? LoadBE32(base + rhi + 8)
+          : 0;
+  if (GuestAddrPlausible(d3d_eff) && ObjectReadable(base, d3d_eff, 32)) {
+    slot->raw0 = LoadBE32(base + d3d_eff + 24);
+    slot->raw1 = LoadBE32(base + d3d_eff + 28);
+  }
+  ++slot->count;
 }
 
 // D3DPRIMITIVETYPE -> what the input assembler needs. Fans, rect lists and quad
@@ -3581,9 +3679,11 @@ bool CaptureDraw(const std::uint8_t* base, const DrawDesc& d) {
       return false;
     }
     BufferFetch fetch;
-    if (!ResolveBuffer(base, d.vb_guest[s], d.vb_d3d[s], fetch)) {
+    std::uint8_t fail = kVbFailNone;
+    if (!ResolveBuffer(base, d.vb_guest[s], d.vb_d3d[s], fetch, &fail)) {
       g_size_unknown.fetch_add(1, std::memory_order_relaxed);
       g_no_vbobj.fetch_add(1, std::memory_order_relaxed);
+      NoteVbObjFail(base, s, d.vb_guest[s], d.vb_d3d[s], d.stride[s], fail);
       return false;
     }
     g_size_known.fetch_add(1, std::memory_order_relaxed);
@@ -5424,6 +5524,31 @@ void LogStats() {
       g_no_ibdata.load(std::memory_order_relaxed),
       g_no_constants.load(std::memory_order_relaxed), g_no_device.load(std::memory_order_relaxed),
       g_overflow.load(std::memory_order_relaxed));
+  if (g_no_vbobj.load(std::memory_order_relaxed) != 0) {
+    REXLOG_INFO("[native-scene] vb-object failures by reason: {} d3d unreadable, {} no key + "
+                "learned miss, {} fetch/BaseAddress mismatch",
+                g_vbfail_reason[kVbFailD3dBad].load(std::memory_order_relaxed),
+                g_vbfail_reason[kVbFailNoKey].load(std::memory_order_relaxed),
+                g_vbfail_reason[kVbFailMismatch].load(std::memory_order_relaxed));
+    std::lock_guard<std::mutex> lock(g_vbfail_mutex);
+    for (const auto& e : g_vbfail) {
+      if (e.count == 0) {
+        continue;
+      }
+      // Decode the +24 fetch the way ResolveBuffer would, so the line itself
+      // says which gate refused it: addr==0 means the header was never given an
+      // address, size==0 means the dword pair is not a fetch constant at all,
+      // and a plausible addr different from known_addr is a genuinely stale
+      // shadow pair.
+      const std::uint32_t f_addr = e.raw0 & 0xFFFFFFFCu;
+      const std::uint64_t f_size = static_cast<std::uint64_t>((e.raw1 >> 2) & 0xFFFFFFu) * 4ull;
+      REXLOG_INFO(
+          "[native-scene]   vb-fail x{}: reason={} stream={} stride={} rhi={:#x} d3d={:#x} "
+          "BaseAddress={:#x} fetch@24 raw={:#x},{:#x} -> addr={:#x} size={}",
+          e.count, e.reason, e.stream, e.stride, e.rhi, e.d3d, e.known_addr, e.raw0, e.raw1,
+          f_addr, f_size);
+    }
+  }
   dpour_state::LogStats();
   dpour_vbuf::LogStats();
   dpour_pipeline::LogStats();

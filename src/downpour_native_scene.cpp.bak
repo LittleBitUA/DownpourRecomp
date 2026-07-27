@@ -45,13 +45,6 @@
 using Microsoft::WRL::ComPtr;
 
 namespace dpour_scene {
-
-// Defined below; the guest-output callback (in the anonymous namespace) records
-// the frame through it. Returns true when it composited into `out_res`, i.e.
-// when the presenter should show OUR image instead of the emulated one.
-bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandList* dl,
-                    ID3D12GraphicsCommandList* cmd, std::uint32_t width, std::uint32_t height,
-                    ID3D12Resource* out_res, std::uint64_t submission, std::uint64_t completed);
 namespace {
 
 // The native pass renders at the guest's own resolution. That is not a
@@ -241,87 +234,15 @@ bool Topology(std::uint32_t prim, D3D12_PRIMITIVE_TOPOLOGY& topo,
   }
 }
 
-// THE CPU STAGING ARENA - UnleashedRecomp's IntermediaryUploadAllocator
-// (video.cpp:533), 16 MB blocks and all.
-//
-// Capture writes the bytes of a draw HERE, into plain memory, and records an
-// OFFSET. The GPU address is created later, in the replay, out of the frame's
-// upload allocator - which is what FlushRenderStateForRenderThread does
-// (video.cpp:4520) and what ProcDrawPrimitiveUP does for its vertices (:4711).
-//
-// What this replaces: capture allocated GPU memory and baked the ADDRESS into
-// the snapshot. Anything reading that snapshot afterwards - a second replay, a
-// replay after the allocator rotated - read whatever now lived at that address.
-// On screen: the loading screen's text still standing in gameplay and coming
-// apart one glyph at a time, because the geometry was fine and the constants
-// underneath it belonged to a later frame. Every workaround built around that
-// (one replay per published frame, conservative completion, slack in the upload
-// caches) exists only because the address was baked too early. They come out
-// with it.
-struct CpuArena {
-  static constexpr std::uint32_t kBlockBytes = 16u << 20;
-  std::vector<std::unique_ptr<std::uint8_t[]>> blocks;
-  std::uint32_t index = 0;
-  std::uint32_t offset = 0;
-
-  // Returns the writable pointer and, through out_handle, what the snapshot
-  // stores. Allocations never straddle a block, so the handle decomposes back
-  // into (block, byte) by plain division.
-  std::uint8_t* Alloc(std::uint32_t bytes, std::uint32_t& out_handle) {
-    if (bytes == 0 || bytes > kBlockBytes) {
-      return nullptr;
-    }
-    const std::uint32_t aligned = (bytes + 15u) & ~15u;
-    if (offset + aligned > kBlockBytes) {
-      ++index;
-      offset = 0;
-    }
-    if (blocks.size() <= index) {
-      blocks.resize(index + 1);
-    }
-    auto& b = blocks[index];
-    if (!b) {
-      b = std::make_unique<std::uint8_t[]>(kBlockBytes);
-    }
-    out_handle = index * kBlockBytes + offset;
-    std::uint8_t* at = b.get() + offset;
-    offset += aligned;
-    return at;
-  }
-
-  const std::uint8_t* At(std::uint32_t handle) const {
-    const std::uint32_t i = handle / kBlockBytes;
-    if (i >= blocks.size() || !blocks[i]) {
-      return nullptr;
-    }
-    return blocks[i].get() + (handle % kBlockBytes);
-  }
-
-  void Reset() {
-    index = 0;
-    offset = 0;
-  }
-};
-constexpr std::uint32_t kNoStage = 0xFFFFFFFFu;
-
 // --- a captured draw, with every input already resolved ----------------------
 struct SceneDraw {
   ID3D12PipelineState* pso = nullptr;
   D3D12_VERTEX_BUFFER_VIEW vbv[kMaxStreams]{};
   std::uint32_t vbv_count = 0;
   D3D12_INDEX_BUFFER_VIEW ibv{};
-  // Handles into the staging arena, NOT GPU addresses. Resolved in the replay.
-  std::uint32_t cb_vertex = kNoStage;
-  std::uint32_t cb_pixel = kNoStage;
-  std::uint32_t cb_shared = kNoStage;
-  std::uint32_t cb_vertex_bytes = 0;
-  std::uint32_t cb_pixel_bytes = 0;
-  // User-primitive geometry, staged the same way (ProcDrawPrimitiveUP allocates
-  // its vertices from the FRAME allocator at draw time, video.cpp:4711).
-  std::uint32_t up_vtx = kNoStage;
-  std::uint32_t up_vtx_bytes = 0;
-  std::uint32_t up_idx = kNoStage;
-  std::uint32_t up_idx_bytes = 0;
+  std::uint64_t cb_vertex = 0;
+  std::uint64_t cb_pixel = 0;
+  std::uint64_t cb_shared = 0;
   std::uint32_t count = 0;  // indices or vertices
   std::uint32_t start = 0;
   // BeginIndexedVertices rebases indices onto the copied vertex range with a
@@ -342,57 +263,15 @@ struct SceneDraw {
   std::uint8_t dpg = 0xFF;
 };
 
-// A RESOLVE THE GAME ASKED FOR, recorded where it happened in the draw stream.
-//
-// RHICopyToResolveTarget (XeD3DRenderTarget.cpp:399) copies a surface into its
-// resolve texture and, doing so, UNDOES the exponent bias the shaders wrote with
-// (:519, D3DRESOLVE_EXPONENTBIAS(-GetColorExpBias())). We have been aliasing
-// instead: handing the sampler the surface's own target, which skips the copy
-// AND the un-biasing, so everything the game composes from the scene texture
-// reads 2^bias times too bright - eight times, for the scene colour
-// (SCENE_COLOR_BIAS_FACTOR_EXP = 3). That is the white screen, and our own probe
-// had already photographed it as PS c0 = 8.0.
-//
-// The bias is NOT a constant to hardcode: XeGetRenderTargetColorExpBias
-// (XeD3DRenderTarget.cpp:94) returns 3, 5 or 0 depending on the surface and
-// texture formats. It is read per surface, from the game's own struct.
-struct PendingResolve {
-  std::uint32_t surface = 0;     // source surface object (target registry key)
-  std::uint32_t d3d_tex = 0;     // destination D3D texture object (link key)
-  std::int32_t bias = 0;         // XeSurfaceInfo.ColorExpBias
-  std::uint32_t draw_index = 0;  // how many draws had been staged when it fired
-};
-
 std::mutex g_mutex;
 std::vector<SceneDraw> g_staging;
 std::vector<SceneDraw> g_published;
-// FOUR ARENAS IN ROTATION, so a snapshot and the bytes it points at can never
-// come apart. Capture fills one, publish hands it to the replay and moves
-// capture to the next. The replay notes WHICH arena its snapshot came with and
-// reads only that one - a fresh publish cannot pull the ground from under a
-// replay in progress, because it lands three arenas away.
-//
-// Rotating rather than allocating anew: an arena holds 16 MB blocks, and
-// building them per frame would trade one bug for a stall.
-constexpr std::uint32_t kArenaCount = 4;
-CpuArena g_arenas[kArenaCount];
-std::uint32_t g_stage_arena_index = 0;      // capture writes here
-std::uint32_t g_published_arena_index = 0;  // the replay reads here
-std::vector<PendingResolve> g_resolve_staging;
-std::vector<PendingResolve> g_resolve_published;
 std::atomic<ID3D12Device*> g_device{nullptr};
 
 // Render-target passes. A frame draws into several surfaces; only the one that
 // receives the most geometry is the scene, and replaying a shadow pass into it
 // would smear a light's view across the image.
-// SIXTEEN WAS NOT ENOUGH, and the shortfall was silent. A measured Downpour
-// frame binds 23 DISTINCT colour surfaces (logged: "device pass: surface ..."),
-// and with the MSAA diversion gone every one of them wants its own slot. Past
-// the sixteenth, PassSlotFor used to hand back slot 0 - which is the BACK
-// BUFFER on most frames - so shadow, downsample and post draws were rendered
-// straight into the image that gets composited. Enough slots for every surface
-// the game can bind, and an explicit refusal past that, never slot 0.
-constexpr std::uint32_t kMaxPasses = 64;
+constexpr std::uint32_t kMaxPasses = 16;
 struct PassSlot {
   std::uint32_t color = 0;   // the ref pointer the RHI call carried (pass key)
   std::uint32_t depth = 0;
@@ -421,10 +300,7 @@ std::uint32_t g_published_pass = 0;
 // bound through the device, not through RHISetRenderTarget, so no colour
 // address ever identifies it - the bracket does. kScenePassColor is the slot's
 // stand-in "colour" (an impossible guest address).
-// RETIRED. Deliberately outside [0, kMaxPasses) so it can never collide with a
-// real slot now that PassSlotFor is free to hand out every one of them: the
-// reserved scene slot no longer exists, and nothing routes here.
-constexpr std::uint32_t kScenePassSlot = 0xFFFFFFFEu;
+constexpr std::uint32_t kScenePassSlot = kMaxPasses - 1;
 constexpr std::uint32_t kScenePassColor = 0xFFFFFFFFu;
 // UE3's ESceneDepthPriorityGroup: 0 = UnrealEdBackground, 1 = World,
 // 2 = Foreground. Measured live: 119815 world against 2441 foreground.
@@ -485,16 +361,6 @@ std::atomic<std::uint32_t> g_scene_fetch_addr{0};
 struct SurfaceMeta {
   std::uint32_t w = 0;
   std::uint32_t h = 0;
-  // Named by the game itself at RHICreateTargetableSurface: DefaultDepth,
-  // ShadowDepthZ, DominantShadowDepthZ, TranslucencyShadowDepthZ. The reference
-  // makes the same distinction on the format and acts on it in two places
-  // (video.cpp:3572 and :3582, "Depth stencil textures in this game are
-  // guaranteed to be transient") - it does not copy depth resolves at all.
-  bool is_depth = false;
-  // The game's OWN name for this surface, copied because the guest string it
-  // came from may be freed. "5 of 17 resolves had no source" is not actionable;
-  // "SceneColorLDR and FilterColor had no source" says which pass to look at.
-  char name[24] = {};
 };
 extern float g_depth_clear;  // defined with the scene targets below
 std::mutex g_reg_mutex;
@@ -518,239 +384,29 @@ std::uint32_t g_reg_rtv_next = 0;
 std::uint32_t g_reg_dsv_next = 0;
 constexpr std::uint32_t kRegMaxTargets = 48;
 
-// Destination textures for the real resolve copy - one per resolved D3D texture
-// object. The reference owns exactly this: ExecutePendingStretchRectCommands
-// renders a copy of the surface INTO the destination texture, which is what
-// makes it safe for a later draw to sample it while rendering back into the
-// source surface. See ResolveCopyEnabled() for why this is behind a flag.
-struct ResolveTexture {
-  ComPtr<ID3D12Resource> tex;
-  std::uint32_t rtv_index = 0;
-  std::uint32_t srv_slot = 0;
-  std::uint32_t w = 0, h = 0;
-};
-std::unordered_map<std::uint32_t, ResolveTexture> g_resolve_textures;  // render thread only
-std::unordered_map<std::uint32_t, std::uint32_t> g_resolve_srv;  // d3d tex -> srv (g_reg_mutex)
-// WHEN each of those was last actually written by us, in guest frames. A slot
-// that exists is not a slot that holds this frame's content: the ghost of the
-// loading screen in the menu was a texture whose copy stopped being refreshed
-// three states ago and kept being served anyway. Both maps live under
-// g_reg_mutex; the helpers below assume the caller already holds it.
-std::unordered_map<std::uint32_t, std::uint64_t> g_resolve_copy_frame;  // d3d tex -> guest frame
-std::unordered_map<std::uint32_t, std::uint64_t> g_surface_drawn_frame;  // surface -> guest frame
-extern std::atomic<std::uint64_t> g_frame;
-// Three guest frames of slack, not one: capture runs a frame ahead of the replay
-// that makes the copy, and a loading stall replays one published snapshot for a
-// while. Two would be the tight bound; the third is there so a hitch does not
-// flicker the picture between native and decoded.
-constexpr std::uint64_t kFreshFrames = 3;
-
-// DEFAULT OFF - it made the menu WHITE, which is worse than the ghost it was
-// meant to remove. Measured 2026-07-26, reverted the same minute.
-//
-// The reasoning was sound and the result still refutes it: refusing to serve a
-// texture we never refreshed should hand the game the guest texture the emulated
-// path wrote. It does not - the decode comes back white, the same failure the
-// glyph corruption showed earlier. So there is no working fallback to yield TO,
-// and the ghost has to be fixed by making the copy happen, not by declining to
-// serve a stale one. Kept behind the flag because the two maps it fills are the
-// measurement that tells us WHICH surfaces are never rendered by us.
-// DPOUR_NR_ALIAS_KEY=1 to enable. DEFAULT OFF until it is shown to do what the
-// source says it should: the first measurement had GuestBaseAddress returning 0
-// for every resolve destination, so the key silently fell back to the texture
-// object and the mechanism was doing nothing. Shipping an unverified mechanism
-// on top of a user-visible regression is how the last two hours went.
-bool AliasKeyOn() {
-  static const bool on = EnvOn("DPOUR_NR_ALIAS_KEY");
-  return on;
-}
-
-bool FreshGateOff() {
-  static const bool on = EnvOn("DPOUR_NR_FRESH_GATE");
-  return !on;
-}
-
-// DPOUR_NR_SKIP_DEPTH_RESOLVE=1. Skip the resolve COPY for surfaces the game
-// named as depth ("...Depth..." at RHICreateTargetableSurface): the reference
-// does not copy depth resolves at all (video.cpp:3572 and :3582, "Depth stencil
-// textures in this game are guaranteed to be transient").
-//
-// DEFAULT OFF. It should be a no-op - those resolves already fall out below for
-// want of a native target - but it shipped in the same build as a white screen,
-// and "should be a no-op" is a claim to measure, not to assert.
-bool SkipDepthResolves() {
-  static const bool on = EnvOn("DPOUR_NR_SKIP_DEPTH_RESOLVE");
-  return on;
-}
-
-// DPOUR_NR_DRAW_CWMASK=1. Honour the guest's RB_COLOR_MASK in the pipeline
-// instead of writing RGBA unconditionally.
-//
-// This is state translation, not a filter: the game turns colour writes off for
-// the depth prepass, for occlusion work and for the studio's own depth capture,
-// and a draw that writes colour when the guest asked for none paints over the
-// target. It also replaces the "no pixel shader = prepass" test we had been
-// relying on, which this game's own source refutes - SceneRendering.cpp:2625
-// runs the masked-material lists in every prepass, and those bind a pixel shader
-// for the alpha test.
-//
-// DEFAULT OFF: it can only ever REMOVE pixels, so if the offset were wrong the
-// failure mode is an empty screen. dpour_state::LogStats prints the census that
-// says whether it matters at all before anyone turns it on.
-bool ColorWriteMaskOn() {
-  static const bool on = EnvOn("DPOUR_NR_DRAW_CWMASK");
-  return on;
-}
-
-// DPOUR_NR_EDRAM_ALIAS=1. Give the whole DefaultColor family ONE native target.
-//
-// MEASURED, 27.07, this run's own log:
-//   resolve link: key 0x411c1c00 <- surface 0x40cb7860   ("DefaultColorRaw")
-//   resolve link: key 0x411c1c00 <- surface 0x40cb78a0   ("DefaultColorFixedPoint")
-//   resolve WITHOUT SOURCE x200: "DefaultColorFixedPoint" ... -> tex 0x411c1c00
-//   passes: ... *0x40cb7820=188@1280x720 ...             (the scene's 188 draws)
-// Two surfaces, ONE destination texture, and the 188 scene draws landed in a
-// THIRD surface. On the console all three are the same EDRAM tiles - the game's
-// own engineers drew the map in XeD3DRenderTarget.cpp:761-769, and
-// SceneRenderTargets.cpp:1051 sets SceneColorFixedPoint = Raw.Texture outright -
-// so reading through any of them reads what was drawn through the others. Giving
-// each its own target loses exactly that, which is why the texture the composite
-// samples was never written by us.
-//
-// This is not "guess which pass is the scene": the family is identified by the
-// game's own usage strings, which the create hook already collects.
-//
-// DEFAULT OFF - it is a visible change.
-bool EdramAliasOn() {
-  static const bool on = EnvOn("DPOUR_NR_EDRAM_ALIAS");
-  return on;
-}
-
-// Is this surface object the game's own scene colour, or one of the aliases it
-// created alongside it? Identified by the usage strings the game passes to
-// RHICreateTargetableSurface, which the create hook records - not by size, not
-// by draw count.
-bool IsSceneColorSurface(std::uint32_t surface) {
-  if (surface == 0) {
-    return false;
-  }
-  for (const auto& slot : g_scene_color_aliases) {
-    const std::uint32_t cur = slot.load(std::memory_order_relaxed);
-    if (cur == 0) {
-      return false;
-    }
-    if (cur == surface) {
-      return true;
-    }
-  }
-  return false;
-}
-
-// DPOUR_NR_YIELD_NO_SCENE=1. Yield the frame to the emulated output when the
-// game drew nothing into its own scene colour surface.
-//
-// THIS IS SKATE3'S GATE, asked of our data model. RenderScene opens with
-//   if (!g_scene || g_scene->items.empty()) return false;
-// (skate3_native_scene_gpu.cpp:7637) and its g_scene holds WORLD draws only -
-// the 2D overlay is published on a separate list. Ours holds everything, so our
-// `items.empty()` is true only when the game drew literally nothing; the intro
-// movies, which submit their video quads through the ordinary path, sailed past
-// it and published a frame we cannot reproduce. That is the white screen.
-//
-// NOT PORTED, and the reason matters: skate3's other gate reads the presence
-// context (rex::kernel::guest_presence::GameplayContextValue() == 0, :5089).
-// Measured 27.07 in our own kernel log - Downpour writes
-// XGIUserSetContextEx(user=0, context=0x8001, value=0x1) ONCE at startup and
-// never again, three context writes in a whole session. The signal carries no
-// menu/gameplay information in this game, so there is nothing to port.
-//
-// DEFAULT OFF - it decides what reaches the screen.
-bool YieldWithoutSceneOn() {
-  static const bool on = EnvOn("DPOUR_NR_YIELD_NO_SCENE");
-  return on;
-}
-
-// The surface the registry should key on: for a DefaultColor family member, the
-// primary (slot 0); for anything else, itself.
-std::uint32_t CanonicalSurface(std::uint32_t surface) {
-  if (!EdramAliasOn() || surface == 0) {
-    return surface;
-  }
-  const std::uint32_t primary = g_scene_color_aliases[0].load(std::memory_order_relaxed);
-  if (primary == 0 || primary == surface) {
-    return surface;
-  }
-  for (std::uint32_t i = 1; i < kMaxSceneAliases; ++i) {
-    const std::uint32_t cur = g_scene_color_aliases[i].load(std::memory_order_relaxed);
-    if (cur == 0) {
-      break;
-    }
-    if (cur == surface) {
-      return primary;
-    }
-  }
-  return surface;
-}
-
-bool FrameIsFresh(const std::unordered_map<std::uint32_t, std::uint64_t>& when, std::uint32_t key) {
-  if (FreshGateOff()) {
-    return true;
-  }
-  const auto it = when.find(key);
-  if (it == when.end()) {
-    return false;
-  }
-  const std::uint64_t now = g_frame.load(std::memory_order_relaxed);
-  return now <= it->second + kFreshFrames;
-}
-
-bool CopyIsFresh(std::uint32_t d3d_tex) { return FrameIsFresh(g_resolve_copy_frame, d3d_tex); }
-bool SurfaceIsFresh(std::uint32_t surface) { return FrameIsFresh(g_surface_drawn_frame, surface); }
-ComPtr<ID3D12DescriptorHeap> g_resolve_rtv_heap;
-std::uint32_t g_resolve_rtv_next = 0;
-constexpr std::uint32_t kResolveMaxTextures = 32;
-// STICKY FAILURE - the skate3 discipline, verified in their code: g_r.failed is
-// set at EVERY resource and pipeline creation failure
-// (skate3_native_scene_gpu.cpp:2781, 2843, 2928, 2956, 2974, 3342, 4042 ...),
-// EnsurePipeline opens with `if (g_r.failed) return false;` (:4146), and only an
-// explicit ResetSceneFailure() clears it (:11567). A native path that cannot
-// build its resources hands the frame back to the emulator and STAYS there; it
-// does not retry a failing CreateCommittedResource sixty times a second while
-// the log fills and the driver runs out of whatever it ran out of the first
-// time. Failure is where we crash, so failure is where we stop.
-bool g_reg_failed = false;
-
 bool EnsureRegHeaps(ID3D12Device* device) {
   if (g_reg_rtv_heap && g_reg_dsv_heap) {
     return true;
-  }
-  if (g_reg_failed) {
-    return false;
   }
   D3D12_DESCRIPTOR_HEAP_DESC rtv{};
   rtv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
   rtv.NumDescriptors = kRegMaxTargets;
   D3D12_DESCRIPTOR_HEAP_DESC dsv = rtv;
   dsv.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
-  if (FAILED(device->CreateDescriptorHeap(&rtv, IID_PPV_ARGS(&g_reg_rtv_heap))) ||
-      FAILED(device->CreateDescriptorHeap(&dsv, IID_PPV_ARGS(&g_reg_dsv_heap)))) {
-    REXLOG_ERROR("[native-scene] target registry descriptor heaps failed - native path off");
-    g_reg_failed = true;
-    return false;
-  }
-  return true;
+  return SUCCEEDED(device->CreateDescriptorHeap(&rtv, IID_PPV_ARGS(&g_reg_rtv_heap))) &&
+         SUCCEEDED(device->CreateDescriptorHeap(&dsv, IID_PPV_ARGS(&g_reg_dsv_heap)));
 }
 
-// Defined with the retirement list further down: a resource still readable by a
-// recorded-but-unfinished submission must outlive our last reference to it.
-void DestroyDeferred(ComPtr<ID3D12Resource>&& res);
-
-// The colour + depth resources and their three views, for a target whose
-// descriptor indices are already assigned. Split out of GetOrCreateRegTarget so
-// the rebuild below runs exactly the same code as the first creation - a second
-// copy of it is how the two drift apart.
-bool BuildRegTargetResources(ID3D12Device* device, NativeTarget& t, std::uint32_t key,
-                             std::uint32_t w, std::uint32_t h) {
+NativeTarget* GetOrCreateRegTarget(ID3D12Device* device, std::uint32_t key, std::uint32_t w,
+                                   std::uint32_t h) {
+  auto it = g_reg_targets.find(key);
+  if (it != g_reg_targets.end()) {
+    return &it->second;
+  }
+  if (g_reg_rtv_next >= kRegMaxTargets || g_reg_dsv_next >= kRegMaxTargets || w == 0 || h == 0) {
+    return nullptr;
+  }
+  NativeTarget t{};
   t.w = w;
   t.h = h;
   D3D12_HEAP_PROPERTIES heap{};
@@ -769,10 +425,7 @@ bool BuildRegTargetResources(ID3D12Device* device, NativeTarget& t, std::uint32_
   if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &cd,
                                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cclear,
                                              IID_PPV_ARGS(&t.color)))) {
-    REXLOG_ERROR("[native-scene] registry colour target {:#x} {}x{} failed - native path off", key,
-                 w, h);
-    g_reg_failed = true;
-    return false;
+    return nullptr;
   }
   D3D12_RESOURCE_DESC dd = cd;
   dd.Format = kDepthResFormat;
@@ -783,10 +436,7 @@ bool BuildRegTargetResources(ID3D12Device* device, NativeTarget& t, std::uint32_
   if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &dd,
                                              D3D12_RESOURCE_STATE_DEPTH_WRITE, &dclear,
                                              IID_PPV_ARGS(&t.depth)))) {
-    REXLOG_ERROR("[native-scene] registry depth target {:#x} {}x{} failed - native path off", key,
-                 w, h);
-    g_reg_failed = true;
-    return false;
+    return nullptr;
   }
   {  // named for the DRED post-mortem (see the watchdog)
     wchar_t n[64];
@@ -795,10 +445,8 @@ bool BuildRegTargetResources(ID3D12Device* device, NativeTarget& t, std::uint32_
     std::swprintf(n, 64, L"dpour.rtdepth.%08x", key);
     t.depth->SetName(n);
   }
-  // Freshly created, so the states are the ones asked for above, and nothing has
-  // cleared this content yet.
-  t.color_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-  t.cleared_frame = 0;
+  t.rtv_index = g_reg_rtv_next++;
+  t.dsv_index = g_reg_dsv_next++;
   const std::uint32_t rtv_stride =
       device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
   const std::uint32_t dsv_stride =
@@ -813,12 +461,8 @@ bool BuildRegTargetResources(ID3D12Device* device, NativeTarget& t, std::uint32_
   dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
   device->CreateDepthStencilView(t.depth.Get(), &dv, dsvh);
   // A bindless SRV slot, so a texture linked to this surface samples the
-  // target directly - the whole point of the registry. On a rebuild the slot is
-  // kept and the descriptor overwritten, so every link already pointing at this
-  // surface follows the new resource instead of dangling on the old one.
-  if (t.srv_slot == dpour_tex::kInvalidSlot) {
-    t.srv_slot = dpour_tex::AllocDescriptorSlot();
-  }
+  // target directly - the whole point of the registry.
+  t.srv_slot = dpour_tex::AllocDescriptorSlot();
   if (t.srv_slot != dpour_tex::kInvalidSlot) {
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
     sv.Format = kColorFormat;
@@ -830,80 +474,6 @@ bool BuildRegTargetResources(ID3D12Device* device, NativeTarget& t, std::uint32_
     device->CreateShaderResourceView(t.color.Get(), &sv, sh);
     std::lock_guard<std::mutex> lk(g_reg_mutex);
     g_surface_srv[key] = t.srv_slot;
-  }
-  return true;
-}
-
-// `size_is_authoritative` - the caller read w/h from the game's own
-// RHICreateTargetableSurface record (or knows the fixed back-buffer size), as
-// opposed to falling back on the pass viewport. Only an authoritative size may
-// trigger the rebuild below; the viewport moves within a frame (the game clips
-// UI work to small rects on a full-size surface) and rebuilding on it would
-// thrash every target in the registry once a frame.
-NativeTarget* GetOrCreateRegTarget(ID3D12Device* device, std::uint32_t key, std::uint32_t w,
-                                   std::uint32_t h, bool size_is_authoritative) {
-  auto it = g_reg_targets.find(key);
-  if (it != g_reg_targets.end()) {
-    NativeTarget& t = it->second;
-    // THE GUEST REUSES SURFACE ADDRESSES. XeD3DResources.cpp:110-184 frees a
-    // surface one frame after its last use and the allocator hands the same
-    // address straight back out, so "we already have a target for this key" does
-    // not mean "for this surface". Measured in our own log: 0x40cb9c10 arrived
-    // as AuxColor 128x128 and later as AuxColor 1024x720, and every draw of the
-    // second one went into the first one's 128x128 target - which is exactly
-    // what a stale, wrongly-scaled image on screen looks like.
-    if (!size_is_authoritative || w == 0 || h == 0 || (t.w == w && t.h == h)) {
-      return &t;
-    }
-    if (g_reg_failed) {
-      return nullptr;
-    }
-    static std::uint32_t rebuilt = 0;
-    if (rebuilt < 16) {
-      ++rebuilt;
-      REXLOG_INFO("[native-scene] target {:#x} resized {}x{} -> {}x{} - rebuilding (guest reused "
-                  "the surface address)",
-                  key, t.w, t.h, w, h);
-    }
-    DestroyDeferred(std::move(t.color));
-    DestroyDeferred(std::move(t.depth));
-    if (!BuildRegTargetResources(device, t, key, w, h)) {
-      g_reg_targets.erase(it);
-      return nullptr;
-    }
-    return &t;
-  }
-  if (g_reg_failed) {
-    return nullptr;
-  }
-  // Now that the MSAA bracket no longer funnels the scene into one shared
-  // target, EVERY guest surface asks for its own - so the two ways this can come
-  // up empty are worth naming. A silent nullptr here reads downstream as "the
-  // resolve had no source", which is the symptom we just spent a day chasing.
-  if (g_reg_rtv_next >= kRegMaxTargets || g_reg_dsv_next >= kRegMaxTargets) {
-    static bool warned = false;
-    if (!warned) {
-      warned = true;
-      REXLOG_ERROR("[native-scene] target registry FULL at {} surfaces - {:#x} {}x{} and every "
-                   "later surface renders nowhere",
-                   kRegMaxTargets, key, w, h);
-    }
-    return nullptr;
-  }
-  if (w == 0 || h == 0) {
-    static std::uint32_t unsized = 0;
-    if (unsized < 8) {
-      ++unsized;
-      REXLOG_WARN("[native-scene] surface {:#x} has no size yet - no target, draws dropped", key);
-    }
-    return nullptr;
-  }
-  NativeTarget t{};
-  t.rtv_index = g_reg_rtv_next++;
-  t.dsv_index = g_reg_dsv_next++;
-  t.srv_slot = dpour_tex::kInvalidSlot;
-  if (!BuildRegTargetResources(device, t, key, w, h)) {
-    return nullptr;
   }
   auto [ins, ok] = g_reg_targets.emplace(key, std::move(t));
   REXLOG_INFO("[native-scene] target registered: surface {:#x} {}x{} (srv {})", key, w, h,
@@ -1037,14 +607,8 @@ std::uint64_t g_published_frame = 0;
 // say so exactly.
 std::uint64_t g_vs_rev_cached = ~0ull;
 std::uint64_t g_ps_rev_cached = ~0ull;
-// The last staged constant bank and its size, so consecutive draws sharing a
-// bank share one staging allocation. This is the reference's dirty-state idea
-// (SetDirtyValue / g_dirtyStates.vertexShaderConstants) at capture: the bank is
-// re-staged only when its contents actually changed.
-std::uint32_t g_vs_cb_cached = kNoStage;
-std::uint32_t g_ps_cb_cached = kNoStage;
-std::uint32_t g_vs_cb_bytes = 0;
-std::uint32_t g_ps_cb_bytes = 0;
+std::uint64_t g_vs_cb_cached = 0;
+std::uint64_t g_ps_cb_cached = 0;
 std::uint64_t g_cache_frame = ~0ull;
 
 // Diagnostics
@@ -1109,34 +673,25 @@ ComPtr<ID3D12PipelineState> g_comp_pso;
 // callback (no frame yet, size mismatch, sticky failure) shows the emulated
 // frame instead - the reference fallback discipline.
 ComPtr<ID3D12PipelineState> g_comp_pso_guestout;
-// THE COMPOSITE DRAWS STRAIGHT INTO THE PRESENTER'S GUEST OUTPUT.
-//
-// It used to render into a texture of our own and let the callback CopyResource
-// it over the guest output - which forced the two to be the same size, and any
-// resolution_scale > 1 (the presenter then asks for 2560x1440 while we draw
-// 1280x720) made every single frame fail that equality and yield to the
-// emulated output. Everything looked healthy in the log and the screen showed
-// the emulator; it cost most of a day.
-//
-// skate3 has no such texture and no such test: it renders into
-// context.guest_output as a render target and ends with
-// Barrier(guest_output, kRenderTarget, kGuestOutput)
-// (skate3_native_scene_gpu.cpp:11546). A full-screen triangle writes whatever
-// size the presenter asks for, so upscaling and FSR ride on top of us instead
-// of shutting us off.
-//
-// (True supersampling still needs OUR targets built at the output size, the way
-// skate3's EnsureOutputSizedTargets does; this only removes the size gate.)
-ComPtr<ID3D12DescriptorHeap> g_guestout_rtv_heap;  // kPassFrames RTVs, ring
-// The guest output resource of the callback currently running, and the size it
-// asked for. Written by the callback, read by the composite it calls into.
+ComPtr<ID3D12Resource> g_guestout_tex;
+ComPtr<ID3D12DescriptorHeap> g_guestout_rtv_heap;
+std::vector<ComPtr<ID3D12Resource>> g_guestout_graveyard;  // never freed: the
+// callback thread may still copy from a predecessor; resizes are rare.
+std::uint32_t g_guestout_w = 0;
+std::uint32_t g_guestout_h = 0;
+// What the callback asked for (the presenter's guest output size); our texture
+// is (re)built to match on the next Render.
 std::atomic<std::uint32_t> g_guestout_want_w{0};
 std::atomic<std::uint32_t> g_guestout_want_h{0};
+std::atomic<ID3D12Resource*> g_guestout_src{nullptr};
+std::atomic<bool> g_guestout_has_frame{false};
 std::atomic<bool> g_guestout_failed{false};
 // What the composite showed last frame (telemetry: key + how many draws the
 // chosen source target actually received).
 std::atomic<std::uint32_t> g_comp_source_key{0};
 std::atomic<std::uint32_t> g_comp_source_draws{0};
+ComPtr<ID3D12CommandAllocator> g_allocators[kPassFrames];
+ComPtr<ID3D12GraphicsCommandList> g_pass_list;
 // DOES ANY OF THIS ACTUALLY LAND ON SCREEN?
 //
 // Every diagnosis so far has gone through a screenshot and a walk back into the
@@ -1151,98 +706,14 @@ std::atomic<std::uint64_t> g_scene_pixel_frames{0};
 std::atomic<std::uint32_t> g_scene_issued{0};
 std::atomic<std::uint32_t> g_scene_issued_shaded{0};
 
-// THE COMMAND PROCESSOR'S OWN SUBMISSION COUNTERS, LATCHED PER CALLBACK.
-//
-// nrhi::Device::CurrentSubmission()/CompletedSubmission() are, in the SDK's own
-// words, "the basis of all lifetime/readback gating" (native_rhi.h:545). The
-// callback reads them and stores them here so code that cannot see the context
-// - target rebuilds, the deferred-release list - answers "is the GPU done with
-// this" from the same source instead of from a private counter with nothing
-// behind it.
-std::atomic<std::uint64_t> g_submission_current{0};
-std::atomic<std::uint64_t> g_submission_completed{0};
-
-// DestroyDeferred, by hand, for the resources this module still owns as raw
-// D3D12 (the nrhi Device offers it for its own objects). A resource released
-// while a recorded-but-unfinished submission still reads it is the plainest
-// use-after-free there is, and it does not fault at the call site - it faults
-// later, inside the driver, as a device removal with no line number attached.
-struct RetiredResource {
-  ComPtr<ID3D12Resource> res;
-  std::uint64_t submission;
-};
-std::mutex g_retire_mutex;
-std::vector<RetiredResource> g_retired;
-
-void DestroyDeferred(ComPtr<ID3D12Resource>&& res) {
-  if (!res) {
-    return;
-  }
-  std::lock_guard<std::mutex> lock(g_retire_mutex);
-  g_retired.push_back(RetiredResource{std::move(res),
-                                      g_submission_current.load(std::memory_order_relaxed)});
-}
-
-// Release what the GPU has finished with. Cheap and self-limiting: the list is
-// empty except in the few frames after a target rebuild or a resize.
-void FlushRetired(std::uint64_t completed) {
-  std::lock_guard<std::mutex> lock(g_retire_mutex);
-  if (g_retired.empty()) {
-    return;
-  }
-  g_retired.erase(std::remove_if(g_retired.begin(), g_retired.end(),
-                                 [completed](const RetiredResource& r) {
-                                   return r.submission <= completed;
-                                 }),
-                  g_retired.end());
-}
-
+ComPtr<ID3D12Fence> g_fence;
+HANDLE g_fence_event = nullptr;
+std::uint64_t g_fence_value = 0;
 std::uint64_t g_alloc_fence[kPassFrames]{};
 // Guest frame each in-flight submission belongs to, so "the GPU is done with
 // frame N" can be answered in the same units the constant ring counts in.
 std::uint64_t g_alloc_frame[kPassFrames]{};
 std::uint32_t g_pass_index = 0;
-
-// Publish "the GPU has finished this guest frame" - from the CALLBACK, every
-// frame, not only from the tail of a successful replay.
-//
-// THE LATCH THIS BREAKS: the constant ring only rotates a slice once this value
-// passes the frame that wrote it (pipeline::BeginFrame). Updating it solely at
-// the end of the replay means any early return freezes it - and one of those
-// early returns is "nothing was published", which is exactly what a
-// ring-starved frame produces. No constants -> no draws -> nothing published ->
-// this never runs -> the ring is never reused. A one-way door: the native path
-// went dark for the rest of the session while every log line still read healthy.
-void UpdateGpuCompleted(std::uint64_t completed) {
-  // CONSERVATIVE: a guest frame counts as finished only when NOTHING still in
-  // flight is holding it.
-  //
-  // Taking the newest finished slot was wrong the moment a frame could be
-  // replayed more than once. Two submissions can carry the same guest frame;
-  // the first completes, the frame is declared done, the constant ring rotates
-  // its slice - and the second submission is still reading it. On screen that is
-  // text that comes apart one glyph at a time while the geometry stays put,
-  // because the vertices are fine and the constants underneath them now belong
-  // to a later frame.
-  std::uint64_t newest_done = 0;
-  std::uint64_t oldest_in_flight = 0;
-  for (std::uint32_t i = 0; i < kPassFrames; ++i) {
-    if (g_alloc_fence[i] == 0) {
-      continue;
-    }
-    if (g_alloc_fence[i] <= completed) {
-      newest_done = std::max(newest_done, g_alloc_frame[i]);
-    } else if (oldest_in_flight == 0 || g_alloc_frame[i] < oldest_in_flight) {
-      oldest_in_flight = g_alloc_frame[i];
-    }
-  }
-  const std::uint64_t done_frame =
-      oldest_in_flight != 0 ? (oldest_in_flight > 0 ? oldest_in_flight - 1 : 0)
-                            : newest_done;
-  if (done_frame > g_gpu_completed.load(std::memory_order_relaxed)) {
-    g_gpu_completed.store(done_frame, std::memory_order_relaxed);
-  }
-}
 std::uint32_t g_target_w = 0;
 std::uint32_t g_target_h = 0;
 bool g_targets_failed = false;
@@ -1416,193 +887,6 @@ bool EnsureComposite(ID3D12Device* device) {
   return true;
 }
 
-// --- the real resolve copy ---------------------------------------------------
-//
-// The reference's ExecutePendingStretchRectCommands, in the shape our pipeline
-// can carry: a full-screen triangle from the source surface's target into a
-// texture of ours, scaling by 2^-ColorExpBias on the way. Point sampling, like
-// the Xenos resolve itself - source and destination are the same size, and a
-// filtered copy would blur a 1:1 transfer for nothing.
-const char kResolveSrc[] = R"HLSL(
-Texture2D<float4> uSrc : register(t0);
-cbuffer Params : register(b0) { float uScale; float3 uPad; };
-struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
-VSOut VSMain(uint vid : SV_VertexID) {
-  VSOut o;
-  float2 uv = float2((vid << 1) & 2, vid & 2);
-  o.uv = uv;
-  o.pos = float4(uv * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
-  return o;
-}
-float4 PSMain(VSOut i) : SV_Target {
-  uint2 dim;
-  uSrc.GetDimensions(dim.x, dim.y);
-  int2 p = int2(i.uv * float2(dim));
-  float4 c = uSrc.Load(int3(p, 0));
-  // Colour only. The bias is described throughout the game's source as a COLOUR
-  // exponent bias, and the destination formats it is used with (PF_FloatRGB,
-  // A2B10G10R10) carry no alpha worth scaling.
-  return float4(c.rgb * uScale, c.a);
-}
-)HLSL";
-
-ComPtr<ID3D12RootSignature> g_resolve_root;
-ComPtr<ID3D12PipelineState> g_resolve_pso;
-bool g_resolve_failed = false;
-
-bool EnsureResolvePipeline(ID3D12Device* device) {
-  if (g_resolve_pso) {
-    return true;
-  }
-  if (g_resolve_failed || device == nullptr) {
-    return false;
-  }
-  g_resolve_failed = true;  // sticky until it gets all the way through
-
-  ComPtr<ID3DBlob> vs, ps, err;
-  if (FAILED(D3DCompile(kResolveSrc, sizeof(kResolveSrc) - 1, "dpour_resolve", nullptr, nullptr,
-                        "VSMain", "vs_5_0", 0, 0, &vs, &err))) {
-    REXLOG_ERROR("[native-scene] resolve VS compile failed: {}",
-                 err ? static_cast<const char*>(err->GetBufferPointer()) : "");
-    return false;
-  }
-  err.Reset();
-  if (FAILED(D3DCompile(kResolveSrc, sizeof(kResolveSrc) - 1, "dpour_resolve", nullptr, nullptr,
-                        "PSMain", "ps_5_0", 0, 0, &ps, &err))) {
-    REXLOG_ERROR("[native-scene] resolve PS compile failed: {}",
-                 err ? static_cast<const char*>(err->GetBufferPointer()) : "");
-    return false;
-  }
-  // One SRV, one root constant. Deliberately its own signature rather than the
-  // composite's: that one declares a table of TWO descriptors, and pointing it
-  // into the bindless heap would put whatever happens to occupy the next slot
-  // into the pipeline as well.
-  D3D12_DESCRIPTOR_RANGE range{};
-  range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
-  range.NumDescriptors = 1;
-  range.BaseShaderRegister = 0;
-  D3D12_ROOT_PARAMETER params[2]{};
-  params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
-  params[0].DescriptorTable.NumDescriptorRanges = 1;
-  params[0].DescriptorTable.pDescriptorRanges = &range;
-  params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-  params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-  params[1].Constants.ShaderRegister = 0;
-  params[1].Constants.Num32BitValues = 4;
-  params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
-
-  D3D12_ROOT_SIGNATURE_DESC rs{};
-  rs.NumParameters = 2;
-  rs.pParameters = params;
-  rs.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
-  ComPtr<ID3DBlob> blob, rs_err;
-  if (FAILED(D3D12SerializeRootSignature(&rs, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &rs_err)) ||
-      FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(),
-                                         IID_PPV_ARGS(&g_resolve_root)))) {
-    REXLOG_ERROR("[native-scene] resolve root signature failed");
-    return false;
-  }
-  D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
-  desc.pRootSignature = g_resolve_root.Get();
-  desc.VS = {vs->GetBufferPointer(), vs->GetBufferSize()};
-  desc.PS = {ps->GetBufferPointer(), ps->GetBufferSize()};
-  desc.SampleMask = UINT_MAX;
-  desc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-  desc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-  desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-  desc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-  desc.NumRenderTargets = 1;
-  desc.RTVFormats[0] = kColorFormat;
-  desc.SampleDesc.Count = 1;
-  if (FAILED(device->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&g_resolve_pso)))) {
-    REXLOG_ERROR("[native-scene] resolve PSO failed - resolve copies off");
-    return false;
-  }
-  g_resolve_failed = false;
-  REXLOG_INFO("[native-scene] resolve copy pipeline ready");
-  return true;
-}
-
-// The destination texture for one resolved guest texture object. Created once
-// and kept: the game resolves into the same handful of textures every frame.
-ResolveTexture* EnsureResolveTexture(ID3D12Device* device, std::uint32_t d3d_tex, std::uint32_t w,
-                                     std::uint32_t h) {
-  auto it = g_resolve_textures.find(d3d_tex);
-  if (it != g_resolve_textures.end()) {
-    return it->second.w == w && it->second.h == h ? &it->second : nullptr;
-  }
-  if (g_resolve_failed || g_resolve_rtv_next >= kResolveMaxTextures || w == 0 || h == 0) {
-    return nullptr;
-  }
-  if (!g_resolve_rtv_heap) {
-    D3D12_DESCRIPTOR_HEAP_DESC hd{};
-    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = kResolveMaxTextures;
-    if (FAILED(device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_resolve_rtv_heap)))) {
-      REXLOG_ERROR("[native-scene] resolve RTV heap failed - resolve copies off");
-      g_resolve_failed = true;
-      return nullptr;
-    }
-  }
-  ResolveTexture rt{};
-  rt.w = w;
-  rt.h = h;
-  D3D12_HEAP_PROPERTIES heap{};
-  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-  D3D12_RESOURCE_DESC td{};
-  td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-  td.Width = w;
-  td.Height = h;
-  td.DepthOrArraySize = 1;
-  td.MipLevels = 1;
-  td.Format = kColorFormat;
-  td.SampleDesc.Count = 1;
-  td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-  D3D12_CLEAR_VALUE cv{};
-  cv.Format = kColorFormat;
-  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
-                                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
-                                             IID_PPV_ARGS(&rt.tex)))) {
-    REXLOG_ERROR("[native-scene] resolve texture {:#x} {}x{} failed - resolve copies off", d3d_tex,
-                 w, h);
-    g_resolve_failed = true;
-    return nullptr;
-  }
-  {
-    wchar_t n[64];
-    std::swprintf(n, 64, L"dpour.resolve.%08x", d3d_tex);
-    rt.tex->SetName(n);
-  }
-  rt.srv_slot = dpour_tex::AllocDescriptorSlot();
-  if (rt.srv_slot == dpour_tex::kInvalidSlot) {
-    return nullptr;  // the bindless heap is full; the alias still works
-  }
-  D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
-  sv.Format = kColorFormat;
-  sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-  sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  sv.Texture2D.MipLevels = 1;
-  D3D12_CPU_DESCRIPTOR_HANDLE sh{};
-  sh.ptr = static_cast<std::size_t>(dpour_tex::CpuHandleAt(rt.srv_slot));
-  device->CreateShaderResourceView(rt.tex.Get(), &sv, sh);
-
-  rt.rtv_index = g_resolve_rtv_next++;
-  const std::uint32_t stride =
-      device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-  D3D12_CPU_DESCRIPTOR_HANDLE rtvh = g_resolve_rtv_heap->GetCPUDescriptorHandleForHeapStart();
-  rtvh.ptr += static_cast<std::size_t>(rt.rtv_index) * stride;
-  device->CreateRenderTargetView(rt.tex.Get(), nullptr, rtvh);
-
-  auto [ins, ok] = g_resolve_textures.emplace(d3d_tex, std::move(rt));
-  {
-    std::lock_guard<std::mutex> lk(g_reg_mutex);
-    g_resolve_srv[d3d_tex] = ins->second.srv_slot;
-  }
-  REXLOG_INFO("[native-scene] resolve copy target: tex {:#x} {}x{} (srv {})", d3d_tex, w, h,
-              ins->second.srv_slot);
-  return &ins->second;
-}
-
 bool g_targets_inverted = false;
 
 bool EnsureTargets(ID3D12Device* device, std::uint32_t width, std::uint32_t height) {
@@ -1632,14 +916,11 @@ bool EnsureTargets(ID3D12Device* device, std::uint32_t width, std::uint32_t heig
   g_targets_inverted = inverted;
   g_depth_clear = inverted ? 0.0f : 1.0f;
 
-  // Anything still in flight referenced the old targets, so they outlive this
-  // call by however long the command processor needs - the DestroyDeferred
-  // contract, done by hand for the resources this module still owns as raw
-  // D3D12. What stood here waited on OUR fence, which nothing has signalled
-  // since the replay moved onto the command processor's list: the wait was a
-  // no-op and the Reset() below freed targets a submission was still reading.
-  DestroyDeferred(std::move(g_color));
-  DestroyDeferred(std::move(g_depth));
+  // Anything still in flight referenced the old targets.
+  if (g_fence && g_fence_value != 0 && g_fence->GetCompletedValue() < g_fence_value) {
+    g_fence->SetEventOnCompletion(g_fence_value, g_fence_event);
+    WaitForSingleObject(g_fence_event, 2000);
+  }
   g_color.Reset();
   g_depth.Reset();
 
@@ -1727,10 +1008,25 @@ bool EnsureTargets(ID3D12Device* device, std::uint32_t width, std::uint32_t heig
   sd.Format = kDepthSrvFormat;
   device->CreateShaderResourceView(g_depth.Get(), &sd, srv);
 
-  // (The allocator ring, the command list and the fence that used to be built
-  // here went with the second timeline they served. Nothing referenced them
-  // after the replay moved onto the command processor's list; they were still
-  // being created every time the targets were.)
+  if (!g_pass_list) {
+    for (std::uint32_t i = 0; i < kPassFrames; ++i) {
+      if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                IID_PPV_ARGS(&g_allocators[i])))) {
+        return false;
+      }
+    }
+    if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                         g_allocators[0].Get(), nullptr,
+                                         IID_PPV_ARGS(&g_pass_list))) ||
+        FAILED(g_pass_list->Close()) ||
+        FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&g_fence)))) {
+      return false;
+    }
+    g_fence_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (g_fence_event == nullptr) {
+      return false;
+    }
+  }
 
   g_target_w = width;
   g_target_h = height;
@@ -1753,23 +1049,14 @@ std::uint32_t PassSlotFor(std::uint32_t color, std::uint32_t depth) {
       return i;
     }
   }
-  if (g_pass_count < kMaxPasses) {
+  // kScenePassSlot stays reserved for the MSAA-block bracket.
+  if (g_pass_count < kScenePassSlot) {
     g_passes[g_pass_count].color = color;
     g_passes[g_pass_count].depth = depth;
     g_passes[g_pass_count].draws = 0;
     return g_pass_count++;
   }
-  // NOT slot 0. An unroutable draw is dropped, not redirected: slot 0 is a real
-  // surface (the back buffer, most frames), and pouring the overflow into it
-  // renders shadow maps and post-process passes into the composited image.
-  static bool warned = false;
-  if (!warned) {
-    warned = true;
-    REXLOG_ERROR("[native-scene] pass table FULL at {} surfaces - surface {:#x} and later ones "
-                 "draw nowhere this frame",
-                 kMaxPasses, color);
-  }
-  return kMaxPasses;
+  return 0;
 }
 
 }  // namespace
@@ -1786,56 +1073,6 @@ bool Enabled() {
 
 bool NativeOnly() {
   static const bool on = EnvOn("DPOUR_NR_DRAW_ONLY");
-  return on;
-}
-
-// DPOUR_NR_RESOLVE_COPY - the real resolve copy, DEFAULT OFF.
-//
-// Off, a resolve only records the link and the sampler is handed the source
-// surface's own target (the alias). On, the surface is COPIED into a texture of
-// ours, scaled by 2^-ColorExpBias, and that texture is what the sampler gets -
-// which is what the game's own resolve does, un-biasing included.
-//
-// Default off on purpose, and not as timidity: it changes every pixel the game
-// composes from a resolved texture, and it lands on top of an already large
-// structural change (the composite moving into the presenter's image) that has
-// not been looked at yet. Two unverified visual changes in one build means a
-// wrong picture tells us nothing about which one did it - which is exactly how
-// the last two days went. One flag, one run, one answer.
-bool ResolveCopyEnabled() {
-  static const bool on = EnvOn("DPOUR_NR_RESOLVE_COPY");
-  return on;
-}
-
-// DPOUR_NR_KEEP_COLOR_BIAS - keep the game's EDRAM exponent bias instead of
-// neutralising it. Default OFF, i.e. the bias is neutralised.
-//
-// THE MARATHON MOVE, at the closest point we own. Marathon does not emulate the
-// EDRAM tiling constraint - it hooks the guest function that decides it and
-// returns 0 ("We return 0 to always disable tiling", video.cpp SurfaceSize).
-// Downpour's colour exponent bias is the same kind of console artefact: the
-// shaders multiply their output by 2^bias and the resolve divides it back out,
-// purely because EDRAM is 10 MB and the scene needs the range.
-//
-// It reaches the shaders through one place, and the game's own source says
-// which (XeD3DCommands.cpp:536):
-//
-//     void RHISetRenderTargetBias(FLOAT ColorBias) {
-//       FVector4 ColorBiasParameter(ColorBias, 0, 0, 0);
-//       GDirect3DDevice->SetPixelShaderConstantF(PSR_ColorBiasFactor, ..., 1);
-//     }
-//
-// PSR_ColorBiasFactor is register 0 of the PIXEL constant bank - a bank we
-// already stage for every draw. Writing 1.0 there is not an invention either:
-// the game itself does exactly that on the paths that want no bias
-// (XeD3DCommands.cpp:1603, RHISetRenderTargetBias(1)).
-//
-// With no multiply there is nothing to divide back, so our resolve copies stop
-// scaling too and the whole chain is consistent with itself. What it replaces:
-// half the resolve copies were not happening (7 of 17 in the last run), so half
-// the samples stayed 8x too bright - which is the white screen.
-bool KeepColorBias() {
-  static const bool on = EnvOn("DPOUR_NR_KEEP_COLOR_BIAS");
   return on;
 }
 
@@ -2318,60 +1555,39 @@ bool GuestOutputRenderCallback(const rex::graphics::NativeGuestOutputRenderConte
       ctx.backend != rg::NativeGuestOutputBackend::kD3D12) {
     return false;
   }
-  // Telemetry only now. It used to gate the whole path ("until our texture is
-  // this size, yield"), which is the trap resolution_scale fell into; the
-  // composite writes the presenter's image directly and takes any size.
+  // Tell the render side which size the presenter actually wants; until our
+  // texture matches, yield to the emulated frame.
   g_guestout_want_w.store(ctx.guest_output_width, std::memory_order_relaxed);
   g_guestout_want_h.store(ctx.guest_output_height, std::memory_order_relaxed);
-  {
-    static std::atomic<std::uint32_t> last_w{0};
-    const std::uint32_t w = ctx.guest_output_width;
-    if (last_w.exchange(w, std::memory_order_relaxed) != w) {
-      REXLOG_INFO("[native-scene] guest output size: {}x{}", w, ctx.guest_output_height);
-    }
-  }
-
-  // THE FRAME IS RECORDED HERE, on the command processor's own list - the
-  // skate3 arrangement on this same SDK.
-  //
-  // The device comes from the context, not from the presenter. Depending on the
-  // presenter to hand it over is what broke this path once already: the only
-  // thing that registered this callback was the presenter's per-present entry,
-  // so when that entry stopped drawing, nothing registered and the emulated
-  // frame went to screen with the whole native path healthy behind it.
-  ID3D12Resource* out_res = rg::d3d12::NativeRhiGetD3D12TextureResource(ctx.guest_output);
-  auto* rec = rg::d3d12::NativeRhiGetDeferredCommandList(ctx.device);
-  if (out_res == nullptr || rec == nullptr) {
+  if (!g_guestout_has_frame.load(std::memory_order_acquire)) {
     return false;
   }
-  ID3D12Device* dev = g_device.load(std::memory_order_relaxed);
-  if (dev == nullptr) {
-    ComPtr<ID3D12Device> owner;
-    if (FAILED(out_res->GetDevice(IID_PPV_ARGS(&owner)))) {
-      return false;
-    }
-    dev = owner.Get();
-    g_device.store(dev, std::memory_order_relaxed);
-    dpour_tex::EnsureHeap(dev);
-    dpour_pipeline::Init(dev);
-  }
-  // Real lifetime gating, from the command processor's own counters. Ours used
-  // to be a lag heuristic (a private counter minus kPassFrames) with nothing on
-  // the GPU behind it, which is not a fence at all - it decided when vertex,
-  // index and texture uploads were safe to recycle by guessing. These two are
-  // "the basis of all lifetime/readback gating" per native_rhi.h:545.
-  const std::uint64_t submission = ctx.device->CurrentSubmission();
-  const std::uint64_t completed = ctx.device->CompletedSubmission();
-  g_submission_current.store(submission, std::memory_order_relaxed);
-  g_submission_completed.store(completed, std::memory_order_relaxed);
-  FlushRetired(completed);
-  // Unconditionally, before anything below can decide to return early.
-  UpdateGpuCompleted(completed);
-  const bool drew = RenderRecorded(dev, rec, nullptr, ctx.guest_output_width,
-                                   ctx.guest_output_height, out_res, submission, completed);
-  if (!drew) {
+  ID3D12Resource* src = g_guestout_src.load(std::memory_order_relaxed);
+  if (src == nullptr) {
     return false;
   }
+  const D3D12_RESOURCE_DESC sd = src->GetDesc();
+  if (sd.Width != ctx.guest_output_width || sd.Height != ctx.guest_output_height) {
+    return false;
+  }
+  ID3D12Resource* out = rg::d3d12::NativeRhiGetD3D12TextureResource(ctx.guest_output);
+  rg::d3d12::DeferredCommandList* dl = rg::d3d12::NativeRhiGetDeferredCommandList(ctx.device);
+  if (out == nullptr || dl == nullptr) {
+    return false;
+  }
+  // The image arrives in kGuestOutputInternalState and must be returned to it.
+  D3D12_RESOURCE_BARRIER to_copy{};
+  to_copy.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+  to_copy.Transition.pResource = out;
+  to_copy.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+  to_copy.Transition.StateBefore = rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState;
+  to_copy.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+  dl->D3DResourceBarrier(1, &to_copy);
+  dl->D3DCopyResource(out, src);
+  D3D12_RESOURCE_BARRIER back = to_copy;
+  back.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+  back.Transition.StateAfter = rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState;
+  dl->D3DResourceBarrier(1, &back);
   static std::atomic<bool> announced{false};
   if (!announced.exchange(true, std::memory_order_relaxed)) {
     REXLOG_INFO("[native-scene] guest output REPLACED natively for the first time ({}x{})",
@@ -2420,23 +1636,6 @@ float AmplifyFactor() {
 }  // namespace
 
 void BeginFrame() {
-  // REGISTER UNCONDITIONALLY, AND NOT FROM THE PRESENTER.
-  //
-  // skate3 does exactly this (skate3_native_scene_gpu.cpp Install()), and its
-  // comment says why: the renderer is registered "even when the scene cvar
-  // starts off", because the callback itself yields to the emulated output
-  // while disabled - so the toggle can flip at any time and nothing depends on
-  // who called whom. Ours used to register inside the presenter's per-present
-  // entry, which made "is the native path in the chain at all" depend on a UI
-  // drawer running. It stopped running, and the whole path went silently dark.
-  {
-    static std::atomic<bool> registered{false};
-    if (!registered.exchange(true, std::memory_order_relaxed)) {
-      rex::graphics::SetNativeGuestOutputRenderer(&GuestOutputRenderCallback, nullptr);
-      REXLOG_INFO("[native-scene] guest-output renderer registered (draw path {})",
-                  Enabled() ? "on" : "off");
-    }
-  }
   if (!Enabled()) {
     return;
   }
@@ -2451,7 +1650,6 @@ void BeginFrame() {
 
   std::lock_guard<std::mutex> lock(g_mutex);
   g_staging.clear();
-  g_resolve_staging.clear();
   // The render target does not change just because a frame ended, so the pass
   // that was current carries over as slot 0 with a fresh count. Resetting the
   // count without carrying the identity left draws made before the frame's first
@@ -2465,6 +1663,11 @@ void BeginFrame() {
   g_up_frame_count.store(0, std::memory_order_relaxed);
   g_pass_count = 1;
   g_pass_current = 0;
+  // The scene slot keeps its viewport (it only changes with the video mode) but
+  // starts the frame empty and unmarked.
+  g_passes[kScenePassSlot].color = kScenePassColor;
+  g_passes[kScenePassSlot].depth = kScenePassColor;
+  g_passes[kScenePassSlot].draws = 0;
   g_scene_marked = false;
   g_frame_scene_color = 0;  // the base pass renames it every frame
   g_vs_rev_cached = ~0ull;
@@ -2483,14 +1686,17 @@ void EndFrame() {
   if (g_pass_count == 0) {
     return;
   }
-  // `best` sizes the stats line and nothing else - every captured draw is
-  // published regardless, and the composite takes the back buffer. The old
-  // "an MSAA block means the scene slot won" branch is gone with the diversion
-  // that fed it: no draw can land in kScenePassSlot any more.
+  // When the frame contained an MSAA block, the scene is whatever was drawn
+  // inside it - the game said so itself, and no vote can improve on that. The
+  // vote below only remains for frames without a block (menus, movies).
   std::uint32_t best = 0;
-  for (std::uint32_t i = 1; i < g_pass_count; ++i) {
-    if (g_passes[i].draws > g_passes[best].draws) {
-      best = i;
+  if (g_scene_marked && g_passes[kScenePassSlot].draws > 0) {
+    best = kScenePassSlot;
+  } else {
+    for (std::uint32_t i = 1; i < g_pass_count; ++i) {
+      if (g_passes[i].draws > g_passes[best].draws) {
+        best = i;
+      }
     }
   }
   // PUBLISH WHAT WAS RESOLVED, not what won the vote.
@@ -2509,14 +1715,6 @@ void EndFrame() {
   // with a snapshot of the pass table so the render thread can switch targets
   // as the order dictates. `best` only sizes the scene target and the stats.
   g_published = g_staging;
-  // The bytes travel with the draws that reference them: the arena capture just
-  // filled becomes the one the replay reads, and capture moves to the next.
-  g_published_arena_index = g_stage_arena_index;
-  g_stage_arena_index = (g_stage_arena_index + 1) % kArenaCount;
-  g_arenas[g_stage_arena_index].Reset();
-  g_vs_cb_cached = kNoStage;  // nothing staged in the fresh arena yet
-  g_ps_cb_cached = kNoStage;
-  g_resolve_published = g_resolve_staging;
   std::memcpy(g_published_passes, g_passes, sizeof(g_published_passes));
   g_published_pass = best;
   g_published_frame = g_frame.load(std::memory_order_relaxed);
@@ -2650,29 +1848,16 @@ void SceneBlockBegin() {
   CloseUPPending();
   static std::atomic<bool> announced{false};
   if (!announced.exchange(true, std::memory_order_relaxed)) {
-    REXLOG_INFO("[native-scene] MSAA block seen - bracket noted, pass routing untouched");
+    REXLOG_INFO("[native-scene] scene target bound for the first time - marking the scene slot");
   }
   std::lock_guard<std::mutex> lock(g_mutex);
-  // THE BRACKET IS NOT A TARGET. It used to set g_pass_current = kScenePassSlot
-  // here, and that one line was the whole white/stale-menu bug:
-  //
-  //   RHIMSAABeginRendering's original runs FIRST in our hook, and its first act
-  //   is GDirect3DDevice->SetRenderTarget - so DeviceSetRenderTarget had already
-  //   routed the pass to the surface the game actually bound. Overwriting it
-  //   afterwards sent every draw of the block into one shared g_color instead,
-  //   so the guest surface never got a NativeTarget, so the resolve that reads
-  //   it found nothing in g_reg_targets and skipped ("4 of 13 queued"), so the
-  //   destination texture kept whatever was in it - the loading screen - and the
-  //   menu's composition quads sampled stale and never-written textures. Ghost
-  //   loading content and a white screen are the same bug seen twice.
-  //
-  // MSAA/tiling is a console constraint, and the reference answer to a console
-  // constraint is Marathon's: neutralise it, do not model it. Their SurfaceSize
-  // hook returns 0 with the comment "We return 0 to always disable tiling"; they
-  // do not grow a special target out of the tiling bracket, and neither do we.
-  // Downpour runs GUseTilingCode=FALSE anyway. The bracket is recorded for the
-  // stats line and nothing else - the game's own binds route every draw.
+  g_pass_current = kScenePassSlot;
   g_scene_marked = true;
+  // Converge the capture filter this very frame: only scene draws are worth
+  // resolving once the block has announced itself.
+  g_target_color = kScenePassColor;
+  g_target_depth = kScenePassColor;
+  g_have_target = true;
 }
 
 namespace {
@@ -2724,7 +1909,7 @@ bool ShouldSkipGuestDraw() {
 }
 
 bool OnResolveScene(const std::uint8_t* base, std::uint32_t surface_ref,
-                    std::uint32_t surface_object, std::uint32_t resolve_params) {
+                    std::uint32_t surface_object) {
   if (!Enabled() || base == nullptr || surface_object == 0) {
     return false;
   }
@@ -2748,22 +1933,7 @@ bool OnResolveScene(const std::uint8_t* base, std::uint32_t surface_ref,
   // is what the previous guess-every-member loop did - produced a link nothing
   // could ever hit, and additionally registered XeSurfaceInfo.Offset, an EDRAM
   // tile number, as if it were a texture address.
-  //
-  // ...UNLESS the call carries an explicit destination. The very first line of
-  // RHICopyToResolveTarget is
-  //   FTextureRHIParamRef ResolveTarget2D = ResolveParams.ResolveTarget
-  //       ? ResolveParams.ResolveTarget : SourceSurface.ResolveTargetTexture2D;
-  // (XeD3DRenderTarget.cpp:399), so the override wins outright. FResolveParams
-  // (RHI.h:630-659) is CubeFace +0, X1 +4, Y1 +8, X2 +12, Y2 +16,
-  // ResolveTarget +20 - all four-byte members, no padding on this ABI. Reading
-  // only surface_ref+4 linked those resolves to the WRONG destination texture,
-  // so a later sample of the real one found no link and fell through to the
-  // decoded guest bytes.
-  std::uint32_t rhi_tex = resolve_params != 0 ? ReadGuestPtr(base, resolve_params + 20) : 0;
-  const bool explicit_target = rhi_tex != 0;
-  if (rhi_tex == 0) {
-    rhi_tex = ReadGuestPtr(base, surface_ref + 4);
-  }
+  const std::uint32_t rhi_tex = ReadGuestPtr(base, surface_ref + 4);
   if (rhi_tex == 0) {
     return false;  // depth or cube resolve: no 2D destination
   }
@@ -2771,49 +1941,10 @@ bool OnResolveScene(const std::uint8_t* base, std::uint32_t surface_ref,
   if (d3d_tex == 0) {
     return false;
   }
-  // ...and the key on top of THAT is the memory the texture occupies, not the
-  // texture. RHICreateSharedTexture2D points several render-target textures at
-  // one buffer (SceneRenderTargets.cpp:1074 and five more call sites) and ends
-  // with XGOffsetResourceAddress(Resource, SharedMemory->BaseAddress)
-  // (XeD3DTexture.cpp:1246), so they all report the same base address in their
-  // fetch constants. Keyed on the object, a resolve into FilterColor left
-  // SceneColorLDR - the texture the final quad samples, and the SAME buffer -
-  // holding whatever we last wrote into it, which is why the menu wore the
-  // loading screen. Keyed on the address, one resolve refreshes all of them,
-  // exactly as one buffer does on the console.
-  const std::uint32_t addr = AliasKeyOn() ? dpour_tex::GuestBaseAddress(base, d3d_tex) : 0;
-  const std::uint32_t alias = addr != 0 ? addr : d3d_tex;
-  // Queue the copy where it happened in the draw stream. Order matters and is
-  // not negotiable: the game resolves a surface, then samples the result while
-  // rendering back into that same surface. A copy taken at the end of the frame
-  // would hand every such pass the FINAL contents of the surface instead of what
-  // it held at resolve time. The draw count at this moment is that position.
-  if (ResolveCopyEnabled()) {
-    std::int32_t bias = 0;
-    if (ObjectReadable(base, surface_ref + 20, 4)) {
-      bias = static_cast<std::int32_t>(LoadBE32(base + surface_ref + 20));
-    }
-    // A bias outside what the game's own table can produce (0, 3, 5 - see
-    // XeGetRenderTargetColorExpBias) means the struct is not what we think it
-    // is; take no bias rather than scale by a garbage exponent.
-    if (bias < -8 || bias > 8) {
-      bias = 0;
-    }
-    std::lock_guard<std::mutex> dl(g_mutex);
-    if (g_resolve_staging.size() < 64) {
-      g_resolve_staging.push_back(PendingResolve{CanonicalSurface(surface_object), alias, bias,
-                                                 static_cast<std::uint32_t>(g_staging.size())});
-    }
-  }
-
   std::lock_guard<std::mutex> lk(g_reg_mutex);
-  // The LINK is to the canonical surface too: DefaultColorRaw and
-  // DefaultColorFixedPoint resolve into one texture, and whoever samples it must
-  // reach the target the scene was actually drawn into.
-  const std::uint32_t link_surface = CanonicalSurface(surface_object);
-  const bool is_new = g_texture_link.find(alias) == g_texture_link.end() ||
-                      g_texture_link[alias] != link_surface;
-  g_texture_link[alias] = link_surface;
+  const bool is_new = g_texture_link.find(d3d_tex) == g_texture_link.end() ||
+                      g_texture_link[d3d_tex] != surface_object;
+  g_texture_link[d3d_tex] = surface_object;
   // EVERY distinct link, not just the first: one link tells us the mechanism
   // works, but not whether the SCENE's surface is among them - which is the
   // only one the game's final composition actually samples.
@@ -2822,13 +1953,10 @@ bool OnResolveScene(const std::uint8_t* base, std::uint32_t surface_ref,
     if (told.fetch_add(1, std::memory_order_relaxed) < 24) {
       const auto srv = g_surface_srv.find(surface_object);
       const auto meta = g_surface_meta.find(surface_object);
-      REXLOG_INFO("[native-scene] resolve link: key {:#x} (tex {:#x} addr {:#x}) <- surface {:#x} "
-                  "({}x{}) srv {} explicit={}",
-                  alias, d3d_tex, addr, surface_object,
-                  meta != g_surface_meta.end() ? meta->second.w : 0,
+      REXLOG_INFO("[native-scene] resolve link: d3d tex {:#x} <- surface {:#x} ({}x{}) srv {}",
+                  d3d_tex, surface_object, meta != g_surface_meta.end() ? meta->second.w : 0,
                   meta != g_surface_meta.end() ? meta->second.h : 0,
-                  srv != g_surface_srv.end() ? static_cast<int>(srv->second) : -1,
-                  explicit_target ? 1 : 0);
+                  srv != g_surface_srv.end() ? static_cast<int>(srv->second) : -1);
     }
   }
   // The guest's own resolve still runs - the emulated pipeline stays whole
@@ -2836,19 +1964,14 @@ bool OnResolveScene(const std::uint8_t* base, std::uint32_t surface_ref,
   return false;
 }
 
-std::uint32_t RtBackedSrvSlot(std::uint32_t texture_rhi_guest, std::uint32_t base_addr) {
+std::uint32_t RtBackedSrvSlot(std::uint32_t texture_rhi_guest) {
   if (!Enabled() || texture_rhi_guest == 0) {
     return dpour_tex::kInvalidSlot;
   }
-  // The alias key: memory first, object second. Six of this engine's render
-  // targets live in ONE buffer on purpose, so a resolve into any of them is a
-  // resolve into all - and keying on the object alone made each of them a
-  // private copy that nobody else's resolve ever refreshed.
-  const std::uint32_t alias = AliasKeyOn() && base_addr != 0 ? base_addr : texture_rhi_guest;
   std::uint32_t surface = 0;
   {
     std::lock_guard<std::mutex> lk(g_reg_mutex);
-    const auto link = g_texture_link.find(alias);
+    const auto link = g_texture_link.find(texture_rhi_guest);
     if (link == g_texture_link.end()) {
       return dpour_tex::kInvalidSlot;
     }
@@ -2888,41 +2011,8 @@ std::uint32_t RtBackedSrvSlot(std::uint32_t texture_rhi_guest, std::uint32_t bas
   (void)g_rt_alias_refused;
 
   std::lock_guard<std::mutex> lk(g_reg_mutex);
-  if (ResolveCopyEnabled()) {
-    // A copy exists for this texture: serve THAT. It holds the surface as it was
-    // at resolve time, with the exponent bias taken back out - the two things
-    // the alias cannot give. If no copy has been made yet (first frames, or a
-    // texture resolved before our targets existed) fall through to the alias
-    // rather than to the guest-memory decode: the decode is what corrupted the
-    // loading-screen glyphs when this path refused outright.
-    const auto copy = g_resolve_srv.find(alias);
-    if (copy != g_resolve_srv.end() && CopyIsFresh(alias)) {
-      return copy->second;
-    }
-  }
-  // SERVE NATIVELY ONLY WHAT WE RENDERED NATIVELY.
-  //
-  // The reference never faces this question: Unleashed replaces the whole RHI,
-  // so every guest surface holds what the game drew and a resolve always has a
-  // source. Ours is partial - some surfaces are still written only by the
-  // emulated path - and for those our target is empty and our copy is whatever
-  // was last put there, which during the menu is THE LOADING SCREEN. That is the
-  // ghost: not a frozen frame (the snapshot keeps moving), but a live frame
-  // sampling textures nobody refreshed.
-  //
-  // skate3's discipline for "we cannot serve this" is to yield, and this is that
-  // yield at texture granularity: hand back kInvalidSlot and the guest texture is
-  // decoded from guest memory, which the emulated path DID write correctly.
-  //
-  // This is also why refusing the alias outright once corrupted the loading
-  // screen's glyphs: back then it refused for surfaces we HAD rendered, whose
-  // guest memory we never wrote. The freshness test refuses only the opposite
-  // case, so the decode is the right answer exactly when it is taken.
   const auto srv = g_surface_srv.find(surface);
-  if (srv != g_surface_srv.end() && SurfaceIsFresh(surface)) {
-    return srv->second;
-  }
-  return dpour_tex::kInvalidSlot;
+  return srv != g_surface_srv.end() ? srv->second : dpour_tex::kInvalidSlot;
 }
 
 void OnTargetableSurfaceCreated(const std::uint8_t* base, std::uint32_t sret,
@@ -2948,11 +2038,8 @@ void OnTargetableSurfaceCreated(const std::uint8_t* base, std::uint32_t sret,
   REXLOG_INFO("[native-scene] targetable surface {:08x} usage \"{}\" {}x{}", surface, name,
               size_x, size_y);
   if (surface != 0 && size_x >= 1 && size_x <= 4096 && size_y >= 1 && size_y <= 4096) {
-    const bool depth = std::strstr(name, "Depth") != nullptr;
     std::lock_guard<std::mutex> lk(g_reg_mutex);
-    SurfaceMeta m{size_x, size_y, depth};
-    std::snprintf(m.name, sizeof(m.name), "%s", name);
-    g_surface_meta[surface] = m;
+    g_surface_meta[surface] = SurfaceMeta{size_x, size_y};
   }
   // The engine's own names (SceneRenderTargets.cpp:1042/1058): the scene colour
   // surface is created as "DefaultColor", with "DefaultColorRaw" and
@@ -3001,12 +2088,10 @@ void SceneBlockEnd() {
   if (!Enabled()) {
     return;
   }
-  (void)0;
-  // Nothing to undo. Forcing g_pass_current = 0 here was the mirror image of the
-  // Begin bug: slot 0 is a real surface's slot, so post-block draws were pushed
-  // into an unrelated target until the game's next bind happened to fix it. The
-  // game re-targets through RHISetRenderTarget when it wants a different target,
-  // and until then the current bind is still the current bind.
+  std::lock_guard<std::mutex> lock(g_mutex);
+  // Whatever runs next (resolves, post-processing) re-targets through
+  // RHISetRenderTarget; until it does, its draws must not count as scene.
+  g_pass_current = 0;
 }
 
 void NoteViewProj(const std::uint8_t* base, std::uint32_t matrix_guest) {
@@ -3086,27 +2171,24 @@ bool FillDrawConstants(const std::uint8_t* base, const DrawDesc& d,
         dev_vs != nullptr
             ? (!vs_raw_valid || std::memcmp(vs_raw, dev_vs, sizeof(vs_raw)) != 0)
             : (vs_rev != g_vs_rev_cached);
-    if (vs_changed || g_vs_cb_cached == kNoStage) {
+    if (vs_changed || g_vs_cb_cached == 0) {
       const std::uint32_t bytes = dev_vs != nullptr ? dpour_consts::kDeviceBankBytes : vs_bytes;
-      std::uint32_t handle = kNoStage;
-      std::uint8_t* cpu = g_arenas[g_stage_arena_index].Alloc(bytes, handle);
-      if (cpu == nullptr) {
+      const dpour_pipeline::ConstantAlloc a = dpour_pipeline::AllocConstants(bytes);
+      if (a.cpu == nullptr) {
         g_no_constants.fetch_add(1, std::memory_order_relaxed);
         return false;
       }
       if (dev_vs != nullptr) {
         std::memcpy(vs_raw, dev_vs, sizeof(vs_raw));
         vs_raw_valid = true;
-        SwapBankToHost(cpu, dev_vs, bytes);
+        SwapBankToHost(a.cpu, dev_vs, bytes);
       } else {
-        dpour_consts::CopyVertexBank(cpu, bytes);
+        dpour_consts::CopyVertexBank(a.cpu, bytes);
       }
-      g_vs_cb_cached = handle;
-      g_vs_cb_bytes = bytes;
+      g_vs_cb_cached = a.gpu;
       g_vs_rev_cached = vs_rev;
     }
     out.cb_vertex = g_vs_cb_cached;
-    out.cb_vertex_bytes = g_vs_cb_bytes;
 
     if (d.ps != nullptr) {
       const std::uint64_t ps_rev = dpour_consts::PixelRevision();
@@ -3114,53 +2196,37 @@ bool FillDrawConstants(const std::uint8_t* base, const DrawDesc& d,
           dev_ps != nullptr
               ? (!ps_raw_valid || std::memcmp(ps_raw, dev_ps, sizeof(ps_raw)) != 0)
               : (ps_rev != g_ps_rev_cached);
-      if (ps_changed || g_ps_cb_cached == kNoStage) {
+      if (ps_changed || g_ps_cb_cached == 0) {
         const std::uint32_t bytes = dev_ps != nullptr ? dpour_consts::kDeviceBankBytes : ps_bytes;
-        std::uint32_t handle = kNoStage;
-        std::uint8_t* cpu = g_arenas[g_stage_arena_index].Alloc(bytes, handle);
-        if (cpu == nullptr) {
+        const dpour_pipeline::ConstantAlloc a = dpour_pipeline::AllocConstants(bytes);
+        if (a.cpu == nullptr) {
           g_no_constants.fetch_add(1, std::memory_order_relaxed);
           return false;
         }
         if (dev_ps != nullptr) {
           std::memcpy(ps_raw, dev_ps, sizeof(ps_raw));
           ps_raw_valid = true;
-          SwapBankToHost(cpu, dev_ps, bytes);
+          SwapBankToHost(a.cpu, dev_ps, bytes);
         } else {
-          dpour_consts::CopyPixelBank(cpu, bytes);
+          dpour_consts::CopyPixelBank(a.cpu, bytes);
         }
-        // PSR_ColorBiasFactor (Engine/Inc/RHI.h:452) is float4 register 0.
-        if (!KeepColorBias() && bytes >= 16) {
-          float* c0 = reinterpret_cast<float*>(cpu);
-          c0[0] = 1.0f;
-          c0[1] = 0.0f;
-          c0[2] = 0.0f;
-          c0[3] = 0.0f;
-        }
-        g_ps_cb_cached = handle;
-        g_ps_cb_bytes = bytes;
+        g_ps_cb_cached = a.gpu;
         g_ps_rev_cached = ps_rev;
       }
       out.cb_pixel = g_ps_cb_cached;
-      out.cb_pixel_bytes = g_ps_cb_bytes;
     } else {
       out.cb_pixel = g_vs_cb_cached;  // never read; the root CBV still needs an address
-      out.cb_pixel_bytes = g_vs_cb_bytes;
     }
   }
 
-  std::uint32_t shared_handle = kNoStage;
-  std::uint8_t* shared_cpu = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    shared_cpu = g_arenas[g_stage_arena_index].Alloc(dpour_pipeline::kSharedConstantsSize, shared_handle);
-  }
-  if (shared_cpu == nullptr) {
+  const dpour_pipeline::ConstantAlloc shared_alloc =
+      dpour_pipeline::AllocConstants(dpour_pipeline::kSharedConstantsSize);
+  if (shared_alloc.cpu == nullptr) {
     g_no_constants.fetch_add(1, std::memory_order_relaxed);
     return false;
   }
   {
-    auto* sc = reinterpret_cast<dpour_pipeline::SharedConstants*>(shared_cpu);
+    auto* sc = static_cast<dpour_pipeline::SharedConstants*>(shared_alloc.cpu);
     std::memset(sc, 0, sizeof(*sc));
     // Resolving all sixteen texture slots costs a cache lookup each; between two
     // draws of the same material nothing has changed, and the bound-slot key
@@ -3197,7 +2263,7 @@ bool FillDrawConstants(const std::uint8_t* base, const DrawDesc& d,
     std::memcpy(sc->bools, state.bools, sizeof(sc->bools));
     std::memcpy(sc->loops, state.loops, sizeof(sc->loops));
   }
-  out.cb_shared = shared_handle;
+  out.cb_shared = shared_alloc.gpu;
   return true;
 }
 
@@ -3388,9 +2454,7 @@ bool CaptureDraw(const std::uint8_t* base, const DrawDesc& d) {
   key.dst_blend = static_cast<std::uint8_t>(state.dst_blend);
   key.blend_op = static_cast<std::uint8_t>(state.blend_op);
   key.topology = static_cast<std::uint8_t>(topology_type);
-  key.color_write_mask = ColorWriteMaskOn()
-                             ? static_cast<std::uint8_t>(state.color_write_mask)
-                             : static_cast<std::uint8_t>(D3D12_COLOR_WRITE_ENABLE_ALL);
+  key.color_write_mask = D3D12_COLOR_WRITE_ENABLE_ALL;
   key.front_ccw = state.front_ccw ? 1 : 0;
   key.src_blend_alpha = static_cast<std::uint8_t>(state.src_blend_alpha);
   key.dst_blend_alpha = static_cast<std::uint8_t>(state.dst_blend_alpha);
@@ -3757,9 +2821,7 @@ void CaptureUPBegin(const std::uint8_t* base, const UPDraw& u) {
   key.dst_blend = static_cast<std::uint8_t>(state.dst_blend);
   key.blend_op = static_cast<std::uint8_t>(state.blend_op);
   key.topology = static_cast<std::uint8_t>(topology_type);
-  key.color_write_mask = ColorWriteMaskOn()
-                             ? static_cast<std::uint8_t>(state.color_write_mask)
-                             : static_cast<std::uint8_t>(D3D12_COLOR_WRITE_ENABLE_ALL);
+  key.color_write_mask = D3D12_COLOR_WRITE_ENABLE_ALL;
   key.front_ccw = state.front_ccw ? 1 : 0;
   key.src_blend_alpha = static_cast<std::uint8_t>(state.src_blend_alpha);
   key.dst_blend_alpha = static_cast<std::uint8_t>(state.dst_blend_alpha);
@@ -3783,27 +2845,21 @@ void CaptureUPBegin(const std::uint8_t* base, const UPDraw& u) {
     return;
   }
 
-  // Staged, like everything else the snapshot carries. The GPU vertex buffer is
-  // created in the replay out of that frame's allocator.
-  std::uint32_t vtx_handle = kNoStage;
-  std::uint8_t* vtx_cpu = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    vtx_cpu = g_arenas[g_stage_arena_index].Alloc(vtx_bytes, vtx_handle);
-  }
-  if (vtx_cpu == nullptr) {
+  // The geometry rides the same per-frame upload ring as the constants: the
+  // slice outlives the draw exactly as long as a constant slice does.
+  const dpour_pipeline::ConstantAlloc vslice = dpour_pipeline::AllocConstants(vtx_bytes);
+  if (vslice.cpu == nullptr) {
     g_no_vbdata.fetch_add(1, std::memory_order_relaxed);
     return;
   }
-  out.up_vtx = vtx_handle;
-  out.up_vtx_bytes = vtx_bytes;
+  out.vbv[0].BufferLocation = vslice.gpu;
   out.vbv[0].SizeInBytes = vtx_bytes;
   out.vbv[0].StrideInBytes = u.vtx_stride;
   out.vbv_count = 1;
 
   PendingUP p;
   p.base = base;
-  p.vtx_dst = vtx_cpu;
+  p.vtx_dst = static_cast<std::uint8_t*>(vslice.cpu);
   p.vtx_guest = u.vtx_guest;
   p.vtx_bytes = vtx_bytes;
 
@@ -3825,18 +2881,12 @@ void CaptureUPBegin(const std::uint8_t* base, const UPDraw& u) {
       g_up_dropped.fetch_add(1, std::memory_order_relaxed);
       return;
     }
-    std::uint32_t idx_handle = kNoStage;
-    std::uint8_t* idx_cpu = nullptr;
-    {
-      std::lock_guard<std::mutex> lock(g_mutex);
-      idx_cpu = g_arenas[g_stage_arena_index].Alloc(issue_bytes, idx_handle);
-    }
-    if (idx_cpu == nullptr) {
+    const dpour_pipeline::ConstantAlloc islice = dpour_pipeline::AllocConstants(issue_bytes);
+    if (islice.cpu == nullptr) {
       g_no_ibdata.fetch_add(1, std::memory_order_relaxed);
       return;
     }
-    out.up_idx = idx_handle;
-    out.up_idx_bytes = issue_bytes;
+    out.ibv.BufferLocation = islice.gpu;
     out.ibv.SizeInBytes = issue_bytes;
     out.ibv.Format = fmt32 ? DXGI_FORMAT_R32_UINT : DXGI_FORMAT_R16_UINT;
     out.indexed = true;
@@ -3847,14 +2897,14 @@ void CaptureUPBegin(const std::uint8_t* base, const UPDraw& u) {
       // These depend on nothing the game is still writing - fill them now.
       const std::uint32_t nq = u.vtx_count / 4u;
       if (fmt32) {
-        auto* dst = reinterpret_cast<std::uint32_t*>(idx_cpu);
+        auto* dst = static_cast<std::uint32_t*>(islice.cpu);
         for (std::uint32_t q = 0; q < nq; ++q) {
           const std::uint32_t v = q * 4u;
           *dst++ = v; *dst++ = v + 1; *dst++ = v + 2;
           *dst++ = v; *dst++ = v + 2; *dst++ = v + 3;
         }
       } else {
-        auto* dst = reinterpret_cast<std::uint16_t*>(idx_cpu);
+        auto* dst = static_cast<std::uint16_t*>(islice.cpu);
         for (std::uint32_t q = 0; q < nq; ++q) {
           const std::uint16_t v = static_cast<std::uint16_t>(q * 4u);
           *dst++ = v; *dst++ = v + 1; *dst++ = v + 2;
@@ -3862,7 +2912,7 @@ void CaptureUPBegin(const std::uint8_t* base, const UPDraw& u) {
         }
       }
     } else {
-      p.idx_dst = idx_cpu;
+      p.idx_dst = static_cast<std::uint8_t*>(islice.cpu);
       p.idx_guest = u.idx_guest;
       p.idx_count = u.idx_count;
       p.idx_32bit = u.idx_32bit;
@@ -3968,156 +3018,12 @@ void StartDeviceWatchdog(ID3D12Device* device) {
   }).detach();
 }
 
-// Composite `src` into the presenter's guest output image, at whatever size it
-// asks for. This is the skate3 arrangement: render into context.guest_output as
-// a render target and hand it back in kGuestOutput state
-// (skate3_native_scene_gpu.cpp:11546). No intermediate texture, and above all
-// no "are the two the same size" test - that test is what a resolution_scale of
-// 2 failed on every single frame, yielding a perfectly healthy native frame to
-// the emulator with nothing in the log to say so.
-bool CompositeToGuestOutput(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandList* dl,
-                            ID3D12Resource* out_res, std::uint32_t out_w, std::uint32_t out_h,
-                            ID3D12Resource* src) {
-  if (device == nullptr || dl == nullptr || out_res == nullptr || src == nullptr || out_w == 0 ||
-      out_h == 0 || g_guestout_failed.load(std::memory_order_relaxed) || !g_comp_pso_guestout ||
-      !g_comp_root || !g_srv_heap || !g_depth) {
-    return false;
-  }
-  if (!g_guestout_rtv_heap) {
-    D3D12_DESCRIPTOR_HEAP_DESC h{};
-    h.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    h.NumDescriptors = kPassFrames;
-    if (FAILED(device->CreateDescriptorHeap(&h, IID_PPV_ARGS(&g_guestout_rtv_heap)))) {
-      // Sticky, the way skate3 marks every creation failure (g_r.failed):
-      // a path that cannot build its resources does not get to retry them once
-      // per frame forever. It yields to the emulated output and stays there.
-      REXLOG_ERROR("[native-scene] guest-output RTV heap creation failed");
-      g_guestout_failed.store(true, std::memory_order_relaxed);
-      return false;
-    }
-  }
-  // Ring slot of its own: the composite runs on repeat callbacks too, where the
-  // replay counter does not move, so keying the descriptors on that counter
-  // would rewrite descriptors a still-recording submission is pointing at.
-  static std::uint32_t comp_index = 0;
-  const std::uint32_t ring = comp_index++ % kPassFrames;
-
-  const UINT rtv_inc = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-  D3D12_CPU_DESCRIPTOR_HANDLE rtv = g_guestout_rtv_heap->GetCPUDescriptorHandleForHeapStart();
-  rtv.ptr += static_cast<SIZE_T>(ring) * rtv_inc;
-  D3D12_RENDER_TARGET_VIEW_DESC rv{};
-  rv.Format = rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat;
-  rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
-  device->CreateRenderTargetView(out_res, &rv, rtv);
-
-  const UINT srv_inc =
-      device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-  const UINT comp_slot = ring * 2u;
-  D3D12_CPU_DESCRIPTOR_HANDLE comp_cpu = g_srv_heap->GetCPUDescriptorHandleForHeapStart();
-  comp_cpu.ptr += static_cast<SIZE_T>(comp_slot) * srv_inc;
-  D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
-  sv.Format = kColorFormat;
-  sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-  sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-  sv.Texture2D.MipLevels = 1;
-  device->CreateShaderResourceView(src, &sv, comp_cpu);
-  comp_cpu.ptr += srv_inc;
-  sv.Format = kDepthSrvFormat;
-  device->CreateShaderResourceView(g_depth.Get(), &sv, comp_cpu);
-  D3D12_GPU_DESCRIPTOR_HANDLE comp_gpu = g_srv_heap->GetGPUDescriptorHandleForHeapStart();
-  comp_gpu.ptr += static_cast<UINT64>(comp_slot) * srv_inc;
-
-  // The image arrives in kGuestOutputInternalState and must be returned to it.
-  D3D12_RESOURCE_BARRIER to_rt{};
-  to_rt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-  to_rt.Transition.pResource = out_res;
-  to_rt.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-  to_rt.Transition.StateBefore = rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState;
-  to_rt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-  dl->D3DResourceBarrier(1, &to_rt);
-
-  dl->D3DOMSetRenderTargets(1, &rtv, FALSE, nullptr);
-  dl->SetDescriptorHeaps(g_srv_heap.Get(), nullptr);
-  dl->D3DSetGraphicsRootSignature(g_comp_root.Get());
-  dl->D3DSetGraphicsRootDescriptorTable(0, comp_gpu);
-  struct {
-    float depth_clear;
-    std::uint32_t opaque;
-    std::uint32_t depth_view;
-    float amplify;
-  } comp{g_depth_clear, 1u /* the replacement frame is always opaque */,
-         dpour_pipeline::FlatShadingEnabled() ? 1u : 0u, AmplifyFactor()};
-  dl->D3DSetGraphicsRoot32BitConstants(1, 4, &comp, 0);
-  dl->D3DSetPipelineState(g_comp_pso_guestout.Get());
-  const D3D12_VIEWPORT gvp{0.0f, 0.0f, static_cast<float>(out_w), static_cast<float>(out_h),
-                           0.0f, 1.0f};
-  const D3D12_RECT gsc{0, 0, static_cast<LONG>(out_w), static_cast<LONG>(out_h)};
-  dl->RSSetViewport(gvp);
-  dl->RSSetScissorRect(gsc);
-  dl->D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-  dl->D3DIASetVertexBuffers(0, 0, nullptr);
-  dl->D3DIASetIndexBuffer(nullptr);
-  // DPOUR_NR_DRAW_GOTEST: paint the replacement frame a flat colour and skip the
-  // composite entirely. It separates "the guest-output replacement reaches the
-  // screen" from "the composite produces black" - two failures that look
-  // identical and had already cost several runs of guessing between them.
-  static const bool go_test = EnvFlag("DPOUR_NR_DRAW_GOTEST");
-  if (go_test) {
-    const float flat[4] = {0.35f, 0.0f, 0.5f, 1.0f};
-    dl->D3DClearRenderTargetView(rtv, flat, 0, nullptr);
-  } else {
-    dl->D3DDrawInstanced(3, 1, 0, 0);
-  }
-
-  D3D12_RESOURCE_BARRIER back = to_rt;
-  back.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-  back.Transition.StateAfter = rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState;
-  dl->D3DResourceBarrier(1, &back);
-  return true;
-}
-
 }  // namespace
 
-// The presenter's per-present entry. It no longer draws anything: the replay
-// happens inside the guest-output callback, on the command processor's own
-// list. What stays here is what only the presenter can give us - the D3D12
-// device - plus registering that callback once.
 void Render(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12GraphicsCommandList* cmd,
             std::uint32_t width, std::uint32_t height) {
-  if (!Enabled() || device == nullptr) {
+  if (!Enabled() || device == nullptr || queue == nullptr || cmd == nullptr) {
     return;
-  }
-  (void)queue;
-  g_device.store(device, std::memory_order_relaxed);
-  StartDeviceWatchdog(device);
-  static std::atomic<bool> registered{false};
-  if (!registered.exchange(true, std::memory_order_relaxed)) {
-    rex::graphics::SetNativeGuestOutputRenderer(&GuestOutputRenderCallback, nullptr);
-    REXLOG_INFO("[native-scene] guest-output renderer registered (skate3-sdk hook)");
-  }
-  dpour_tex::EnsureHeap(device);
-  dpour_pipeline::Init(device);
-  (void)cmd;
-  (void)width;
-  (void)height;
-}
-
-// The replay, recorded onto the command processor's deferred list. `cmd` is the
-// presenter's own list and is non-null ONLY on the legacy overlay path; from
-// the guest-output callback it is null and the function returns after the
-// composite. Returns true when the composite went into `out_res`.
-bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandList* dl,
-                    ID3D12GraphicsCommandList* cmd, std::uint32_t width, std::uint32_t height,
-                    ID3D12Resource* out_res, std::uint64_t submission, std::uint64_t completed) {
-  if (!Enabled() || device == nullptr || dl == nullptr) {
-    return false;
-  }
-  // Sticky failure first, exactly where skate3 puts it (EnsurePipeline opens
-  // with `if (g_r.failed) return false;`). Once any resource this path needs
-  // could not be built, the emulated output is the frame - permanently, not
-  // until the next retry.
-  if (g_reg_failed || g_guestout_failed.load(std::memory_order_relaxed)) {
-    return false;
   }
   g_device.store(device, std::memory_order_relaxed);
   StartDeviceWatchdog(device);
@@ -4130,11 +3036,8 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   }
   dpour_tex::EnsureHeap(device);
   if (!dpour_pipeline::Init(device)) {
-    return false;
+    return;
   }
-
-  // The replay's upload memory for this submission.
-  dpour_pipeline::BeginReplay(device, submission, completed);
 
   const std::int64_t render_started = TickNow();
   struct RenderCharge {
@@ -4150,64 +3053,42 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   // registry below replaces it. The worker machinery stays compiled but idle.)
 
   static thread_local std::vector<SceneDraw> items;
-  static thread_local std::vector<PendingResolve> resolves;
-  const CpuArena* arena = nullptr;
   PassSlot passes_snap[kMaxPasses];
   std::uint64_t items_frame = 0;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     items = g_published;
-    resolves = g_resolve_published;
-    arena = &g_arenas[g_published_arena_index];
     std::memcpy(passes_snap, g_published_passes, sizeof(passes_snap));
     items_frame = g_published_frame;
   }
   if (items.empty()) {
     // Title screen, menu, loading, movie: nothing of the scene this frame, so
     // leave the frame exactly as the game drew it.
-    return false;
+    return;
   }
-  // ...and the same question asked properly (see YieldWithoutSceneOn): a frame
-  // with draws in it is not a frame with a SCENE in it. The intro movies have
-  // draws and no scene, and publishing them is what puts white on screen.
-  if (YieldWithoutSceneOn()) {
-    bool scene_drew = false;
-    for (std::uint32_t p = 0; p < kMaxPasses; ++p) {
-      if (passes_snap[p].draws != 0 && IsSceneColorSurface(passes_snap[p].color_object)) {
-        scene_drew = true;
-        break;
-      }
-    }
-    if (!scene_drew) {
-      static std::atomic<std::uint64_t> yielded{0};
-      const std::uint64_t n = yielded.fetch_add(1, std::memory_order_relaxed) + 1;
-      if (n == 1 || n == 600 || n == 6000) {
-        REXLOG_INFO("[native-scene] yielding to the emulated frame x{}: {} draws captured but "
-                    "none in the game's scene surface",
-                    n, items.size());
-      }
-      return false;
-    }
+  // ONE SUBMISSION PER PUBLISHED GUEST FRAME.
+  //
+  // The presenter calls this every present, the guest publishes only when it
+  // finishes a frame: measured, 1758 renders against 600 publishes - the same
+  // snapshot re-submitted three times over, and far more than that through a
+  // loading stall. Re-submitting a stale snapshot is not just wasted GPU, it is
+  // the whole use-after-free class: the snapshot holds RAW vertex/index/constant
+  // GPU addresses, and a buffer retired while it was still being replayed got
+  // freed under a submission that had not run yet (DRED: page fault, every
+  // breadcrumb list complete). The "+8 fences of slack" in the buffer cache was
+  // a guess at how long that replay window could be; this removes the window
+  // instead of guessing at it.
+  //
+  // Nothing disappears from the screen: in guest-output mode our last frame
+  // lives in g_guestout_tex and the callback keeps serving it until a newer one
+  // replaces it. The overlay path still composites every present (it paints onto
+  // the presenter's own list, which is rebuilt each frame), so it is exempt.
+  static std::uint64_t last_rendered_frame = 0;  // render thread only
+  if (GuestOutMode() && items_frame == last_rendered_frame &&
+      g_guestout_has_frame.load(std::memory_order_acquire)) {
+    return;
   }
-  // EVERY CALLBACK REPLAYS IN FULL, the way skate3's RenderScene does - and it
-  // is now safe to, which it was not before.
-  //
-  // The snapshot no longer holds GPU addresses. Its constants and its
-  // user-primitive geometry are BYTES in the staging arena, and each replay
-  // copies them into that frame's upload allocator and binds the address it
-  // gets back. A second replay of the same snapshot therefore reads the same
-  // bytes, not whatever has since moved into an address recycled underneath it.
-  //
-  // The whole cast of workarounds that stood here goes with it: one replay per
-  // published frame, declining the callbacks in between, and the invention that
-  // followed - re-compositing the target the last replay left, which froze the
-  // picture and painted a loading frame over the menu.
-  //
-  // The per-target clear keys on the REPLAY, not the published frame, so a
-  // second replay starts from a clean target rather than drawing on top of the
-  // first.
-  static std::uint64_t replay_index = 0;
-  ++replay_index;
+  last_rendered_frame = items_frame;
 
   // Targets are created only once there is something to draw, and not before:
   // their depth clear value depends on whether the game runs a reversed depth
@@ -4217,7 +3098,7 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   const std::uint32_t tw = g_published_w.load(std::memory_order_relaxed);
   const std::uint32_t th = g_published_h.load(std::memory_order_relaxed);
   if (!EnsureTargets(device, tw, th) || !EnsureComposite(device)) {
-    return false;
+    return;
   }
 
   if (!g_logged_first.exchange(true)) {
@@ -4235,52 +3116,25 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
       REXLOG_INFO("[native-scene] drawing {} draws this frame at {}x{}", items.size(), tw, th);
     }
   }
-  // IS THE SNAPSHOT STILL MOVING? A frozen picture and a correctly-replayed one
-  // are the same log line above: both say "drawing N draws". The published guest
-  // frame is what separates them - if it stops advancing while the callbacks
-  // keep coming, we are replaying a dead snapshot, and the screen shows the
-  // frame the game drew before it stopped publishing. That is precisely what
-  // "the menu shows the previous frame" looks like from in here.
-  {
-    static std::uint64_t last_seen = ~0ull;
-    static std::uint32_t repeats = 0;
-    if (items_frame == last_seen) {
-      ++repeats;
-      if (repeats == 120 || repeats == 600 || repeats == 3000) {
-        REXLOG_WARN("[native-scene] SNAPSHOT FROZEN: guest frame {} replayed {} times - the game "
-                    "has published nothing new ({} draws held)",
-                    items_frame, repeats, items.size());
-      }
-    } else {
-      if (repeats >= 120) {
-        REXLOG_INFO("[native-scene] snapshot moving again: frame {} after {} repeats of {}",
-                    items_frame, repeats, last_seen);
-      }
-      repeats = 0;
-      last_seen = items_frame;
-    }
-  }
 
-  // NO COMMAND LIST OF OUR OWN, NO SUBMISSION OF OUR OWN.
-  //
-  // Everything below is recorded onto the command processor's deferred list -
-  // the same list the rest of the frame is recorded on, submitted once by the
-  // command processor. What used to stand here (our own allocator ring, our own
-  // ID3D12GraphicsCommandList, our own ExecuteCommandLists + Signal on the
-  // runtime's queue) was a SECOND timeline running beside it, which no
-  // reference has: skate3 records into the callback's list on this very SDK,
-  // UnleashedRecomp and MarathonRecomp into their one render thread's list.
-  // Two timelines mean two independent notions of "when is this resource free",
-  // and that is the whole use-after-free / device-hang class.
   const std::uint32_t slot = g_pass_index % kPassFrames;
+  if (g_alloc_fence[slot] != 0 && g_fence->GetCompletedValue() < g_alloc_fence[slot]) {
+    g_fence->SetEventOnCompletion(g_alloc_fence[slot], g_fence_event);
+    WaitForSingleObject(g_fence_event, 1000);
+  }
+  if (FAILED(g_allocators[slot]->Reset()) || FAILED(g_pass_list->Reset(g_allocators[slot].Get(),
+                                                                      nullptr))) {
+    return;
+  }
+  ID3D12GraphicsCommandList* pl = g_pass_list.Get();
 
   // Uploads first: every buffer and texture a draw refers to was staged this
   // frame and must be copied before the draws that read it.
-  dpour_vbuf::Flush(device, dl);
-  dpour_tex::Flush(device, dl);
+  dpour_vbuf::Flush(device, pl);
+  dpour_tex::Flush(device, pl);
 
   if (!EnsureRegHeaps(device)) {
-    return false;
+    return;
   }
   // The scene target's bindless SRV, so textures the game resolves the scene
   // into sample OUR scene. Recreated in place whenever g_color is rebuilt.
@@ -4321,8 +3175,10 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   depth_to_write.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
   depth_to_write.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
   depth_to_write.Transition.StateAfter = D3D12_RESOURCE_STATE_DEPTH_WRITE;
-  dl->D3DResourceBarrier(1, &depth_to_write);
+  pl->ResourceBarrier(1, &depth_to_write);
 
+  const D3D12_CPU_DESCRIPTOR_HANDLE scene_rtv = g_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+  const D3D12_CPU_DESCRIPTOR_HANDLE scene_dsv = g_dsv_heap->GetCPUDescriptorHandleForHeapStart();
   // DPOUR_NR_DRAW_CLEARTINT: clear the targets to something that is obviously
   // not the game, to separate "our target is black" from "the composite is not
   // showing our target". A black screen is the same picture either way, and
@@ -4333,51 +3189,42 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
 
   ID3D12DescriptorHeap* heaps[2] = {dpour_tex::Heap(), dpour_pipeline::SamplerHeap()};
   if (heaps[0] == nullptr || heaps[1] == nullptr) {
-    return false;
+    return;
   }
-  dl->SetDescriptorHeaps(heaps[0], heaps[1]);
-  dl->D3DSetGraphicsRootSignature(dpour_pipeline::RootSignature());
-  dpour_pipeline::BindDescriptorTables(dl, dpour_tex::GpuHandleStart());
-
-  // THE STATE LIVES ON THE TARGET. This is UnleashedRecomp's AddBarrier
-  // (video.cpp:753) with its one essential property: it does NOTHING when the
-  // resource is already in the requested state.
-  //
-  //     if (texture->layout != layout) { g_barrierMap[...] = layout; texture->layout = layout; }
-  //
-  // Ours hardcoded every StateBefore and wrote NativeTarget::color_state without
-  // ever reading it back, so a target already in PIXEL_SHADER_RESOURCE was told
-  // it was in RENDER_TARGET. A transition whose StateBefore does not match the
-  // resource's actual state is not a hint the runtime corrects - it is undefined
-  // behaviour, and what the driver does with the contents afterwards is its own
-  // business. Making the recorded barrier follow the tracked state removes the
-  // whole class rather than one instance of it.
-  const auto transition_target = [&](NativeTarget& t, D3D12_RESOURCE_STATES to) {
-    if (t.color_state == to) {
-      return;
-    }
-    D3D12_RESOURCE_BARRIER b{};
-    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    b.Transition.pResource = t.color.Get();
-    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    b.Transition.StateBefore = t.color_state;
-    b.Transition.StateAfter = to;
-    dl->D3DResourceBarrier(1, &b);
-    t.color_state = to;
-  };
+  pl->SetDescriptorHeaps(2, heaps);
+  pl->SetGraphicsRootSignature(dpour_pipeline::RootSignature());
+  dpour_pipeline::BindDescriptorTables(pl, dpour_tex::GpuHandleStart());
 
   // --- the ordered multi-target replay (the references' command queue) -------
   const std::uint32_t rtv_stride =
       device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
   const std::uint32_t dsv_stride =
       device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+  bool scene_color_open = false;   // g_color currently in RENDER_TARGET state
+  bool scene_cleared = false;
   NativeTarget* current_reg = nullptr;
   std::uint32_t current_pass = 0xFFFFFFFFu;
   ID3D12Resource* last_target_res = nullptr;  // what the composite should show
   const auto close_current = [&]() {
     if (current_reg != nullptr) {
-      transition_target(*current_reg, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      D3D12_RESOURCE_BARRIER b{};
+      b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      b.Transition.pResource = current_reg->color.Get();
+      b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+      b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+      pl->ResourceBarrier(1, &b);
+      current_reg->color_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
       current_reg = nullptr;
+    } else if (scene_color_open) {
+      D3D12_RESOURCE_BARRIER b{};
+      b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      b.Transition.pResource = g_color.Get();
+      b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+      b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+      pl->ResourceBarrier(1, &b);
+      scene_color_open = false;
     }
   };
   // Which full-size target actually RECEIVED the frame. "The last one bound"
@@ -4411,17 +3258,31 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   };
   const auto bind_pass = [&](std::uint32_t pass) -> bool {
     close_current();
-    // THE SHARED "SCENE" TARGET IS GONE. What stood here bound g_color for
-    // kScenePassSlot - one target that every draw of the MSAA block was funnelled
-    // into. It is the third architecture neither reference has: Unleashed and
-    // Marathon give every guest surface its own native target, skate3 draws the
-    // engine's stream into one target it owns end to end, and NEITHER answers
-    // "which pass is the scene", because neither ever asks. g_color survives only
-    // as the scene-injection readback source.
-    if (pass >= kMaxPasses) {
-      return false;  // the overflow sentinel: draw nowhere rather than into slot 0
+    if (pass == kScenePassSlot) {
+      D3D12_RESOURCE_BARRIER b{};
+      b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      b.Transition.pResource = g_color.Get();
+      b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+      b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+      pl->ResourceBarrier(1, &b);
+      scene_color_open = true;
+      if (!scene_cleared) {
+        pl->ClearRenderTargetView(scene_rtv, clear_color, 0, nullptr);
+        pl->ClearDepthStencilView(scene_dsv, D3D12_CLEAR_FLAG_DEPTH, g_depth_clear, 0, 0, nullptr);
+        scene_cleared = true;
+      }
+      pl->OMSetRenderTargets(1, &scene_rtv, FALSE, &scene_dsv);
+      const D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(tw), static_cast<float>(th),
+                              0.0f, 1.0f};
+      const D3D12_RECT sc{0, 0, static_cast<LONG>(tw), static_cast<LONG>(th)};
+      pl->RSSetViewports(1, &vp);
+      pl->RSSetScissorRects(1, &sc);
+      last_target_res = g_color.Get();
+      score_target(g_color.Get(), tw, kScenePassColor);
+      return true;
     }
-    const PassSlot& ps = passes_snap[pass];
+    const PassSlot& ps = passes_snap[pass < kMaxPasses ? pass : 0];
     // The back-buffer pass - the game's own final composition (post-process
     // quads sampling the scene resolve through the registry links, then the
     // UI). Identified by the colour OBJECT matching GD3DBackBuffer at bind
@@ -4431,13 +3292,8 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
     // vertices drawn here are in guest screen coordinates and the composite
     // upscales to the output anyway. A null COLOUR with a real depth surface
     // is a depth-only pass (shadows), which has nothing native to draw into.
-    // One EDRAM tile range, one native target: every DefaultColor alias draws
-    // into the primary's target (see EdramAliasOn for the measurement).
-    std::uint32_t target_key = CanonicalSurface(ps.color_object);
+    std::uint32_t target_key = ps.color_object;
     std::uint32_t w = ps.view_w, h = ps.view_h;
-    // The viewport is a fallback, not a size: it moves within a frame. Only the
-    // two branches below that read a real surface record set this.
-    bool size_is_authoritative = false;
     // Only an actual bind of GD3DBackBuffer is the back buffer. A NULL colour
     // bind is not "the back buffer by implication" - it is no render target.
     const bool is_bb = ps.is_backbuffer;
@@ -4452,7 +3308,6 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
       // viewport into the target for the whole session).
       w = kDefaultWidth;
       h = kDefaultHeight;
-      size_is_authoritative = true;
     } else if (target_key == 0) {
       return false;  // depth-only or unidentified pass: nothing to draw into yet
     } else {
@@ -4461,37 +3316,36 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
       if (meta != g_surface_meta.end()) {
         w = meta->second.w;
         h = meta->second.h;
-        size_is_authoritative = true;
       }
     }
-    NativeTarget* t = GetOrCreateRegTarget(device, target_key, w, h, size_is_authoritative);
+    NativeTarget* t = GetOrCreateRegTarget(device, target_key, w, h);
     if (t == nullptr) {
       return false;
     }
-    transition_target(*t, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = t->color.Get();
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    pl->ResourceBarrier(1, &b);
+    t->color_state = D3D12_RESOURCE_STATE_RENDER_TARGET;
     D3D12_CPU_DESCRIPTOR_HANDLE rtvh = g_reg_rtv_heap->GetCPUDescriptorHandleForHeapStart();
     rtvh.ptr += static_cast<std::size_t>(t->rtv_index) * rtv_stride;
     D3D12_CPU_DESCRIPTOR_HANDLE dsvh = g_reg_dsv_heap->GetCPUDescriptorHandleForHeapStart();
     dsvh.ptr += static_cast<std::size_t>(t->dsv_index) * dsv_stride;
-    if (t->cleared_frame != replay_index) {
-      dl->D3DClearRenderTargetView(rtvh, clear_color, 0, nullptr);
-      dl->D3DClearDepthStencilView(dsvh, D3D12_CLEAR_FLAG_DEPTH, g_depth_clear, 0, 0, nullptr);
-      t->cleared_frame = replay_index;
+    if (t->cleared_frame != items_frame) {
+      pl->ClearRenderTargetView(rtvh, clear_color, 0, nullptr);
+      pl->ClearDepthStencilView(dsvh, D3D12_CLEAR_FLAG_DEPTH, g_depth_clear, 0, 0, nullptr);
+      t->cleared_frame = items_frame;
     }
-    dl->D3DOMSetRenderTargets(1, &rtvh, FALSE, &dsvh);
+    pl->OMSetRenderTargets(1, &rtvh, FALSE, &dsvh);
     const D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(t->w), static_cast<float>(t->h),
                             0.0f, 1.0f};
     const D3D12_RECT sc{0, 0, static_cast<LONG>(t->w), static_cast<LONG>(t->h)};
-    dl->RSSetViewport(vp);
-    dl->RSSetScissorRect(sc);
+    pl->RSSetViewports(1, &vp);
+    pl->RSSetScissorRects(1, &sc);
     current_reg = t;
-    // This surface now holds content we drew, as of this guest frame. What reads
-    // it later (the alias path in RtBackedSrvSlot) uses that to tell "our target"
-    // from "our empty target".
-    {
-      std::lock_guard<std::mutex> lk(g_reg_mutex);
-      g_surface_drawn_frame[target_key] = items_frame;
-    }
     // Downsample/utility passes must not become "the frame": only a full-size
     // target may represent it for the composite.
     if (t->w >= 1024) {
@@ -4529,223 +3383,12 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   }
   const bool query_on = g_query_heap && g_query_readback;
   if (query_on) {
-    dl->D3DBeginQuery(g_query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, slot);
+    pl->BeginQuery(g_query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, slot);
   }
 
   ID3D12PipelineState* last_pso = nullptr;
   D3D12_PRIMITIVE_TOPOLOGY last_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
-  std::uint64_t last_vs_cb = 0;
-  std::uint64_t last_ps_cb = 0;
-  std::uint64_t last_sh_cb = 0;
-  // The rest of DirtyStates (video.cpp:195): a binding is re-issued only when
-  // its value actually differs. UE3 draws long runs of primitives off one
-  // stream set, so most of these collapse to nothing.
-  D3D12_VERTEX_BUFFER_VIEW last_vbv[kMaxStreams]{};
-  std::uint32_t last_vbv_count = 0;
-  D3D12_INDEX_BUFFER_VIEW last_ibv{};
-  const auto vbv_same = [&](const D3D12_VERTEX_BUFFER_VIEW* v, std::uint32_t n) {
-    if (n != last_vbv_count) {
-      return false;
-    }
-    for (std::uint32_t i = 0; i < n; ++i) {
-      if (v[i].BufferLocation != last_vbv[i].BufferLocation ||
-          v[i].SizeInBytes != last_vbv[i].SizeInBytes ||
-          v[i].StrideInBytes != last_vbv[i].StrideInBytes) {
-        return false;
-      }
-    }
-    return true;
-  };
   const bool no_draw = NoDraw();
-
-  // Staged handle -> GPU address for this replay. One upload per distinct blob
-  // however many draws reference it.
-  static thread_local std::unordered_map<std::uint32_t, std::uint64_t> staged_gpu;
-  staged_gpu.clear();
-  const auto ResolveStaged = [&](std::uint32_t handle, std::uint32_t bytes) -> std::uint64_t {
-    if (handle == kNoStage || bytes == 0) {
-      return 0;
-    }
-    const auto found = staged_gpu.find(handle);
-    if (found != staged_gpu.end()) {
-      return found->second;
-    }
-    const std::uint8_t* src = arena != nullptr ? arena->At(handle) : nullptr;
-    if (src == nullptr) {
-      return 0;
-    }
-    const dpour_pipeline::ConstantAlloc a = dpour_pipeline::AllocReplayConstants(bytes);
-    if (a.cpu == nullptr) {
-      return 0;
-    }
-    std::memcpy(a.cpu, src, bytes);
-    staged_gpu.emplace(handle, a.gpu);
-    return a.gpu;
-  };
-
-  // THE RESOLVES, RUN WHERE THE GAME RAN THEM.
-  //
-  // Each was stamped with the draw count at the moment RHICopyToResolveTarget
-  // fired, so replaying them at the same point puts the copy between the draws
-  // that produced the surface and the draws that sample the result - which is
-  // the whole reason a resolve exists and the reason an end-of-frame copy would
-  // be wrong.
-  std::size_t resolve_next = 0;
-  std::uint32_t resolves_run = 0;
-  const auto run_resolves_upto = [&](std::uint32_t draw_index) {
-    if (!ResolveCopyEnabled()) {
-      return;
-    }
-    while (resolve_next < resolves.size() && resolves[resolve_next].draw_index <= draw_index) {
-      const PendingResolve pr = resolves[resolve_next++];
-      // The set, not the list: the same destination resolved twice before this
-      // cutoff is copied once, from its last source - what a std::set of pending
-      // surfaces gives the reference for free.
-      //
-      // WITHIN THE BATCH ONLY. Scanning the whole rest of the frame dropped a
-      // copy that a draw between the two resolves was about to sample, and left
-      // it reading the previous frame's copy instead.
-      bool superseded = false;
-      for (std::size_t later = resolve_next; later < resolves.size(); ++later) {
-        if (resolves[later].draw_index > draw_index) {
-          break;
-        }
-        if (resolves[later].d3d_tex == pr.d3d_tex) {
-          superseded = true;
-          break;
-        }
-      }
-      if (superseded) {
-        continue;
-      }
-      // Depth resolves are not copied by the reference (video.cpp:3572 and :3582,
-      // "Depth stencil textures in this game are guaranteed to be transient"), and
-      // ours reach here only to be skipped for want of a target anyway - so this
-      // is a no-op that removes noise, not a behaviour change.
-      //
-      // DEFAULT OFF regardless. It went out in the same build as a white screen,
-      // and "it should be a no-op" is exactly the kind of claim that has to be
-      // measured rather than asserted. DPOUR_NR_SKIP_DEPTH_RESOLVE=1 to enable.
-      if (SkipDepthResolves()) {
-        std::lock_guard<std::mutex> lk(g_reg_mutex);
-        const auto meta = g_surface_meta.find(pr.surface);
-        if (meta != g_surface_meta.end() && meta->second.is_depth) {
-          continue;
-        }
-      }
-      const auto src_it = g_reg_targets.find(pr.surface);
-      if (src_it == g_reg_targets.end() || src_it->second.srv_slot == dpour_tex::kInvalidSlot) {
-        // NAME THEM. "12 of 17" says a third of the copies do not happen; it does
-        // not say which surfaces or why, and that is the difference between a
-        // number and a lead. One line per surface, ever.
-        //
-        // Counted, not just announced: a surface skipped once during boot (before
-        // anything had been drawn into it yet) and a surface skipped on EVERY
-        // frame are completely different findings, and "log the first time" cannot
-        // tell them apart. The repeats at 200 and 2000 are what separates them.
-        static std::unordered_map<std::uint32_t, std::uint32_t> misses;
-        std::uint32_t& n = misses[pr.surface];
-        ++n;
-        if (misses.size() < 64 && (n == 1 || n == 200 || n == 2000)) {
-          std::uint32_t sw = 0, sh = 0;
-          char sname[24] = "?";
-          {
-            std::lock_guard<std::mutex> lk(g_reg_mutex);
-            const auto meta = g_surface_meta.find(pr.surface);
-            if (meta != g_surface_meta.end()) {
-              sw = meta->second.w;
-              sh = meta->second.h;
-              if (meta->second.name[0] != '\0') {
-                std::snprintf(sname, sizeof(sname), "%s", meta->second.name);
-              }
-            }
-          }
-          REXLOG_WARN("[native-scene] resolve WITHOUT SOURCE x{}: \"{}\" surface {:#x} ({}x{}) -> "
-                      "tex {:#x} - no native target, so nothing we drew reaches that texture",
-                      n, sname, pr.surface, sw, sh, pr.d3d_tex);
-        }
-        continue;  // nothing native has been drawn into that surface yet
-      }
-      NativeTarget& src = src_it->second;
-      if (!EnsureResolvePipeline(device)) {
-        return;  // sticky: it will not work later either
-      }
-      ResolveTexture* dst = EnsureResolveTexture(device, pr.d3d_tex, src.w, src.h);
-      if (dst == nullptr) {
-        continue;
-      }
-      // The source has to be readable. If it is the target currently bound, this
-      // is exactly the case the alias could never handle - close it first. The
-      // transition after it is a no-op unless something else left it writable.
-      if (current_reg == &src) {
-        close_current();
-        current_pass = 0xFFFFFFFFu;
-      }
-      transition_target(src, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-      D3D12_RESOURCE_BARRIER to_rt{};
-      to_rt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-      to_rt.Transition.pResource = dst->tex.Get();
-      to_rt.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-      to_rt.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-      to_rt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-      dl->D3DResourceBarrier(1, &to_rt);
-
-      const std::uint32_t stride =
-          device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-      D3D12_CPU_DESCRIPTOR_HANDLE rtvh = g_resolve_rtv_heap->GetCPUDescriptorHandleForHeapStart();
-      rtvh.ptr += static_cast<std::size_t>(dst->rtv_index) * stride;
-      dl->D3DOMSetRenderTargets(1, &rtvh, FALSE, nullptr);
-      dl->D3DSetGraphicsRootSignature(g_resolve_root.Get());
-      D3D12_GPU_DESCRIPTOR_HANDLE srcgpu{};
-      srcgpu.ptr = dpour_tex::GpuHandleAt(src.srv_slot);
-      dl->D3DSetGraphicsRootDescriptorTable(0, srcgpu);
-      // Nothing to undo when nothing multiplied: with PSR_ColorBiasFactor forced
-      // to 1 the shaders write unbiased colour, so the copy is a straight copy.
-      // (The game's own resolve passes D3DRESOLVE_EXPONENTBIAS(-bias) here,
-      // XeD3DRenderTarget.cpp:519, which is what this mirrors when the bias is
-      // left in place.)
-      const float scale = KeepColorBias() ? std::ldexp(1.0f, -pr.bias) : 1.0f;
-      const float consts[4] = {scale, 0.0f, 0.0f, 0.0f};
-      dl->D3DSetGraphicsRoot32BitConstants(1, 4, consts, 0);
-      dl->D3DSetPipelineState(g_resolve_pso.Get());
-      const D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(dst->w), static_cast<float>(dst->h),
-                              0.0f, 1.0f};
-      const D3D12_RECT sc{0, 0, static_cast<LONG>(dst->w), static_cast<LONG>(dst->h)};
-      dl->RSSetViewport(vp);
-      dl->RSSetScissorRect(sc);
-      dl->D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-      dl->D3DIASetVertexBuffers(0, 0, nullptr);
-      dl->D3DIASetIndexBuffer(nullptr);
-      dl->D3DDrawInstanced(3, 1, 0, 0);
-
-      D3D12_RESOURCE_BARRIER back = to_rt;
-      back.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-      back.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-      dl->D3DResourceBarrier(1, &back);
-      ++resolves_run;
-      // This destination now holds this frame's content. Anything that samples it
-      // later is entitled to our copy; anything sampling a destination we did NOT
-      // refresh gets the guest texture instead.
-      {
-        std::lock_guard<std::mutex> lk(g_reg_mutex);
-        g_resolve_copy_frame[pr.d3d_tex] = items_frame;
-      }
-
-      // Hand the list back to the game's own pipeline. Setting a root signature
-      // drops every root argument with it, so the next draw has to re-bind the
-      // target, the PSO and the topology as if nothing were current.
-      dl->D3DSetGraphicsRootSignature(dpour_pipeline::RootSignature());
-      dpour_pipeline::BindDescriptorTables(dl, dpour_tex::GpuHandleStart());
-      last_pso = nullptr;
-      last_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
-      last_vs_cb = 0;
-      last_ps_cb = 0;
-      last_sh_cb = 0;
-      last_vbv_count = 0;
-      last_ibv = D3D12_INDEX_BUFFER_VIEW{};
-      current_pass = 0xFFFFFFFFu;
-    }
-  };
   bool pass_ok = false;
   std::uint32_t issued = 0;
   std::uint32_t scene_issued = 0;
@@ -4759,33 +3402,15 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   // passes feeding each other (shadow maps, the base pass, the post-process
   // chain), and dropping all but one leaves the survivor reading targets that
   // were never rendered.
-  for (std::size_t item_index = 0; item_index < items.size(); ++item_index) {
-    const SceneDraw& it = items[item_index];
+  const bool scene_only = false;
+  for (const SceneDraw& it : items) {
     if (issued >= max_draws) {
       break;
     }
+    if (scene_only && it.pass != kScenePassSlot) {
+      continue;
+    }
     if (it.pass != current_pass) {
-      // THE COPY GOES HERE, WHERE THE REFERENCE PUTS IT.
-      //
-      // Unleashed does not batch its stretch-rect copies at the end of the
-      // frame. FlushRenderStateForRenderThread (video.cpp:4462) and ProcClear
-      // (:3680) both ask PopulateBarriersForStretchRect whether the surface
-      // about to be written has destination textures pending, and if so run
-      // ExecutePendingStretchRectCommands right then - before the draw. The
-      // Present-time pass (:3565) is only the sweep for whatever is still
-      // pending when the frame ends.
-      //
-      // Ours ran every copy after every draw. That is a full frame of latency on
-      // each one: the composition quads sampled the PREVIOUS frame's copy, which
-      // is why the loading screen alternated between correct and a grey or white
-      // wash - the same frame, sampling a texture that was one frame behind or
-      // had never been written at all.
-      //
-      // A pass boundary is the cheap version of the same rule: it is where a
-      // different surface starts being written, so it is where anything that
-      // sampled the old one must already be satisfied. A dozen calls a frame,
-      // not one per draw - the per-draw version was measured at 14 FPS.
-      run_resolves_upto(static_cast<std::uint32_t>(item_index));
       current_pass = it.pass;
       pass_ok = bind_pass(current_pass);
     }
@@ -4793,60 +3418,40 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
       continue;
     }
     ++issued;
-    // Draws that can paint versus draws that cannot. A frame made entirely of
-    // depth-prepass draws writes no colour at all - which looks exactly like
-    // broken shaders. Counted over the WHOLE frame now: there is no reserved
-    // scene slot left to count separately, and the number was only ever a
-    // sanity check on "did anything shaded get through".
-    ++scene_issued;
-    if (it.ps_hash != 0) {
-      ++scene_issued_shaded;
-    }
-    // DPOUR_NR_DRAW_SCENELIST: the frame's draws in submission order, with the
-    // pass each one belongs to. A full-screen quad is unmistakable here: six
-    // indices among neighbours of hundreds.
-    if (SceneListEnabled() && scene_list_frames < 2 && scene_issued <= 80) {
-      REXLOG_INFO("[native-scene] draw[{:3}] pass={} {} count={} start={} vs={:#x} ps={:#x}",
-                  scene_issued, it.pass, it.indexed ? "indexed" : "linear", it.count, it.start,
-                  it.vs_hash, it.ps_hash);
+    // Split what reaches the scene target into draws that can paint and draws
+    // that cannot. A scene made entirely of depth-prepass draws is a scene that
+    // writes no colour at all - which looks exactly like broken shaders.
+    if (it.pass == kScenePassSlot) {
+      ++scene_issued;
+      if (it.ps_hash != 0) {
+        ++scene_issued_shaded;
+      }
+      // DPOUR_NR_DRAW_SCENELIST: the scene's draws in submission order.
+      //
+      // The composited scene came out a single flat colour over the whole
+      // screen, which the clear cannot explain (it is zero) - so one of these
+      // draws covers everything and paints last. Bisecting that with MAXDRAWS
+      // costs a walk back into the game for every guess; the order, the size and
+      // the shader of each draw name the culprit directly. A full-screen quad is
+      // unmistakable here: six indices among neighbours of hundreds.
+      if (SceneListEnabled() && scene_list_frames < 2 && scene_issued <= 80) {
+        REXLOG_INFO("[native-scene] scene[{:3}] {} count={} start={} vs={:#x} ps={:#x}",
+                    scene_issued, it.indexed ? "indexed" : "linear", it.count, it.start,
+                    it.vs_hash, it.ps_hash);
+      }
     }
     score_draw();
     if (it.pso != last_pso) {
-      dl->D3DSetPipelineState(it.pso);
+      pl->SetPipelineState(it.pso);
       last_pso = it.pso;
     }
     if (it.topology != last_topology) {
-      dl->D3DIASetPrimitiveTopology(it.topology);
+      pl->IASetPrimitiveTopology(it.topology);
       last_topology = it.topology;
     }
-    // THE GPU ADDRESS IS BORN HERE, not at capture. Staged bytes are copied into
-    // this frame's upload allocator and bound - FlushRenderStateForRenderThread
-    // (video.cpp:4520) does exactly this, and for the same reason: the address
-    // must belong to the frame that is being submitted, not to one that has
-    // already been recycled.
-    //
-    // Only when it CHANGES, which is the reference's dirty-state rule. Draws
-    // sharing a bank share one upload and one binding, so the common case costs
-    // nothing at all - and it removes three root-descriptor writes per draw.
-    const std::uint64_t vs_gpu = ResolveStaged(it.cb_vertex, it.cb_vertex_bytes);
-    const std::uint64_t ps_gpu = ResolveStaged(it.cb_pixel, it.cb_pixel_bytes);
-    const std::uint64_t sh_gpu =
-        ResolveStaged(it.cb_shared, dpour_pipeline::kSharedConstantsSize);
-    if (vs_gpu == 0 || ps_gpu == 0 || sh_gpu == 0) {
-      continue;  // the frame allocator refused; nothing to bind this draw to
-    }
-    if (vs_gpu != last_vs_cb) {
-      dl->D3DSetGraphicsRootConstantBufferView(dpour_pipeline::kRootVertexConstants, vs_gpu);
-      last_vs_cb = vs_gpu;
-    }
-    if (ps_gpu != last_ps_cb) {
-      dl->D3DSetGraphicsRootConstantBufferView(dpour_pipeline::kRootPixelConstants, ps_gpu);
-      last_ps_cb = ps_gpu;
-    }
-    if (sh_gpu != last_sh_cb) {
-      dl->D3DSetGraphicsRootConstantBufferView(dpour_pipeline::kRootSharedConstants, sh_gpu);
-      last_sh_cb = sh_gpu;
-    }
+    pl->SetGraphicsRootConstantBufferView(dpour_pipeline::kRootVertexConstants, it.cb_vertex);
+    pl->SetGraphicsRootConstantBufferView(dpour_pipeline::kRootPixelConstants, it.cb_pixel);
+    pl->SetGraphicsRootConstantBufferView(dpour_pipeline::kRootSharedConstants, it.cb_shared);
     // One line the first time a given shader pair is actually submitted. A GPU
     // hang kills the process without saying what it was executing, so the last
     // line in the log before the device is removed IS the identification.
@@ -4860,73 +3465,25 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
             static_cast<int>(it.topology), it.vbv_count);
       }
     }
-    // User-primitive geometry becomes a GPU buffer here, in the frame that draws
-    // it - never earlier.
-    D3D12_VERTEX_BUFFER_VIEW vbv[kMaxStreams];
-    std::memcpy(vbv, it.vbv, sizeof(vbv));
-    D3D12_INDEX_BUFFER_VIEW ibv = it.ibv;
-    if (it.up_vtx != kNoStage) {
-      const std::uint64_t gpu = ResolveStaged(it.up_vtx, it.up_vtx_bytes);
-      if (gpu == 0) {
-        continue;
-      }
-      vbv[0].BufferLocation = gpu;
-    }
-    if (it.up_idx != kNoStage) {
-      const std::uint64_t gpu = ResolveStaged(it.up_idx, it.up_idx_bytes);
-      if (gpu == 0) {
-        continue;
-      }
-      ibv.BufferLocation = gpu;
-    }
-    if (!vbv_same(vbv, it.vbv_count)) {
-      dl->D3DIASetVertexBuffers(0, it.vbv_count, vbv);
-      std::memcpy(last_vbv, vbv, sizeof(last_vbv));
-      last_vbv_count = it.vbv_count;
-    }
+    pl->IASetVertexBuffers(0, it.vbv_count, it.vbv);
     if (it.indexed) {
-      if (ibv.BufferLocation != last_ibv.BufferLocation ||
-          ibv.SizeInBytes != last_ibv.SizeInBytes || ibv.Format != last_ibv.Format) {
-        dl->D3DIASetIndexBuffer(&ibv);
-        last_ibv = ibv;
-      }
+      pl->IASetIndexBuffer(&it.ibv);
       if (!no_draw) {
-        dl->D3DDrawIndexedInstanced(it.count, 1, it.start, it.base_vertex, 0);
+        pl->DrawIndexedInstanced(it.count, 1, it.start, it.base_vertex, 0);
       }
     } else if (!no_draw) {
-      dl->D3DDrawInstanced(it.count, 1, it.start, 0);
+      pl->DrawInstanced(it.count, 1, it.start, 0);
     }
   }
 
-  // ONCE PER FRAME, AT THE END, ONE COPY PER DESTINATION.
-  //
-  // This is ProcExecutePendingStretchRectCommands (video.cpp:3565): the resolve
-  // itself records nothing but a link (ProcStretchRect, :3265), the alias serves
-  // every sample taken during the frame (ProcSetTexture -> SetSurface, :3807),
-  // and the real copies run in one batch out of a SET of pending surfaces - so
-  // each destination is written exactly once no matter how often the game
-  // resolved into it.
-  //
-  // Running a full-screen copy at every resolve event instead, in the middle of
-  // the replay, with a forced pass rebind after each, cost fourteen of them per
-  // frame and took gameplay to 14 FPS.
-  run_resolves_upto(0xFFFFFFFFu);
-  if (ResolveCopyEnabled()) {
-    static std::atomic<std::uint64_t> n{0};
-    const std::uint64_t i = n.fetch_add(1, std::memory_order_relaxed);
-    if (i < 3 || (i % 600) == 0) {
-      REXLOG_INFO("[native-scene] resolve copies this frame: {} of {} queued", resolves_run,
-                  resolves.size());
-    }
-  }
   g_scene_issued.store(scene_issued, std::memory_order_relaxed);
   g_scene_issued_shaded.store(scene_issued_shaded, std::memory_order_relaxed);
   if (SceneListEnabled() && scene_issued > 40) {
     ++scene_list_frames;
   }
   if (query_on) {
-    dl->D3DEndQuery(g_query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, slot);
-    dl->D3DResolveQueryData(g_query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, slot, 1,
+    pl->EndQuery(g_query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, slot);
+    pl->ResolveQueryData(g_query_heap.Get(), D3D12_QUERY_TYPE_OCCLUSION, slot, 1,
                          g_query_readback.Get(), sizeof(std::uint64_t) * slot);
   }
 
@@ -4935,7 +3492,7 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   D3D12_RESOURCE_BARRIER depth_to_srv = depth_to_write;
   depth_to_srv.Transition.StateBefore = D3D12_RESOURCE_STATE_DEPTH_WRITE;
   depth_to_srv.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-  dl->D3DResourceBarrier(1, &depth_to_srv);
+  pl->ResourceBarrier(1, &depth_to_srv);
 
   // THE FRAME IS THE BACK BUFFER. Not a vote, not a score, not the target with
   // the most draws - the one surface the game resolves to the front buffer.
@@ -4950,17 +3507,6 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   // Everything that used to stand here - the engine-driven scene target, the
   // back-buffer preference, the draw-count vote among full-size targets - was
   // three ways of guessing at a question the game already answers.
-  // THE BACK BUFFER, AND ONLY IF THE GAME DREW INTO IT THIS FRAME.
-  //
-  // Serving it unconditionally - on the grounds that UnleashedRecomp's back
-  // buffer IS the swapchain image and therefore never needs qualifying - put a
-  // WHITE SCREEN over the logos, which had been rendering correctly through the
-  // emulated path. The reasoning was wrong, not just the result: Unleashed has
-  // no such condition because it has no CHOICE to make, the guest's back buffer
-  // is the output by construction. We do have the choice every frame, and the
-  // reference that shares it is skate3, which yields explicitly and often
-  // (YieldForMenus, YieldForPhotoDisplay, YieldForCasEditor, the warmup gate).
-  // "The game drew into its back buffer this frame" is that yield for us.
   {
     const TargetScore* best = nullptr;
     for (const auto& t : target_scores) {
@@ -4979,74 +3525,165 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
     }
   }
 
-  // Guest-output replacement path: composite straight into the presenter's own
-  // image. Nothing is painted onto the presenter's list in this mode - a frame
-  // we decline shows the clean emulated output.
+  // Guest-output replacement path: draw the composite OPAQUELY into our own
+  // R10G10B10A2 texture on this same command list; the registered callback
+  // copies it over the presenter's guest output image (see
+  // GuestOutputRenderCallback). Nothing is painted onto the presenter's list
+  // in this mode - a yielded frame shows the clean emulated output.
   bool guestout_drawn = false;
-  // NO DRAW-COUNT THRESHOLD. The condition is structural: did the game compose
-  // into its back buffer this frame.
-  //
-  // What stood here was "at least 16 draws", a number of our own choosing, and
-  // on the loading screen the frames hover at 18-21 - so the ones that dipped
-  // under it were handed to the emulator and the picture jumped between the two
-  // renderers. skate3 declines for structural reasons it can name (menus, the
-  // photo viewer, the CAS editor, the warmup gate); it never counts draws and
-  // compares against a constant. Neither should we: "the game drew into its back
-  // buffer" is a fact about the frame, "sixteen" is a guess about it.
-  if (GuestOutMode() && last_target_res != nullptr) {
-    guestout_drawn = CompositeToGuestOutput(device, dl, out_res, width, height, last_target_res);
+  // A frame with almost no captured draws is one we cannot honestly serve
+  // (intro/attract movies, loading fades - content classes the native path
+  // does not draw yet). Yield those to the emulated output instead of
+  // replacing a playing video with our empty target: the skate3 fallback
+  // discipline, per frame.
+  constexpr std::size_t kGuestOutMinDraws = 16;
+  const bool frame_worth_serving = items.size() >= kGuestOutMinDraws;
+  if (!frame_worth_serving) {
+    g_guestout_has_frame.store(false, std::memory_order_release);
+  }
+  if (GuestOutMode() && frame_worth_serving &&
+      !g_guestout_failed.load(std::memory_order_relaxed) &&
+      g_comp_pso_guestout && last_target_res != nullptr) {
+    const std::uint32_t want_w = g_guestout_want_w.load(std::memory_order_relaxed);
+    const std::uint32_t want_h = g_guestout_want_h.load(std::memory_order_relaxed);
+    if (want_w != 0 && want_h != 0) {
+      if (!g_guestout_rtv_heap) {
+        D3D12_DESCRIPTOR_HEAP_DESC h{};
+        h.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        h.NumDescriptors = 1;
+        if (FAILED(device->CreateDescriptorHeap(&h, IID_PPV_ARGS(&g_guestout_rtv_heap)))) {
+          g_guestout_failed.store(true, std::memory_order_relaxed);
+        }
+      }
+      if (!g_guestout_failed.load(std::memory_order_relaxed) &&
+          (g_guestout_w != want_w || g_guestout_h != want_h || !g_guestout_tex)) {
+        if (g_guestout_tex) {
+          // The callback thread may still copy from the old one this frame.
+          g_guestout_graveyard.push_back(g_guestout_tex);
+          g_guestout_has_frame.store(false, std::memory_order_release);
+          g_guestout_src.store(nullptr, std::memory_order_relaxed);
+        }
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = want_w;
+        td.Height = want_h;
+        td.DepthOrArraySize = 1;
+        td.MipLevels = 1;
+        td.Format = DXGI_FORMAT_R10G10B10A2_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_HEAP_PROPERTIES hp{};
+        hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+        g_guestout_tex.Reset();
+        if (FAILED(device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td,
+                                                   D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
+                                                   IID_PPV_ARGS(&g_guestout_tex)))) {
+          REXLOG_ERROR("[native-scene] guest-output texture creation failed ({}x{})", want_w,
+                       want_h);
+          g_guestout_failed.store(true, std::memory_order_relaxed);
+        } else {
+          g_guestout_tex->SetName(L"dpour.guestout");
+          g_guestout_w = want_w;
+          g_guestout_h = want_h;
+          device->CreateRenderTargetView(g_guestout_tex.Get(), nullptr,
+                                         g_guestout_rtv_heap->GetCPUDescriptorHandleForHeapStart());
+          REXLOG_INFO("[native-scene] guest-output texture ready: {}x{}", want_w, want_h);
+        }
+      }
+      if (g_guestout_tex && !g_guestout_failed.load(std::memory_order_relaxed)) {
+        // Per-frame descriptor pair (see the heap comment): in-flight frames
+        // keep their own [colour, depth] slots untouched.
+        const UINT srv_inc =
+            device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        const UINT comp_slot = static_cast<UINT>(g_pass_index % kPassFrames) * 2u;
+        D3D12_CPU_DESCRIPTOR_HANDLE comp_cpu = g_srv_heap->GetCPUDescriptorHandleForHeapStart();
+        comp_cpu.ptr += static_cast<SIZE_T>(comp_slot) * srv_inc;
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = kColorFormat;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture2D.MipLevels = 1;
+        device->CreateShaderResourceView(last_target_res, &sv, comp_cpu);
+        comp_cpu.ptr += srv_inc;
+        sv.Format = kDepthSrvFormat;
+        device->CreateShaderResourceView(g_depth.Get(), &sv, comp_cpu);
+        D3D12_GPU_DESCRIPTOR_HANDLE comp_gpu = g_srv_heap->GetGPUDescriptorHandleForHeapStart();
+        comp_gpu.ptr += static_cast<UINT64>(comp_slot) * srv_inc;
+        D3D12_RESOURCE_BARRIER to_rt{};
+        to_rt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        to_rt.Transition.pResource = g_guestout_tex.Get();
+        to_rt.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        to_rt.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        to_rt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        pl->ResourceBarrier(1, &to_rt);
+        const D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+            g_guestout_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        pl->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+        ID3D12DescriptorHeap* heaps[] = {g_srv_heap.Get()};
+        pl->SetDescriptorHeaps(1, heaps);
+        pl->SetGraphicsRootSignature(g_comp_root.Get());
+        pl->SetGraphicsRootDescriptorTable(0, comp_gpu);
+        struct {
+          float depth_clear;
+          std::uint32_t opaque;
+          std::uint32_t depth_view;
+          float amplify;
+        } comp{g_depth_clear, 1u /* the replacement frame is always opaque */,
+               dpour_pipeline::FlatShadingEnabled() ? 1u : 0u, AmplifyFactor()};
+        pl->SetGraphicsRoot32BitConstants(1, 4, &comp, 0);
+        pl->SetPipelineState(g_comp_pso_guestout.Get());
+        const D3D12_VIEWPORT gvp{0.0f, 0.0f, static_cast<float>(g_guestout_w),
+                                 static_cast<float>(g_guestout_h), 0.0f, 1.0f};
+        const D3D12_RECT gsc{0, 0, static_cast<LONG>(g_guestout_w),
+                             static_cast<LONG>(g_guestout_h)};
+        pl->RSSetViewports(1, &gvp);
+        pl->RSSetScissorRects(1, &gsc);
+        pl->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        pl->IASetVertexBuffers(0, 0, nullptr);
+        pl->IASetIndexBuffer(nullptr);
+        // DPOUR_NR_DRAW_GOTEST: paint the replacement frame a flat colour and
+        // skip the composite entirely. It separates "the guest-output
+        // replacement reaches the screen" from "the composite produces black" -
+        // two failures that look identical and had already cost several runs of
+        // guessing between them.
+        static const bool go_test = EnvFlag("DPOUR_NR_DRAW_GOTEST");
+        if (go_test) {
+          const float flat[4] = {0.35f, 0.0f, 0.5f, 1.0f};
+          pl->ClearRenderTargetView(rtv, flat, 0, nullptr);
+        } else {
+          pl->DrawInstanced(3, 1, 0, 0);
+        }
+        D3D12_RESOURCE_BARRIER to_copy_src = to_rt;
+        to_copy_src.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        to_copy_src.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+        pl->ResourceBarrier(1, &to_copy_src);
+        guestout_drawn = true;
+      }
+    }
   }
 
-  // TWO CONSUMERS, TWO UNITS. Collapsing them into one broke both, one at a
-  // time, and each failure was visible on screen:
-  //
-  // 1. THE CONSTANT RING AND THE OCCLUSION READBACK ask "has the GPU finished
-  //    the submission that wrote this slot", and the honest answer is the
-  //    command processor's own pair (native_rhi.h:545). Answering it with a
-  //    private counter minus kPassFrames is not just imprecise, it is
-  //    STRUCTURALLY DEAD: there are kPassFrames slots and they always hold the
-  //    kPassFrames most recent values, so `fence <= counter - kPassFrames` is
-  //    never true for any of them. g_gpu_completed stayed 0 forever,
-  //    pipeline::BeginFrame never rotated a slice (it only rotates once
-  //    `completed` passes the frame that wrote it), the current slice filled to
-  //    its full 24 MB and every draw after that got no constants at all. Then it
-  //    latches: no constants -> no draws -> nothing published -> this tail never
-  //    runs -> completed never moves. One frame of it and the native path is
-  //    gone for the session, which is exactly what "все через емулятор пішло"
-  //    looked like.
-  //
-  // 2. UPLOAD RETIREMENT counts in REPLAYS. RetireUploads holds a buffer retired
-  //    during capture for `submitted + 8`, and that 8 was measured in replays -
-  //    roughly guest frames, the unit the staging -> published -> replay window
-  //    is counted in. Fed the command processor's counter, which ticks many
-  //    times per guest frame, the same 8 became a fraction of a frame: vertex
-  //    data freed while it was still being read, which is why the loading
-  //    screen's text came back with its first glyphs as garbage.
-  g_alloc_fence[slot] = submission;
+  if (FAILED(pl->Close())) {
+    return;
+  }
+  ID3D12CommandList* lists[] = {pl};
+  queue->ExecuteCommandLists(1, lists);
+  ++g_fence_value;
+  queue->Signal(g_fence.Get(), g_fence_value);
+  g_alloc_fence[slot] = g_fence_value;
   g_alloc_frame[slot] = items_frame;
   ++g_pass_index;
+  const std::uint64_t completed = g_fence->GetCompletedValue();
   // Highest guest frame whose submission the GPU has finished. Anything older
   // than this is safe for the constant ring to reuse.
-  UpdateGpuCompleted(completed);
-  // RETIREMENT COUNTS IN GUEST FRAMES. Not replays, not submissions.
-  //
-  // The slack inside RetireUploads is described in its own words as covering
-  // "the staging -> published -> replay window", and "during a loading stall the
-  // published snapshot referencing it is replayed for many frames without a new
-  // publish". Both of those are measured in GUEST FRAMES, so that is the unit to
-  // hand it - and it is the only one of the three that does not move when we
-  // change how often we replay or how often the command processor submits.
-  //
-  // Every other unit tried here failed on screen. Command-processor submissions
-  // tick many times per guest frame, so +8 became a fraction of a frame and the
-  // loading screen's glyphs came back as garbage. A private replay counter was
-  // stable only while the replay ran once per published frame; the moment the
-  // replay correctly began running on every callback, it took the same fall.
-  //
-  // g_gpu_completed is already exactly "the newest guest frame whose submission
-  // the GPU has finished", derived from the command processor's real counters.
-  dpour_vbuf::RetireUploads(g_gpu_completed.load(std::memory_order_relaxed), items_frame);
-  dpour_tex::RetireUploads(g_gpu_completed.load(std::memory_order_relaxed), items_frame);
+  std::uint64_t done_frame = 0;
+  for (std::uint32_t i = 0; i < kPassFrames; ++i) {
+    if (g_alloc_fence[i] != 0 && g_alloc_fence[i] <= completed && g_alloc_frame[i] > done_frame) {
+      done_frame = g_alloc_frame[i];
+    }
+  }
+  g_gpu_completed.store(done_frame, std::memory_order_relaxed);
+  dpour_vbuf::RetireUploads(completed, g_fence_value);
+  dpour_tex::RetireUploads(completed, g_fence_value);
 
   // Read back an occlusion result the GPU has certainly finished with. Any slot
   // whose fence completed is safe; the newest such slot is the freshest answer.
@@ -5069,19 +3706,16 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
     }
   }
 
-  if (GuestOutMode()) {
-    // Replacement mode: nothing is painted onto the presenter's list. The
-    // composite already went into the presenter's own image, so "did we draw"
-    // is the whole answer the callback needs.
-    return guestout_drawn;
+  if (guestout_drawn) {
+    // Publish for the guest-output callback: the copy it records executes on
+    // this same queue after the submission above, so the content is complete.
+    g_guestout_src.store(g_guestout_tex.Get(), std::memory_order_relaxed);
+    g_guestout_has_frame.store(true, std::memory_order_release);
   }
-
-  // Below is the OVERLAY path: it paints onto the presenter's own list, which
-  // only exists when the presenter called us. Recorded from the guest-output
-  // callback there is no such list (and none is wanted - the frame was already
-  // composited above), so this is where that call returns.
-  if (cmd == nullptr) {
-    return guestout_drawn;
+  if (GuestOutMode()) {
+    // Replacement mode: nothing is painted onto the presenter's list; the
+    // callback either serves our frame or yields to the emulated one.
+    return;
   }
 
   // The composite shows the target that received the most draws this frame.
@@ -5127,7 +3761,6 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   cmd->IASetVertexBuffers(0, 0, nullptr);
   cmd->IASetIndexBuffer(nullptr);
   cmd->DrawInstanced(3, 1, 0, 0);
-  return guestout_drawn;
 }
 
 void LogStats() {
@@ -5154,11 +3787,12 @@ void LogStats() {
                          g_passes[i].is_backbuffer ? "bb:" : "", g_passes[i].color,
                          g_passes[i].draws, g_passes[i].view_w, g_passes[i].view_h);
     }
-    // Whether the frame carried an MSAA block at all. It routes nothing now, so
-    // it is pure information: it says which part of the game we are in.
+    // The reserved scene slot, separately: this line is the proof (or refutal)
+    // of the DefaultColor marker actually firing in a given part of the game.
     if (n > 0 && n < 340) {
-      n += std::snprintf(line + n, sizeof(line) - n, " | msaa-block:%s",
-                         g_scene_marked ? "yes" : "no");
+      n += std::snprintf(line + n, sizeof(line) - n, " | scene[15]:%s %u draws@%ux%u",
+                         g_scene_marked ? "MARKED" : "idle", g_passes[kScenePassSlot].draws,
+                         g_passes[kScenePassSlot].view_w, g_passes[kScenePassSlot].view_h);
     }
     REXLOG_INFO("[native-scene] {}", line);
   }

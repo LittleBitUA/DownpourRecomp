@@ -363,6 +363,22 @@ struct PendingResolve {
   std::uint32_t draw_index = 0;  // how many draws had been staged when it fired
 };
 
+// The game's own Clear, captured as a stream item - RenderCommandType::Clear in
+// the reference (video.cpp:824), executed by ProcClear at its position with the
+// game's own colour into the currently bound target. Dropping the guest clear
+// under own-device and substituting one black clear per replay threw both
+// away: the colour (a screen whose content IS a coloured clear plus quads came
+// out ours-black) and the position (a surface the game clears mid-frame and
+// reuses accumulated both uses).
+struct PendingClear {
+  std::uint32_t pass = 0;        // pass slot bound when the clear fired
+  float rgba[4] = {};
+  float depth = 1.0f;            // engine-side value; the GInvertZ flip is applied at replay
+  bool clear_color = false;
+  bool clear_depth = false;
+  std::uint32_t draw_index = 0;  // position in the item stream
+};
+
 std::mutex g_mutex;
 std::vector<SceneDraw> g_staging;
 std::vector<SceneDraw> g_published;
@@ -380,6 +396,8 @@ std::uint32_t g_stage_arena_index = 0;      // capture writes here
 std::uint32_t g_published_arena_index = 0;  // the replay reads here
 std::vector<PendingResolve> g_resolve_staging;
 std::vector<PendingResolve> g_resolve_published;
+std::vector<PendingClear> g_clear_staging;
+std::vector<PendingClear> g_clear_published;
 std::atomic<ID3D12Device*> g_device{nullptr};
 
 // Render-target passes. A frame draws into several surfaces; only the one that
@@ -1898,6 +1916,35 @@ bool SkipGuestDraws() {
 // that have to drop the guest's packet writers.
 bool OwnDevice() { return OwnDeviceMode(); }
 
+// RHIClear, captured as a stream item the way the reference captures it
+// (RenderCommandType::Clear). color_guest points at the FLinearColor (four
+// big-endian floats); depth arrives engine-side, un-flipped - the GInvertZ
+// flip lives inside the game's RHIClear and is mirrored at replay.
+void OnClear(const std::uint8_t* base, bool clear_color, std::uint32_t color_guest,
+             bool clear_depth, float depth) {
+  if (!Enabled() || base == nullptr) {
+    return;
+  }
+  PendingClear pc{};
+  pc.clear_color = clear_color;
+  pc.clear_depth = clear_depth;
+  pc.depth = depth;
+  if (clear_color && GuestAddrPlausible(color_guest) && ObjectReadable(base, color_guest, 16)) {
+    for (int i = 0; i < 4; ++i) {
+      const std::uint32_t bits = LoadBE32(base + color_guest + 4u * static_cast<std::uint32_t>(i));
+      float f;
+      std::memcpy(&f, &bits, 4);
+      pc.rgba[i] = f;
+    }
+  }
+  std::lock_guard<std::mutex> lock(g_mutex);
+  pc.pass = g_pass_current;
+  pc.draw_index = static_cast<std::uint32_t>(g_staging.size());
+  if (g_clear_staging.size() < 128) {
+    g_clear_staging.push_back(pc);
+  }
+}
+
 bool UpAtApiLevel() {
   static const bool on = EnvOn("DPOUR_NR_UP_API") || OwnDeviceMode();
   return on;
@@ -2515,6 +2562,7 @@ void BeginFrame() {
   std::lock_guard<std::mutex> lock(g_mutex);
   g_staging.clear();
   g_resolve_staging.clear();
+  g_clear_staging.clear();
   // The render target does not change just because a frame ended, so the pass
   // that was current carries over as slot 0 with a fresh count. Resetting the
   // count without carrying the identity left draws made before the frame's first
@@ -2579,6 +2627,7 @@ void EndFrame() {
   g_vs_cb_cached = kNoStage;  // nothing staged in the fresh arena yet
   g_ps_cb_cached = kNoStage;
   g_resolve_published = g_resolve_staging;
+  g_clear_published = g_clear_staging;
   std::memcpy(g_published_passes, g_passes, sizeof(g_published_passes));
   g_published_pass = best;
   g_published_frame = g_frame.load(std::memory_order_relaxed);
@@ -4111,10 +4160,12 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   const CpuArena* arena = nullptr;
   PassSlot passes_snap[kMaxPasses];
   std::uint64_t items_frame = 0;
+  static thread_local std::vector<PendingClear> clears;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     items = g_published;
     resolves = g_resolve_published;
+    clears = g_clear_published;
     arena = &g_arenas[g_published_arena_index];
     std::memcpy(passes_snap, g_published_passes, sizeof(passes_snap));
     items_frame = g_published_frame;
@@ -4333,6 +4384,12 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
       device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
   NativeTarget* current_reg = nullptr;
   std::uint32_t current_pass = 0xFFFFFFFFu;
+  // The handles of whatever is bound right now, so a captured Clear can hit the
+  // same image ProcClear hits: the currently bound one.
+  D3D12_CPU_DESCRIPTOR_HANDLE cur_rtvh{};
+  D3D12_CPU_DESCRIPTOR_HANDLE cur_dsvh{};
+  bool cur_has_rtv = false;
+  bool cur_has_dsv = false;
   ID3D12Resource* last_target_res = nullptr;  // what the composite should show
   // THE BACK BUFFER IS THE PRESENTED TEXTURE - the reference arrangement.
   // UnleashedRecomp assigns g_backBuffer->texture = g_swapChain->getTexture(...)
@@ -4405,6 +4462,9 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
     const D3D12_RECT sc{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
     dl->RSSetViewport(vp);
     dl->RSSetScissorRect(sc);
+    cur_rtvh = rtvh;
+    cur_has_rtv = true;
+    cur_has_dsv = false;
     return true;
   };
   const auto close_current = [&]() {
@@ -4535,6 +4595,10 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
     const D3D12_RECT sc{0, 0, static_cast<LONG>(t->w), static_cast<LONG>(t->h)};
     dl->RSSetViewport(vp);
     dl->RSSetScissorRect(sc);
+    cur_rtvh = rtvh;
+    cur_dsvh = dsvh;
+    cur_has_rtv = true;
+    cur_has_dsv = true;
     current_reg = t;
     // This surface now holds content we drew, as of this guest frame. What reads
     // it later (the alias path in RtBackedSrvSlot) uses that to tell "our target"
@@ -4798,6 +4862,33 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
     }
   };
   bool pass_ok = false;
+  // The captured Clears, run at their recorded positions - ProcClear's job in
+  // the reference. A clear for a pass other than the bound one binds that pass
+  // first; the next item's own pass check rebinds whatever it needs.
+  std::size_t clear_next = 0;
+  const auto run_clears_upto = [&](std::uint32_t draw_index) {
+    while (clear_next < clears.size() && clears[clear_next].draw_index <= draw_index) {
+      const PendingClear pc = clears[clear_next++];
+      if (pc.pass != current_pass) {
+        current_pass = pc.pass;
+        pass_ok = bind_pass(current_pass);
+      }
+      if (!pass_ok) {
+        continue;
+      }
+      if (pc.clear_color && cur_has_rtv) {
+        dl->D3DClearRenderTargetView(cur_rtvh, pc.rgba, 0, nullptr);
+      }
+      if (pc.clear_depth && cur_has_dsv) {
+        // The game's own RHIClear applies the GInvertZ flip inside; the captured
+        // value is engine-side, so the flip is mirrored here where our depth
+        // convention is decided.
+        const float d = g_invert_z.load(std::memory_order_relaxed) == 1 ? 1.0f - pc.depth
+                                                                        : pc.depth;
+        dl->D3DClearDepthStencilView(cur_dsvh, D3D12_CLEAR_FLAG_DEPTH, d, 0, 0, nullptr);
+      }
+    }
+  };
   std::uint32_t issued = 0;
   std::uint32_t scene_issued = 0;
   std::uint32_t scene_issued_shaded = 0;
@@ -4827,6 +4918,8 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
     if (issued >= max_draws) {
       break;
     }
+    // The game's own Clears, at their recorded positions (ProcClear's job).
+    run_clears_upto(static_cast<std::uint32_t>(item_index));
     if (it.pass != current_pass) {
       // THE COPY GOES HERE, WHERE THE REFERENCE PUTS IT.
       //
@@ -4973,6 +5066,7 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   // Running a full-screen copy at every resolve event instead, in the middle of
   // the replay, with a forced pass rebind after each, cost fourteen of them per
   // frame and took gameplay to 14 FPS.
+  run_clears_upto(0xFFFFFFFFu);
   run_resolves_upto(0xFFFFFFFFu);
   if (ResolveCopyEnabled()) {
     static std::atomic<std::uint64_t> n{0};

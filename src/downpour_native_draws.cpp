@@ -914,11 +914,21 @@ DPOUR_RHI_LOGHOOK(sub_829CE888, "RHICopyFromResolveTarget", 500)
 // here - the API entry is the one that matches the references.
 REX_EXTERN(__imp__sub_829CAF60);
 REX_HOOK_RAW(sub_829CAF60) {
+  // Captured as a stream item in BOTH modes - the reference treats Clear as a
+  // command (RenderCommandType::Clear), not as something to skip. Register
+  // layout verified against the recomp: r3=bClearColor (-> mask 15),
+  // r4=&FLinearColor, r5=bClearDepth (-> |16), r7=bClearStencil (-> |32),
+  // Depth in f1 (the GPR slot is reserved, so r6 is skipped), and the GInvertZ
+  // flip happens INSIDE this function - so f1 here is the engine-side value.
+  if (NativeActive() && dpour_scene::Enabled()) {
+    dpour_scene::OnClear(base, ctx.r3.u32 != 0, ctx.r4.u32, ctx.r5.u32 != 0,
+                         static_cast<float>(ctx.f1.f64));
+  }
   if (NativeActive() && dpour_scene::Enabled() && dpour_scene::OwnDevice()) {
     static std::atomic<std::uint64_t> dropped{0};
     const std::uint64_t n = dropped.fetch_add(1, std::memory_order_relaxed) + 1;
     if (n == 1 || n == 1000) {
-      REXLOG_INFO("[native-draw] own-device: RHIClear dropped x{}", n);
+      REXLOG_INFO("[native-draw] own-device: RHIClear captured, guest submission dropped x{}", n);
     }
     return;
   }

@@ -237,6 +237,13 @@ struct UPDraw {
 };
 void CaptureUPBegin(const std::uint8_t* base, const UPDraw& u);
 
+// RHIClear as a stream item - the reference's RenderCommandType::Clear. The
+// game's own colour, at the clear's own position, into the pass bound at the
+// time. `depth` is the engine-side value; the GInvertZ flip is mirrored at
+// replay, where our depth convention is decided.
+void OnClear(const std::uint8_t* base, bool clear_color, std::uint32_t color_guest,
+             bool clear_depth, float depth);
+
 // Close the pending UP capture NOW, copying its bytes while they are still
 // valid. The device-level capture cannot do this - it opens at BeginVertices,
 // before the game has written anything - so it defers to the next captured

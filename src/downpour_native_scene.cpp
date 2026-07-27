@@ -4473,6 +4473,25 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   NativeTarget* current_reg = nullptr;
   std::uint32_t current_pass = 0xFFFFFFFFu;
   ID3D12Resource* last_target_res = nullptr;  // what the composite should show
+  // THE BACK BUFFER IS THE PRESENTED TEXTURE - the reference arrangement.
+  // UnleashedRecomp assigns g_backBuffer->texture = g_swapChain->getTexture(...)
+  // (video.cpp:1597), so the game's own final composition draws straight into
+  // what will be shown and Present does nothing but present (:2791). Rendering
+  // the back-buffer pass into a private target and compositing it afterwards is
+  // our own invention, and it is exactly where the image was being lost: the
+  // composite's source held the game's two UberPostProcess quads, which SAMPLE
+  // textures rather than carry pixels, so a missing link showed as white.
+  bool guestout_is_bound = false;
+  const auto transition_guest_output = [&](D3D12_RESOURCE_STATES from,
+                                           D3D12_RESOURCE_STATES to) {
+    D3D12_RESOURCE_BARRIER b{};
+    b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    b.Transition.pResource = out_res;
+    b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    b.Transition.StateBefore = from;
+    b.Transition.StateAfter = to;
+    dl->D3DResourceBarrier(1, &b);
+  };
   const auto close_current = [&]() {
     if (current_reg != nullptr) {
       transition_target(*current_reg, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -4543,6 +4562,51 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
     if (is_bb) {
       if (!BackbufferPassEnabled()) {
         return false;
+      }
+      // Bind the presenter's own image and draw the game's composition into it,
+      // the way the references do. Only under own-device: with the emulated
+      // pipeline still running, its frame and ours would fight over the same
+      // texture.
+      if (OwnDeviceMode() && out_res != nullptr && !g_guestout_failed.load(std::memory_order_relaxed)) {
+        if (!g_guestout_rtv_heap) {
+          D3D12_DESCRIPTOR_HEAP_DESC h{};
+          h.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+          h.NumDescriptors = kPassFrames;
+          if (FAILED(device->CreateDescriptorHeap(&h, IID_PPV_ARGS(&g_guestout_rtv_heap)))) {
+            REXLOG_ERROR("[native-scene] guest-output RTV heap creation failed");
+            g_guestout_failed.store(true, std::memory_order_relaxed);
+            return false;
+          }
+        }
+        static std::uint32_t bb_ring = 0;
+        const std::uint32_t ring = bb_ring++ % kPassFrames;
+        D3D12_CPU_DESCRIPTOR_HANDLE rtvh =
+            g_guestout_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+        rtvh.ptr += static_cast<SIZE_T>(ring) * rtv_stride;
+        D3D12_RENDER_TARGET_VIEW_DESC rv{};
+        rv.Format = rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+        rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+        device->CreateRenderTargetView(out_res, &rv, rtvh);
+        if (!guestout_is_bound) {
+          transition_guest_output(rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+                                  D3D12_RESOURCE_STATE_RENDER_TARGET);
+          guestout_is_bound = true;
+          // The guest's own Clear is dropped in this mode, so the image starts
+          // from ours - once per replay, not once per bind.
+          dl->D3DClearRenderTargetView(rtvh, clear_color, 0, nullptr);
+        }
+        // No depth: the game's final composition is full-screen quads, and the
+        // console's back buffer is bound with a null depth surface too
+        // (XeD3DViewport.cpp:85, RHISetRenderTarget(GD3DBackBuffer, NULL)).
+        dl->D3DOMSetRenderTargets(1, &rtvh, FALSE, nullptr);
+        const D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(width),
+                                static_cast<float>(height), 0.0f, 1.0f};
+        const D3D12_RECT sc{0, 0, static_cast<LONG>(width), static_cast<LONG>(height)};
+        dl->RSSetViewport(vp);
+        dl->RSSetScissorRect(sc);
+        current_reg = nullptr;
+        score_target(out_res, width, kBackbufferKey);
+        return true;
       }
       target_key = kBackbufferKey;
       // The guest back buffer is a fixed 1280x720 - the PASS viewport is not
@@ -5092,7 +5156,19 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   // photo viewer, the CAS editor, the warmup gate); it never counts draws and
   // compares against a constant. Neither should we: "the game drew into its back
   // buffer" is a fact about the frame, "sixteen" is a guess about it.
-  if (GuestOutMode() && last_target_res != nullptr) {
+  if (guestout_is_bound) {
+    // The game's composition went straight into the presenter's image, so there
+    // is nothing left to composite - only the state to hand back. This is the
+    // branch the references have (and the one below is the branch they do not).
+    transition_guest_output(D3D12_RESOURCE_STATE_RENDER_TARGET,
+                            rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+    guestout_is_bound = false;
+    guestout_drawn = true;
+    static std::atomic<bool> told{false};
+    if (!told.exchange(true, std::memory_order_relaxed)) {
+      REXLOG_INFO("[native-scene] back buffer IS the presented texture - composite retired");
+    }
+  } else if (GuestOutMode() && last_target_res != nullptr) {
     guestout_drawn = CompositeToGuestOutput(device, dl, out_res, width, height, last_target_res);
   }
 

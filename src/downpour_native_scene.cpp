@@ -664,7 +664,12 @@ bool ColorWriteMaskOn() {
 //
 // DEFAULT OFF - it is a visible change.
 bool EdramAliasOn() {
-  static const bool on = EnvOn("DPOUR_NR_EDRAM_ALIAS");
+  // Implied by own-device: the alias is a property of the GAME - its engineers
+  // drew the tile map (XeD3DRenderTarget.cpp:761-769) and set
+  // SceneColorFixedPoint = Raw.Texture outright (SceneRenderTargets.cpp:1051).
+  // A run without it measures "resolve WITHOUT SOURCE x200: DefaultColorRaw"
+  // straight back into the log, which is the menu-white mechanism again.
+  static const bool on = EnvOn("DPOUR_NR_EDRAM_ALIAS") || OwnDeviceMode();
   return on;
 }
 

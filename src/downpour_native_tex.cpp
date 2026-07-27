@@ -1362,6 +1362,16 @@ void InvalidateGuestAddress(std::uint32_t addr) {
   std::lock_guard<std::mutex> lock(g_mutex);
   for (auto it = g_cache.begin(); it != g_cache.end();) {
     if (it->second.guest_base == page && it->second.guest_base != 0) {
+      // The D3D12 texture must NOT die here: a replay in flight may still
+      // sample its descriptor. Erasing the entry released the ComPtr on the
+      // spot, and the first content transition after that TDR'd the device -
+      // the exact use-after-free the reference avoids by parking retired
+      // resources until the GPU is done (g_tempResources). Park it in
+      // g_retiring with fence 0; RetireUploads stamps it submitted+8, the same
+      // slack every other retirement here gets.
+      if (it->second.texture) {
+        g_retiring.push_back(RetiringUpload{std::move(it->second.texture), 0});
+      }
       // The SRV heap slot is NOT reclaimed - the allocator is monotonic. That
       // leaks one slot per invalidated texture, which is the price of never
       // serving pixels from memory the guest has already handed to something

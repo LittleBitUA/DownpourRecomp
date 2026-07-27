@@ -345,11 +345,16 @@ bool AcquireBuffer(ID3D12Device* device, const std::uint8_t* base, std::uint32_t
         g_retiring.push_back(std::move(r));
         b.slot[i].Reset();
         b.gpu[i] = 0;
+        g_bytes -= b.size;  // give the replaced slot's bytes back to the ledger
       }
     }
     if (g_bytes + static_cast<std::uint64_t>(size) * slots > kMaxResidentBytes) {
+      // A full ledger is a TRANSIENT condition - invalidations free room every
+      // frame - so it must not set the permanent failure latch. Doing so was
+      // measured killing 1201 draws in 25 seconds with `readable_now=true` on
+      // every corpse: buffers latched dead forever for having arrived while
+      // the (then never-decremented) ledger sat at its cap.
       g_rejected.fetch_add(1, std::memory_order_relaxed);
-      b.failures = kMaxFailures;
       NoteAcqFail(data_guest, need_bytes, is_index, kAcqFailCap, b.failures);
       return false;
     }
@@ -479,6 +484,12 @@ void InvalidateGuestAddress(std::uint32_t addr) {
         r.resource = std::move(slot);
         r.fence = 0;
         g_retiring.push_back(std::move(r));
+        // The ledger must shrink when the buffer leaves it, or it only ever
+        // grows: measured 28.07, the "resident" count reached 767 of 768 MB
+        // while 4278 buffers had been freed by the guest, and every new mesh
+        // was refused at the cap. Each slot was added as `size` bytes when it
+        // was created, so each parked slot gives exactly that back.
+        g_bytes -= it->second.size;
       }
     }
     g_buffers.erase(it);

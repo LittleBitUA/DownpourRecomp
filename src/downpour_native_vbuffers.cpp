@@ -89,6 +89,60 @@ std::atomic<std::uint64_t> g_deferred{0};
 std::atomic<std::uint64_t> g_invalidated{0};
 double g_frame_budget_ms = 0.0;
 
+// Why AcquireBuffer said no - one counter per exit, plus a census of the top
+// offenders. The same method that cracked "vb object": the aggregate counter
+// said 10520 per interval and named nothing.
+enum : std::uint8_t {
+  kAcqFailArgs = 1,     // need_bytes 0 / over kMaxSingleBuffer / bad pointer
+  kAcqFailLatched = 2,  // b.failures reached kMaxFailures earlier - permanent
+  kAcqFailBudget = 3,   // frame's upload budget spent and no live copy to serve
+  kAcqFailSpan = 4,     // guest pages not committed at upload time
+  kAcqFailCap = 5,      // kMaxResidentBytes exceeded (also latches)
+  kAcqFailAlloc = 6,    // CreateBuffer failed
+  kAcqFailStage = 7,    // StageCopy failed
+};
+std::atomic<std::uint64_t> g_fail_reason[8] = {};
+
+struct AcqFailEntry {
+  std::uint32_t addr = 0;
+  std::uint32_t need = 0;
+  std::uint8_t reason = 0;
+  std::uint8_t failures = 0;
+  bool is_index = false;
+  std::uint64_t count = 0;
+};
+AcqFailEntry g_acqfail[12];  // guarded by g_mutex, like g_buffers
+// For re-probing census entries at print time: the guest base is one constant
+// mapping per process, remembered here so LogStats can ask "is this latched
+// buffer's memory readable NOW?" - which is the direct test of whether the
+// failure latch outlived the condition that set it.
+const std::uint8_t* g_last_base = nullptr;
+
+// Callers other than the args gate hold g_mutex already.
+void NoteAcqFail(std::uint32_t addr, std::uint32_t need, bool is_index, std::uint8_t reason,
+                 std::uint32_t failures) {
+  g_fail_reason[reason < 8 ? reason : 0].fetch_add(1, std::memory_order_relaxed);
+  AcqFailEntry* slot = nullptr;
+  for (auto& e : g_acqfail) {
+    if (e.count != 0 && e.addr == addr && e.is_index == is_index) {
+      slot = &e;
+      break;
+    }
+    if (slot == nullptr && e.count == 0) {
+      slot = &e;
+    }
+  }
+  if (slot == nullptr) {
+    return;
+  }
+  slot->addr = addr;
+  slot->need = need;
+  slot->reason = reason;
+  slot->failures = static_cast<std::uint8_t>(failures < 255 ? failures : 255);
+  slot->is_index = is_index;
+  ++slot->count;
+}
+
 // Guest pointers come out of D3D resource fields, so nothing may be read without
 // confirming the pages are committed.
 bool SpanReadable(const std::uint8_t* p, std::size_t n) {
@@ -225,14 +279,17 @@ bool AcquireBuffer(ID3D12Device* device, const std::uint8_t* base, std::uint32_t
   out = View{};
   if (device == nullptr || base == nullptr || data_guest < 0x1000u || need_bytes == 0 ||
       need_bytes > kMaxSingleBuffer) {
+    g_fail_reason[kAcqFailArgs].fetch_add(1, std::memory_order_relaxed);
     return false;
   }
   const bool dynamic = (usage_flags & kRufAnyDynamic) != 0;
   const std::uint64_t key = MakeKey(data_guest, is_index);
 
   std::lock_guard<std::mutex> lock(g_mutex);
+  g_last_base = base;
   Buffer& b = g_buffers[key];
   if (b.failures >= kMaxFailures) {
+    NoteAcqFail(data_guest, need_bytes, is_index, kAcqFailLatched, b.failures);
     return false;
   }
 
@@ -251,6 +308,7 @@ bool AcquireBuffer(ID3D12Device* device, const std::uint8_t* base, std::uint32_t
       out.size_bytes = b.size;
       return true;
     }
+    NoteAcqFail(data_guest, need_bytes, is_index, kAcqFailBudget, b.failures);
     return false;
   }
 
@@ -270,6 +328,7 @@ bool AcquireBuffer(ID3D12Device* device, const std::uint8_t* base, std::uint32_t
   if (!whole_readable && (!needs_grow || !SpanReadable(base + data_guest, need_bytes))) {
     ++b.failures;
     g_rejected.fetch_add(1, std::memory_order_relaxed);
+    NoteAcqFail(data_guest, need_bytes, is_index, kAcqFailSpan, b.failures);
     return false;
   }
   const std::uint32_t size = whole_readable ? want : need_bytes;
@@ -291,6 +350,7 @@ bool AcquireBuffer(ID3D12Device* device, const std::uint8_t* base, std::uint32_t
     if (g_bytes + static_cast<std::uint64_t>(size) * slots > kMaxResidentBytes) {
       g_rejected.fetch_add(1, std::memory_order_relaxed);
       b.failures = kMaxFailures;
+      NoteAcqFail(data_guest, need_bytes, is_index, kAcqFailCap, b.failures);
       return false;
     }
     for (std::uint32_t i = 0; i < slots; ++i) {
@@ -298,6 +358,7 @@ bool AcquireBuffer(ID3D12Device* device, const std::uint8_t* base, std::uint32_t
                                D3D12_RESOURCE_STATE_COPY_DEST);
       if (!b.slot[i]) {
         g_rejected.fetch_add(1, std::memory_order_relaxed);
+        NoteAcqFail(data_guest, need_bytes, is_index, kAcqFailAlloc, 0);
         g_buffers.erase(key);
         return false;
       }
@@ -316,6 +377,7 @@ bool AcquireBuffer(ID3D12Device* device, const std::uint8_t* base, std::uint32_t
   if (!StageCopy(device, base + data_guest, b.slot[b.current].Get(), b.size, is_index,
                  needs_grow)) {
     g_rejected.fetch_add(1, std::memory_order_relaxed);
+    NoteAcqFail(data_guest, need_bytes, is_index, kAcqFailStage, b.failures);
     return false;
   }
   b.frame_uploaded = g_frame;
@@ -456,6 +518,36 @@ void LogStats() {
               g_rejected.load(std::memory_order_relaxed),
               g_deferred.load(std::memory_order_relaxed),
               g_invalidated.load(std::memory_order_relaxed));
+  std::uint64_t total = 0;
+  for (const auto& c : g_fail_reason) {
+    total += c.load(std::memory_order_relaxed);
+  }
+  if (total != 0) {
+    REXLOG_INFO("[native-vbuf] acquire failures: {} args, {} latched, {} budget w/o copy, "
+                "{} pages unreadable, {} resident cap, {} alloc, {} stage",
+                g_fail_reason[kAcqFailArgs].load(std::memory_order_relaxed),
+                g_fail_reason[kAcqFailLatched].load(std::memory_order_relaxed),
+                g_fail_reason[kAcqFailBudget].load(std::memory_order_relaxed),
+                g_fail_reason[kAcqFailSpan].load(std::memory_order_relaxed),
+                g_fail_reason[kAcqFailCap].load(std::memory_order_relaxed),
+                g_fail_reason[kAcqFailAlloc].load(std::memory_order_relaxed),
+                g_fail_reason[kAcqFailStage].load(std::memory_order_relaxed));
+    for (const auto& e : g_acqfail) {
+      if (e.count == 0) {
+        continue;
+      }
+      // The census is re-probed HERE, not when the failure happened: a latched
+      // entry whose memory reads fine at print time is a latch that outlived
+      // the streaming window that set it - the exact question this exists to
+      // answer.
+      const bool readable_now =
+          g_last_base != nullptr && SpanReadable(g_last_base + e.addr, e.need);
+      REXLOG_INFO("[native-vbuf]   acq-fail x{}: reason={} addr={:#x} need={} {} failures={} "
+                  "readable_now={}",
+                  e.count, e.reason, e.addr, e.need, e.is_index ? "ib" : "vb", e.failures,
+                  readable_now);
+    }
+  }
 }
 
 }  // namespace dpour_vbuf

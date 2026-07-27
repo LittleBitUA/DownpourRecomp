@@ -398,6 +398,10 @@ struct PassSlot {
   std::uint32_t depth = 0;
   std::uint32_t color_object = 0;  // dereferenced surface objects - the
   std::uint32_t depth_object = 0;  // identities the target registry keys on
+  // The bound surface's host colour format (SurfaceMeta.dxgi at bind time,
+  // kColorFormat when unknown). The PSO built for a draw in this pass must name
+  // the format of the target the replay will bind, or D3D12 rejects the pair.
+  DXGI_FORMAT rtv_format = kColorFormat;
   std::uint32_t draws = 0;
   // The viewport in force while this pass was drawing. Sizing the native target
   // from "the last viewport anyone set" made it flip between the scene's, the
@@ -488,7 +492,48 @@ struct SurfaceMeta {
   // came from may be freed. "5 of 17 resolves had no source" is not actionable;
   // "SceneColorLDR and FilterColor had no source" says which pass to look at.
   char name[24] = {};
+  // Host format for this surface, from the game's own EPixelFormat at creation
+  // (the reference's ConvertFormat, video.cpp:3065). DXGI_FORMAT_UNKNOWN when
+  // the create hook never saw it (the back buffer) - callers fall back to
+  // kColorFormat.
+  DXGI_FORMAT dxgi = DXGI_FORMAT_UNKNOWN;
 };
+
+// UE3 EPixelFormat (EngineTextureClasses.h:153, verified against the game's own
+// header, values 0..26) -> the host format the reference would pick. Two
+// deliberate deviations from a literal table:
+//   - PF_FloatRGB is the Xenon 7e3 EDRAM format (10-bit float RGB): values run
+//     past 1.0, so it maps to half-float, the same choice the reference makes
+//     for its HDR formats.
+//   - depth formats return UNKNOWN here; depth targets have their own path.
+DXGI_FORMAT DxgiFromPixelFormat(std::uint32_t pf) {
+  switch (pf) {
+    case 1: return DXGI_FORMAT_R32G32B32A32_FLOAT;  // PF_A32B32G32R32F
+    case 2: return DXGI_FORMAT_R8G8B8A8_UNORM;      // PF_A8R8G8B8
+    case 3: return DXGI_FORMAT_R8_UNORM;            // PF_G8
+    case 4: return DXGI_FORMAT_R16_UNORM;           // PF_G16
+    case 9: return DXGI_FORMAT_R16G16B16A16_FLOAT;  // PF_FloatRGB (7e3 EDRAM)
+    case 10: return DXGI_FORMAT_R16G16B16A16_FLOAT; // PF_FloatRGBA
+    case 14: return DXGI_FORMAT_R32_FLOAT;          // PF_R32F
+    case 15: return DXGI_FORMAT_R16G16_UNORM;       // PF_G16R16
+    case 16: return DXGI_FORMAT_R16G16_FLOAT;       // PF_G16R16F
+    case 17: return DXGI_FORMAT_R16G16_FLOAT;       // PF_G16R16F_FILTER
+    case 18: return DXGI_FORMAT_R32G32_FLOAT;       // PF_G32R32F
+    case 19: return DXGI_FORMAT_R10G10B10A2_UNORM;  // PF_A2B10G10R10
+    case 20: return DXGI_FORMAT_R16G16B16A16_UNORM; // PF_A16B16G16R16
+    case 22: return DXGI_FORMAT_R16_FLOAT;          // PF_R16F
+    case 23: return DXGI_FORMAT_R16_FLOAT;          // PF_R16F_FILTER
+    default: return DXGI_FORMAT_UNKNOWN;  // depth family, compressed, unknown
+  }
+}
+
+// DPOUR_NR_SURFACE_FMT=1 (implied by DPOUR_NR_OWN_DEVICE): native targets take
+// the guest surface's own format instead of one hardcoded half-float. An
+// 8-bit surface then clips above 1.0 exactly where the console clips it.
+// DEFAULT OFF outside own-device: it changes every pipeline's RTV format.
+// (EnvOn and OwnDeviceMode are defined later in this namespace; the definition
+// sits after them.)
+bool SurfaceFormatOn();
 extern float g_depth_clear;  // defined with the scene targets below
 std::mutex g_reg_mutex;
 std::unordered_map<std::uint32_t, SurfaceMeta> g_surface_meta;       // surface obj -> size
@@ -501,6 +546,10 @@ struct NativeTarget {
   std::uint32_t dsv_index = 0;
   std::uint32_t srv_slot = 0;  // bindless heap slot serving this target
   std::uint32_t w = 0, h = 0;
+  // The colour format this target was built with (the guest surface's own under
+  // SurfaceFormatOn, kColorFormat otherwise). The PSO's RTV format must match
+  // it, and a format change on the same key is a rebuild, same as a resize.
+  DXGI_FORMAT format = kColorFormat;
   D3D12_RESOURCE_STATES color_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
   std::uint64_t cleared_frame = 0;
 };
@@ -671,6 +720,11 @@ bool OwnDeviceMode() {
   return on;
 }
 
+bool SurfaceFormatOn() {
+  static const bool on = EnvOn("DPOUR_NR_SURFACE_FMT") || OwnDeviceMode();
+  return on;
+}
+
 // === DPOUR MIGRATION 2026-07-27: what own-device mode RETIRES ==================
 //
 // Everything listed here exists to negotiate with an emulated frame. Once the
@@ -815,9 +869,10 @@ void DestroyDeferred(ComPtr<ID3D12Resource>&& res);
 // the rebuild below runs exactly the same code as the first creation - a second
 // copy of it is how the two drift apart.
 bool BuildRegTargetResources(ID3D12Device* device, NativeTarget& t, std::uint32_t key,
-                             std::uint32_t w, std::uint32_t h) {
+                             std::uint32_t w, std::uint32_t h, DXGI_FORMAT color_format) {
   t.w = w;
   t.h = h;
+  t.format = color_format;
   D3D12_HEAP_PROPERTIES heap{};
   heap.Type = D3D12_HEAP_TYPE_DEFAULT;
   D3D12_RESOURCE_DESC cd{};
@@ -826,11 +881,11 @@ bool BuildRegTargetResources(ID3D12Device* device, NativeTarget& t, std::uint32_
   cd.Height = h;
   cd.DepthOrArraySize = 1;
   cd.MipLevels = 1;
-  cd.Format = kColorFormat;
+  cd.Format = color_format;
   cd.SampleDesc.Count = 1;
   cd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
   D3D12_CLEAR_VALUE cclear{};
-  cclear.Format = kColorFormat;
+  cclear.Format = color_format;
   if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &cd,
                                              D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cclear,
                                              IID_PPV_ARGS(&t.color)))) {
@@ -886,7 +941,7 @@ bool BuildRegTargetResources(ID3D12Device* device, NativeTarget& t, std::uint32_
   }
   if (t.srv_slot != dpour_tex::kInvalidSlot) {
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
-    sv.Format = kColorFormat;
+    sv.Format = color_format;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sv.Texture2D.MipLevels = 1;
@@ -906,7 +961,8 @@ bool BuildRegTargetResources(ID3D12Device* device, NativeTarget& t, std::uint32_
 // UI work to small rects on a full-size surface) and rebuilding on it would
 // thrash every target in the registry once a frame.
 NativeTarget* GetOrCreateRegTarget(ID3D12Device* device, std::uint32_t key, std::uint32_t w,
-                                   std::uint32_t h, bool size_is_authoritative) {
+                                   std::uint32_t h, bool size_is_authoritative,
+                                   DXGI_FORMAT color_format) {
   auto it = g_reg_targets.find(key);
   if (it != g_reg_targets.end()) {
     NativeTarget& t = it->second;
@@ -917,7 +973,12 @@ NativeTarget* GetOrCreateRegTarget(ID3D12Device* device, std::uint32_t key, std:
     // as AuxColor 128x128 and later as AuxColor 1024x720, and every draw of the
     // second one went into the first one's 128x128 target - which is exactly
     // what a stale, wrongly-scaled image on screen looks like.
-    if (!size_is_authoritative || w == 0 || h == 0 || (t.w == w && t.h == h)) {
+    //
+    // A format change on the same key is the same event seen through the other
+    // attribute, and rebuilds for the same reason.
+    const bool format_matches = !SurfaceFormatOn() || t.format == color_format;
+    if (!size_is_authoritative || w == 0 || h == 0 ||
+        (t.w == w && t.h == h && format_matches)) {
       return &t;
     }
     if (g_reg_failed) {
@@ -926,13 +987,14 @@ NativeTarget* GetOrCreateRegTarget(ID3D12Device* device, std::uint32_t key, std:
     static std::uint32_t rebuilt = 0;
     if (rebuilt < 16) {
       ++rebuilt;
-      REXLOG_INFO("[native-scene] target {:#x} resized {}x{} -> {}x{} - rebuilding (guest reused "
-                  "the surface address)",
-                  key, t.w, t.h, w, h);
+      REXLOG_INFO("[native-scene] target {:#x} changed {}x{} fmt {} -> {}x{} fmt {} - rebuilding "
+                  "(guest reused the surface address)",
+                  key, t.w, t.h, static_cast<int>(t.format), w, h,
+                  static_cast<int>(color_format));
     }
     DestroyDeferred(std::move(t.color));
     DestroyDeferred(std::move(t.depth));
-    if (!BuildRegTargetResources(device, t, key, w, h)) {
+    if (!BuildRegTargetResources(device, t, key, w, h, color_format)) {
       g_reg_targets.erase(it);
       return nullptr;
     }
@@ -967,7 +1029,7 @@ NativeTarget* GetOrCreateRegTarget(ID3D12Device* device, std::uint32_t key, std:
   t.rtv_index = g_reg_rtv_next++;
   t.dsv_index = g_reg_dsv_next++;
   t.srv_slot = dpour_tex::kInvalidSlot;
-  if (!BuildRegTargetResources(device, t, key, w, h)) {
+  if (!BuildRegTargetResources(device, t, key, w, h, color_format)) {
     return nullptr;
   }
   auto [ins, ok] = g_reg_targets.emplace(key, std::move(t));
@@ -2599,6 +2661,25 @@ void DeviceSetRenderTarget(std::uint32_t index, std::uint32_t surface_object,
   if (g_pass_current < kMaxPasses) {
     g_passes[g_pass_current].color_object = surface_object;
     g_passes[g_pass_current].is_backbuffer = is_backbuffer;
+    // The bound surface's format travels with the pass so the PSO built for its
+    // draws names the same format the replay will bind. Under the alias, the
+    // canonical surface's record is the authoritative one.
+    if (SurfaceFormatOn() && !is_backbuffer) {
+      DXGI_FORMAT fmt = kColorFormat;
+      const std::uint32_t canon = CanonicalSurface(surface_object);
+      std::lock_guard<std::mutex> lk(g_reg_mutex);
+      const auto meta = g_surface_meta.find(canon);
+      if (meta != g_surface_meta.end() && meta->second.dxgi != DXGI_FORMAT_UNKNOWN) {
+        fmt = meta->second.dxgi;
+      }
+      g_passes[g_pass_current].rtv_format = fmt;
+    } else if (is_backbuffer && OwnDeviceMode()) {
+      // The back-buffer pass binds the presenter's own image in this mode, so
+      // its PSOs must name the presenter's format, not ours.
+      g_passes[g_pass_current].rtv_format = rex::ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+    } else {
+      g_passes[g_pass_current].rtv_format = kColorFormat;
+    }
     if (g_pass_count != before) {
       static std::uint32_t announced = 0;
       if (announced < 24) {
@@ -2880,7 +2961,7 @@ std::uint32_t RtBackedSrvSlot(std::uint32_t texture_rhi_guest, std::uint32_t bas
 void OnTargetableSurfaceCreated(const std::uint8_t* base, std::uint32_t sret,
                                 std::uint32_t usage_a, std::uint32_t usage_b,
                                 std::uint32_t resolve_texture, std::uint32_t size_x,
-                                std::uint32_t size_y) {
+                                std::uint32_t size_y, std::uint32_t pixel_format) {
   if (!Enabled() || base == nullptr) {
     return;
   }
@@ -2897,13 +2978,14 @@ void OnTargetableSurfaceCreated(const std::uint8_t* base, std::uint32_t sret,
   }
   // A handful of one-time creations; logging them all is what verifies both
   // the argument layout and the actual usage names this game uses.
-  REXLOG_INFO("[native-scene] targetable surface {:08x} usage \"{}\" {}x{}", surface, name,
-              size_x, size_y);
+  REXLOG_INFO("[native-scene] targetable surface {:08x} usage \"{}\" {}x{} pf={}", surface, name,
+              size_x, size_y, pixel_format);
   if (surface != 0 && size_x >= 1 && size_x <= 4096 && size_y >= 1 && size_y <= 4096) {
     const bool depth = std::strstr(name, "Depth") != nullptr;
     std::lock_guard<std::mutex> lk(g_reg_mutex);
     SurfaceMeta m{size_x, size_y, depth};
     std::snprintf(m.name, sizeof(m.name), "%s", name);
+    m.dxgi = DxgiFromPixelFormat(pixel_format);
     g_surface_meta[surface] = m;
   }
   // The engine's own names (SceneRenderTargets.cpp:1042/1058): the scene colour
@@ -3262,10 +3344,15 @@ bool CaptureDraw(const std::uint8_t* base, const DrawDesc& d) {
   // Count every draw against its pass - that is what decides which pass is the
   // scene - but resolve only the pass we actually render. The counting has to
   // happen for all of them or the choice would be self-fulfilling.
+  DXGI_FORMAT pass_rtv_format = kColorFormat;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     if (g_pass_current < kMaxPasses) {
       ++g_passes[g_pass_current].draws;
+      // The format of the target this draw's pass is bound to, latched at
+      // DeviceSetRenderTarget from the surface's own record - the PSO below
+      // must name it or D3D12 refuses the pipeline/target pair at replay.
+      pass_rtv_format = g_passes[g_pass_current].rtv_format;
     }
     // Reference shape: EVERY pass is captured and rendered into its own native
     // target. The old "resolve only the voted pass" filter is gone - it was
@@ -3314,7 +3401,7 @@ bool CaptureDraw(const std::uint8_t* base, const DrawDesc& d) {
   // pipeline is not a special case bolted on here - it is what the game does,
   // and it is what fills our depth buffer so the base pass tests against the
   // same occlusion the guest sees.
-  key.rtv_format = d.ps != nullptr ? kColorFormat : 0;
+  key.rtv_format = d.ps != nullptr ? static_cast<std::uint32_t>(pass_rtv_format) : 0;
   key.dsv_format = kDepthFormat;
   key.depth_enable = state.depth_enable ? 1 : 0;
   key.depth_write = state.depth_write ? 1 : 0;
@@ -3532,11 +3619,13 @@ void CaptureUPBegin(const std::uint8_t* base, const UPDraw& u) {
   }
 
   std::uint32_t pass_now;
+  DXGI_FORMAT pass_rtv_format = kColorFormat;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     pass_now = g_pass_current;
     if (g_pass_current < kMaxPasses) {
       ++g_passes[g_pass_current].draws;
+      pass_rtv_format = g_passes[g_pass_current].rtv_format;
     }
   }
 
@@ -3600,7 +3689,7 @@ void CaptureUPBegin(const std::uint8_t* base, const UPDraw& u) {
   key.vs_hash = d.vs->ucode_hash;
   key.ps_hash = d.ps != nullptr ? d.ps->ucode_hash : 0;
   key.decl_hash = dpour_pipeline::DeclHash(layout);
-  key.rtv_format = d.ps != nullptr ? kColorFormat : 0;
+  key.rtv_format = d.ps != nullptr ? static_cast<std::uint32_t>(pass_rtv_format) : 0;
   key.dsv_format = kDepthFormat;
   key.depth_enable = state.depth_enable ? 1 : 0;
   key.depth_write = state.depth_write ? 1 : 0;
@@ -4321,6 +4410,11 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
     // Only an actual bind of GD3DBackBuffer is the back buffer. A NULL colour
     // bind is not "the back buffer by implication" - it is no render target.
     const bool is_bb = ps.is_backbuffer;
+    // The surface's own colour format when the create hook recorded one and the
+    // mode is on; kColorFormat otherwise (and always for the back buffer, whose
+    // console format is A8R8G8B8 but which receives our HDR-ranged draws until
+    // the composite retires everywhere).
+    DXGI_FORMAT target_format = kColorFormat;
     if (is_bb) {
       if (!BackbufferPassEnabled()) {
         return false;
@@ -4387,9 +4481,13 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
         w = meta->second.w;
         h = meta->second.h;
         size_is_authoritative = true;
+        if (SurfaceFormatOn() && meta->second.dxgi != DXGI_FORMAT_UNKNOWN) {
+          target_format = meta->second.dxgi;
+        }
       }
     }
-    NativeTarget* t = GetOrCreateRegTarget(device, target_key, w, h, size_is_authoritative);
+    NativeTarget* t =
+        GetOrCreateRegTarget(device, target_key, w, h, size_is_authoritative, target_format);
     if (t == nullptr) {
       return false;
     }

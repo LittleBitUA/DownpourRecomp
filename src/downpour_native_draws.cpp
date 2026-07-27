@@ -1009,13 +1009,17 @@ REX_HOOK_RAW(sub_829CD600) {
   const std::uint32_t sret = ctx.r3.u32;
   const std::uint32_t size_x = ctx.r4.u32;
   const std::uint32_t size_y = ctx.r5.u32;
+  // BYTE Format - UE3's EPixelFormat (EngineTextureClasses.h:153), the register
+  // right after SizeY in RHICreateTargetableSurface(SizeX, SizeY, Format,
+  // ResolveTargetTexture, Flags, UsageStr) with the sret shift.
+  const std::uint32_t pixel_format = ctx.r6.u32;
   const std::uint32_t usage_r9 = ctx.r9.u32;
   const std::uint32_t usage_r8 = ctx.r8.u32;
   const std::uint32_t resolve_tex_r7 = ctx.r7.u32;  // ResolveTargetTexture
   __imp__sub_829CD600(ctx, base);
   if (NativeActive()) {
     dpour_scene::OnTargetableSurfaceCreated(base, sret, usage_r9, usage_r8, resolve_tex_r7,
-                                            size_x, size_y);
+                                            size_x, size_y, pixel_format);
   }
   if (HooksEnabled()) {
     static std::atomic<std::uint64_t> _cnt{0};

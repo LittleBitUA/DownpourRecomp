@@ -118,10 +118,15 @@ bool DeviceRtEnabled();
 // sret = the hidden return pointer (r3 on entry; the FSurfaceRHIRef lands
 // there), usage_a/usage_b = the two registers that may carry the UsageStr
 // (r9 expected with the sret shift, r8 logged as the fallback).
+// `pixel_format` is UE3's EPixelFormat byte (EngineTextureClasses.h:153) - the
+// game's own statement of what this surface holds. The reference gives every
+// guest surface its guest format's host equivalent (ConvertFormat,
+// video.cpp:3065); a surface that is A8R8G8B8 on the console clips above 1.0
+// exactly where the console does, which one hardcoded half-float format cannot.
 void OnTargetableSurfaceCreated(const std::uint8_t* base, std::uint32_t sret,
                                 std::uint32_t usage_a, std::uint32_t usage_b,
                                 std::uint32_t resolve_texture, std::uint32_t size_x,
-                                std::uint32_t size_y);
+                                std::uint32_t size_y, std::uint32_t pixel_format);
 
 // Reference-style RT sampling (UnleashedRecomp ProcStretchRect): the resolve
 // call links its destination texture to the bound surface; a later sample of

@@ -833,6 +833,14 @@ REX_HOOK_RAW(sub_829CF628) {
     dpour_vbuf::InvalidateGuestAddress(ctx.r4.u32);
     dpour_tex::InvalidateGuestAddress(ctx.r4.u32);
   }
+  // r3 = the resource object being retired. For a targetable surface that is the
+  // object our registry is keyed on, so this is where its target goes back -
+  // the reference frees a GuestSurface's descriptor at exactly this event
+  // (video.cpp:713). RetireSurface ignores anything it does not hold a surface
+  // record for, which is most of what passes through here.
+  if (NativeActive() && ctx.r3.u32 != 0) {
+    dpour_scene::RetireSurface(ctx.r3.u32);
+  }
   __imp__sub_829CF628(ctx, base);
 }
 

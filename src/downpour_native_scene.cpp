@@ -713,7 +713,55 @@ ComPtr<ID3D12DescriptorHeap> g_reg_rtv_heap;
 ComPtr<ID3D12DescriptorHeap> g_reg_dsv_heap;
 std::uint32_t g_reg_rtv_next = 0;
 std::uint32_t g_reg_dsv_next = 0;
-constexpr std::uint32_t kRegMaxTargets = 48;
+// INDICES COME BACK. Measured, 2026-07-28: the game creates 57 targetable
+// surfaces over a few minutes of play while the registry stopped at 48, and the
+// log said what that costs in as many words - "target registry FULL at 48
+// surfaces, every later surface renders nowhere". A surface with no target is a
+// surface whose draws go nowhere and whose texture link samples nothing, which
+// is a black screen arriving several minutes in.
+//
+// A bigger ceiling alone would only postpone it: the guest creates and destroys
+// surfaces for the whole session, so what matters is that a destroyed one gives
+// its slot back. That is what the reference does - TextureDescriptorAllocator
+// (video.cpp:354) pops from `freed` before growing, and DestructResource hands
+// a surface's descriptor back to it (video.cpp:713). These are the same two
+// lists under a fixed-size heap, which is the only part D3D12 makes us size up
+// front.
+std::vector<std::uint32_t> g_reg_rtv_freed;
+std::vector<std::uint32_t> g_reg_dsv_freed;
+std::vector<std::uint32_t> g_reg_srv_freed;
+// Surfaces the guest has retired, queued by the guest thread and drained by the
+// replay - the device and the registry belong to the render thread.
+std::vector<std::uint32_t> g_pending_surface_retire;
+// WHY THE SLOTS COME BACK BUT NOT THROUGH THE RETIREMENT QUEUE.
+//
+// AddUnusedXeResource is the reference's DestructResource for everything the
+// game allocates itself, and it is where our texture and vertex-buffer caches
+// are invalidated. It is NOT where render-target surfaces arrive: its argument
+// is an FXeGPUResource's D3D object plus that resource's BaseAddress
+// (XeD3DResources.h:19), and a targetable surface is not one of those. The
+// game's own header settles it - `class FSurfaceRHIRef : public
+// TRefCountPtr<IDirect3DSurface9>` (XeD3DRenderTarget.h:68). There is no FXe
+// wrapper around a surface at all; the ref IS the D3D surface, refcounted, and
+// it dies when the last reference drops rather than on a retirement queue.
+//
+// Measured before reading that: 849 retirement calls in one run, none of them a
+// surface. So the hook below is kept (it costs a hash lookup and would be right
+// the day a surface does pass through), the counters stay so the next person
+// sees the same thing without a build, and the ceiling is what actually had to
+// move.
+std::atomic<std::uint64_t> g_retire_calls{0};
+std::atomic<std::uint64_t> g_retire_matched{0};
+constexpr std::uint32_t kRegMaxTargets = 256;
+
+std::uint32_t TakeIndex(std::vector<std::uint32_t>& freed, std::uint32_t& next) {
+  if (!freed.empty()) {
+    const std::uint32_t v = freed.back();
+    freed.pop_back();
+    return v;
+  }
+  return next++;
+}
 
 // Destination textures for the real resolve copy - one per resolved D3D texture
 // object. The reference owns exactly this: ExecutePendingStretchRectCommands
@@ -1192,7 +1240,8 @@ NativeTarget* GetOrCreateRegTarget(ID3D12Device* device, std::uint32_t key, std:
   // target, EVERY guest surface asks for its own - so the two ways this can come
   // up empty are worth naming. A silent nullptr here reads downstream as "the
   // resolve had no source", which is the symptom we just spent a day chasing.
-  if (g_reg_rtv_next >= kRegMaxTargets || g_reg_dsv_next >= kRegMaxTargets) {
+  if ((g_reg_rtv_freed.empty() && g_reg_rtv_next >= kRegMaxTargets) ||
+      (g_reg_dsv_freed.empty() && g_reg_dsv_next >= kRegMaxTargets)) {
     static bool warned = false;
     if (!warned) {
       warned = true;
@@ -1211,16 +1260,66 @@ NativeTarget* GetOrCreateRegTarget(ID3D12Device* device, std::uint32_t key, std:
     return nullptr;
   }
   NativeTarget t{};
-  t.rtv_index = g_reg_rtv_next++;
-  t.dsv_index = g_reg_dsv_next++;
-  t.srv_slot = dpour_tex::kInvalidSlot;
+  t.rtv_index = TakeIndex(g_reg_rtv_freed, g_reg_rtv_next);
+  t.dsv_index = TakeIndex(g_reg_dsv_freed, g_reg_dsv_next);
+  t.srv_slot = g_reg_srv_freed.empty() ? dpour_tex::kInvalidSlot : g_reg_srv_freed.back();
+  if (!g_reg_srv_freed.empty()) {
+    g_reg_srv_freed.pop_back();
+  }
   if (!BuildRegTargetResources(device, t, key, w, h, color_format)) {
+    // Hand the indices back rather than burning them: a build that failed on a
+    // transient allocation would otherwise eat a registry slot per attempt.
+    g_reg_rtv_freed.push_back(t.rtv_index);
+    g_reg_dsv_freed.push_back(t.dsv_index);
+    if (t.srv_slot != dpour_tex::kInvalidSlot) {
+      g_reg_srv_freed.push_back(t.srv_slot);
+    }
     return nullptr;
   }
   auto [ins, ok] = g_reg_targets.emplace(key, std::move(t));
   REXLOG_INFO("[native-scene] target registered: surface {:#x} {}x{} (srv {})", key, w, h,
               ins->second.srv_slot);
   return &ins->second;
+}
+
+// The guest has retired this surface, so its target and its three descriptor
+// indices go back into circulation - the DestructResource role of the reference
+// (video.cpp:708-718), which frees a GuestSurface's descriptor the moment the
+// resource is destructed.
+//
+// The resources themselves are destroyed DEFERRED, never here: the GPU may still
+// be reading this target for a frame already submitted. That is the reference's
+// rule too - ProcDestructResource parks the resource in g_tempResources[g_frame]
+// and only the frame boundary actually releases it.
+void RetireRegTarget(std::uint32_t key) {
+  const auto it = g_reg_targets.find(key);
+  if (it == g_reg_targets.end()) {
+    return;
+  }
+  NativeTarget& t = it->second;
+  DestroyDeferred(std::move(t.color));
+  DestroyDeferred(std::move(t.depth));
+  g_reg_rtv_freed.push_back(t.rtv_index);
+  g_reg_dsv_freed.push_back(t.dsv_index);
+  if (t.srv_slot != dpour_tex::kInvalidSlot) {
+    g_reg_srv_freed.push_back(t.srv_slot);
+  }
+  g_reg_targets.erase(it);
+  {
+    std::lock_guard<std::mutex> lk(g_reg_mutex);
+    g_surface_srv.erase(key);
+    // A link pointing at a surface that no longer exists would otherwise serve
+    // the next surface that lands on this address.
+    for (auto lit = g_texture_link.begin(); lit != g_texture_link.end();) {
+      lit = lit->second == key ? g_texture_link.erase(lit) : std::next(lit);
+    }
+  }
+  static std::uint32_t logged = 0;
+  if (logged < 8) {
+    ++logged;
+    REXLOG_INFO("[native-scene] target retired: surface {:#x} (registry now {})", key,
+                g_reg_targets.size());
+  }
 }
 
 // (The scene-injection pipeline was here: render our target, read it back,
@@ -3238,6 +3337,28 @@ std::uint32_t RtBackedSrvSlot(std::uint32_t texture_rhi_guest, std::uint32_t bas
   return dpour_tex::kInvalidSlot;
 }
 
+// AddUnusedXeResource has handed us a resource the guest is retiring. Only an
+// object we actually hold a target for is one of ours - the queue that reaches
+// this is every retiring resource in the game, most of them textures and
+// vertex-buffer orphans that the other two modules claim.
+//
+// Queued, not acted on: the registry belongs to the render thread, and this runs
+// on the guest's.
+void RetireSurface(std::uint32_t resource_or_surface) {
+  if (!Enabled() || resource_or_surface == 0) {
+    return;
+  }
+  g_retire_calls.fetch_add(1, std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lk(g_reg_mutex);
+  const std::uint32_t surface = resource_or_surface;
+  if (g_surface_meta.find(surface) == g_surface_meta.end()) {
+    return;  // not a surface of ours - textures and buffers share this queue
+  }
+  g_retire_matched.fetch_add(1, std::memory_order_relaxed);
+  g_surface_meta.erase(surface);
+  g_pending_surface_retire.push_back(surface);
+}
+
 void OnTargetableSurfaceCreated(const std::uint8_t* base, std::uint32_t sret,
                                 std::uint32_t usage_a, std::uint32_t usage_b,
                                 std::uint32_t resolve_texture, std::uint32_t size_x,
@@ -4670,6 +4791,19 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   // existed, a surface only had an SRV once a draw had landed in it, so the
   // scene's own resolve destination sampled white on every frame that drew the
   // world into a pass we had not yet built a target for.
+  // Retirements first: a surface destroyed and one created in the same frame
+  // must give its slot up before the new one asks for one, or a registry that
+  // is exactly full stays full for no reason.
+  {
+    std::vector<std::uint32_t> retiring;
+    {
+      std::lock_guard<std::mutex> lk(g_reg_mutex);
+      retiring.swap(g_pending_surface_retire);
+    }
+    for (const std::uint32_t key : retiring) {
+      RetireRegTarget(key);
+    }
+  }
   {
     std::vector<std::uint32_t> pending;
     {
@@ -5831,8 +5965,11 @@ void LogStats() {
   const std::uint64_t rticks = g_render_ticks.exchange(0, std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lk(g_reg_mutex);
-    REXLOG_INFO("[native-scene] registry: {} surfaces known, {} texture links, {} SRV-backed",
-                g_surface_meta.size(), g_texture_link.size(), g_surface_srv.size());
+    REXLOG_INFO("[native-scene] registry: {} surfaces known, {} texture links, {} SRV-backed | "
+                "retire calls {}, matched {}",
+                g_surface_meta.size(), g_texture_link.size(), g_surface_srv.size(),
+                g_retire_calls.load(std::memory_order_relaxed),
+                g_retire_matched.load(std::memory_order_relaxed));
   }
   REXLOG_INFO("[native-scene] UP draws: {} begun, {} captured, {} dropped, {} over the frame cap",
               g_up_seen.load(std::memory_order_relaxed),

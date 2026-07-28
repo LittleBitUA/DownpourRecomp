@@ -128,6 +128,17 @@ void OnTargetableSurfaceCreated(const std::uint8_t* base, std::uint32_t sret,
                                 std::uint32_t resolve_texture, std::uint32_t size_x,
                                 std::uint32_t size_y, std::uint32_t pixel_format);
 
+// The guest is retiring a resource (AddUnusedXeResource). When it is a surface
+// we hold a target for, the target and its descriptor indices go back into
+// circulation - the DestructResource role of the reference (video.cpp:713).
+//
+// Measured: this queue carries textures and vertex-buffer orphans, not
+// surfaces - 849 calls, no surface among them - because a targetable surface is
+// a refcounted IDirect3DSurface9 rather than an FXeGPUResource
+// (XeD3DRenderTarget.h:68). Kept because it is correct and free, but the
+// registry's ceiling is what actually had to move.
+void RetireSurface(std::uint32_t resource_or_surface);
+
 // Reference-style RT sampling (UnleashedRecomp ProcStretchRect): the resolve
 // call links its destination texture to the bound surface; a later sample of
 // that texture binds the surface's own native target SRV. This callback is

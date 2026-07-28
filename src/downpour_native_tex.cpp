@@ -268,6 +268,23 @@ bool ReadFetchAt(const std::uint8_t* base, std::uint32_t guest_addr, Fetch& out)
 std::atomic<std::int32_t> g_fetch_kind{-1};
 std::atomic<std::uint32_t> g_fetch_offset{0};
 
+// What the fallback search below found for one texture object, so it is paid
+// ONCE per object instead of once per bind.
+//
+// MEASURED, and the reason this exists: without it the search ran for every
+// missing texture on every draw - up to three roots by thirty-three offsets of
+// guest reads each - and the title screen went from 60 FPS to 11. The search
+// itself is right; doing it again for an answer we already had is not.
+//
+// Negative results are cached too. A texture we cannot decode is asked about
+// just as often as one we can, and it is the expensive case.
+struct FetchLayout {
+  std::int32_t kind;    // -1 = no layout found
+  std::uint32_t offset;
+};
+std::mutex g_layout_mutex;
+std::unordered_map<std::uint32_t, FetchLayout> g_layout_cache;
+
 bool ResolveFetch(const std::uint8_t* base, std::uint32_t tex_rhi, Fetch& out) {
   const std::int32_t kind = g_fetch_kind.load(std::memory_order_acquire);
   if (kind >= 0) {
@@ -283,8 +300,60 @@ bool ResolveFetch(const std::uint8_t* base, std::uint32_t tex_rhi, Fetch& out) {
         return false;
       }
     }
-    return ReadFetchAt(base, root + off, out) && LooksLikeTextureFetch(out);
+    if (ReadFetchAt(base, root + off, out) && LooksLikeTextureFetch(out)) {
+      return true;
+    }
+    // === DPOUR MIGRATION 2026-07-29: ONE LAYOUT IS NOT EVERY LAYOUT ==========
+    //
+    // The learned (kind, offset) pair is global and latched by the FIRST texture
+    // that decoded, and every texture whose object is shaped differently then
+    // fails together. Measured in the menu: twelve distinct objects, every one
+    // of them "reason 1 (no fetch)", against a screen that shows the logo and
+    // nothing else - no background, no menu items, no button prompts.
+    //
+    // The fast path stays exactly as it was, because it is right for almost
+    // everything and costs one read. What changes is the answer to a miss: fall
+    // through to the same search that learned the pair in the first place,
+    // for THIS texture only. Nothing is re-latched - a second layout must not
+    // evict the first one and make the common case pay for the rare one.
+    //
+    // A miss used to reach ServeWhite, and white is the worst possible guess:
+    // it is invisible in a multiply and catastrophic anywhere else, which is
+    // exactly how the colour-grading LUT painted the whole screen white.
+    //
+    // Answered from the cache when this object has been searched before, which
+    // is what keeps the fallback from costing the frame rate.
+    {
+      std::lock_guard<std::mutex> lk(g_layout_mutex);
+      const auto it = g_layout_cache.find(tex_rhi);
+      if (it != g_layout_cache.end()) {
+        if (it->second.kind < 0) {
+          return false;
+        }
+        std::uint32_t r = tex_rhi;
+        if (it->second.kind != 0) {
+          const std::uint8_t* p = base + tex_rhi + (it->second.kind == 1 ? 8u : 12u);
+          if (!SpanReadable(p, 4)) {
+            return false;
+          }
+          r = LoadBE32(p);
+        }
+        return ReadFetchAt(base, r + it->second.offset, out) && LooksLikeTextureFetch(out);
+      }
+    }
   }
+
+  // Everything below either LEARNS the global pair (kind < 0) or searches for
+  // this one object. RememberLayout records the outcome for the second case.
+  const auto RememberLayout = [&](std::int32_t k, std::uint32_t off) {
+    if (kind < 0) {
+      return;  // learning run: the global latch is the record
+    }
+    std::lock_guard<std::mutex> lk(g_layout_mutex);
+    if (g_layout_cache.size() < 4096) {
+      g_layout_cache[tex_rhi] = FetchLayout{k, off};
+    }
+  };
 
   const std::uint32_t roots[3] = {0u, 8u, 12u};
   for (int k = 1; k <= 2; ++k) {
@@ -298,8 +367,13 @@ bool ResolveFetch(const std::uint8_t* base, std::uint32_t tex_rhi, Fetch& out) {
     }
     for (std::uint32_t off = 0; off <= 0x60; off += 4) {
       if (ReadFetchAt(base, root + off, out) && LooksLikeTextureFetch(out)) {
-        g_fetch_offset.store(off, std::memory_order_relaxed);
-        g_fetch_kind.store(k, std::memory_order_release);
+        if (kind < 0) {  // learning; a fallback search leaves the latch alone
+          g_fetch_offset.store(off, std::memory_order_relaxed);
+          g_fetch_kind.store(k, std::memory_order_release);
+        } else {
+          RememberLayout(k, off);
+          return true;
+        }
         REXLOG_INFO(
             "[native-tex] fetch constant located: RHI+{} -> D3DBaseTexture+{} "
             "(first texture {}x{} fmt={} tiled={} endian={})",
@@ -310,6 +384,10 @@ bool ResolveFetch(const std::uint8_t* base, std::uint32_t tex_rhi, Fetch& out) {
   }
   for (std::uint32_t off = 0; off <= 0x80; off += 4) {
     if (ReadFetchAt(base, tex_rhi + off, out) && LooksLikeTextureFetch(out)) {
+      if (kind >= 0) {
+        RememberLayout(0, off);
+        return true;  // fallback for one texture; the latched pair stands
+      }
       g_fetch_offset.store(off, std::memory_order_relaxed);
       g_fetch_kind.store(0, std::memory_order_release);
       REXLOG_INFO("[native-tex] fetch constant located inline at RHI+{} ({}x{} fmt={} tiled={})",
@@ -317,6 +395,7 @@ bool ResolveFetch(const std::uint8_t* base, std::uint32_t tex_rhi, Fetch& out) {
       return true;
     }
   }
+  RememberLayout(-1, 0);  // nothing fits this object; do not search it again
   return false;
 }
 

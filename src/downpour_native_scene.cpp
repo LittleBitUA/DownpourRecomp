@@ -6853,6 +6853,12 @@ void LogStats() {
   dpour_state::LogStats();
   dpour_vbuf::LogStats();
   dpour_pipeline::LogStats();
+  // The texture census belongs on the PERIODIC line, not only at shutdown.
+  // Every diagnostic run this session ended with the process being killed to
+  // redeploy, so the one number that says whether a texture change helped -
+  // how many binds were served white, by reason - was never written down. A
+  // count that only exists if the program exits cleanly is a count nobody has.
+  dpour_tex::LogStats();
 }
 
 }  // namespace dpour_scene

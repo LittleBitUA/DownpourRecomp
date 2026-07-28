@@ -304,6 +304,14 @@ bool Find(std::uint32_t object, Surface& out) {
   return true;
 }
 
+void ListSurfaces(std::vector<Surface>& out) {
+  std::lock_guard<std::mutex> lk(g_mutex);
+  out.reserve(out.size() + g_surfaces.size());
+  for (const auto& [object, s] : g_surfaces) {
+    out.push_back(s);
+  }
+}
+
 std::uint32_t FamilyPrimary() {
   std::lock_guard<std::mutex> lk(g_mutex);
   return g_family_primary;

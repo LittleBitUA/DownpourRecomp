@@ -114,6 +114,10 @@ void Unregister(std::uint32_t object);
 // would outlive the lock that made it safe to read.
 bool Find(std::uint32_t object, Surface& out);
 
+// Every surface currently on record, appended to `out`. For the F3 panel's
+// surface picker: the game names them all, so the list is the game's own.
+void ListSurfaces(std::vector<Surface>& out);
+
 // The DefaultColor primary - the surface the whole family draws into - or 0
 // before the game has created it.
 std::uint32_t FamilyPrimary();

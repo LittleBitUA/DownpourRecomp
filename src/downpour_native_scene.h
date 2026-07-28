@@ -29,6 +29,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 struct ID3D12Device;
 struct ID3D12CommandQueue;
@@ -290,6 +291,40 @@ void Render(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12GraphicsComma
             std::uint32_t width, std::uint32_t height);
 
 void LogStats();
+
+// === DPOUR MIGRATION 2026-07-29: the F3 panel's switches ====================
+//
+// The renderer's bring-up knobs, live instead of latched at startup. Each is
+// still SEEDED by its environment variable, so scripted and headless runs are
+// unchanged; these only let the overlay move them afterwards. See
+// downpour_native_debugpanel.cpp for what drives them.
+//
+// Read from the render thread, written from the UI thread: every one is an
+// atomic behind these calls, and none of them resizes or reallocates anything.
+
+// Which surface to put on screen whole, instead of the game's frame. Empty or
+// nullptr shows the frame.
+std::string ShowSurfaceSpecCopy();
+void SetShowSurfaceSpec(const char* spec);
+
+// Multiplier applied to the composited colour. 0 = off, -1 = classify (grey
+// never written, yellow written black, blue positive).
+float AmplifyFactor();
+void SetAmplifyFactor(float f);
+
+// Keep the game's own EDRAM exponent bias (its shaders multiply, the resolve
+// divides) rather than neutralising both halves.
+bool KeepColorBias();
+void SetKeepColorBias(bool on);
+
+// Registers the renderer's section in the SDK's F3 debug overlay. Call once at
+// startup; safe before the UI exists.
+void RegisterDebugPanel();
+
+// Carries the three knobs between the cvars (the F4 settings tree, the console,
+// the config file) and the renderer, in whichever direction moved last. Call
+// once per frame.
+void SyncDebugKnobs();
 
 }  // namespace dpour_scene
 // === END DPOUR MIGRATION 2026-07-25 ===

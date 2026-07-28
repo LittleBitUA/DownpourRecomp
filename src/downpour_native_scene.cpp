@@ -823,6 +823,43 @@ struct ResolveTexture {
   std::uint32_t w = 0, h = 0;
 };
 std::unordered_map<std::uint32_t, ResolveTexture> g_resolve_textures;  // render thread only
+
+// === DPOUR MIGRATION 2026-07-29: THE COLOUR-GRADING LUT =====================
+//
+// A volume destination, because the game's final shader samples one:
+//
+//   GammaColor = ColorLookupTable(GammaColor);   OurUberPostProcess...usf:138
+//   half3 ColorLookupTable(half3 c) { return tex3D(ColorGradingLUT, ...); }
+//
+// That is an assignment, so the final colour of every pixel IS the lookup. With
+// nothing to serve, the sampler got the 1x1 white fallback and tex3D returned
+// (1,1,1) everywhere - a white screen with a correct scene sitting behind it.
+//
+// It has to be a real Texture3D and not a slot in the ordinary resolve table:
+// every descriptor there is a TEXTURE2D SRV, and the shared-constant table hands
+// the same slot to space0 and space1 alike, so a 3D sampler reading a 2D
+// descriptor is a dimension mismatch. The LUT gets its own slot with its own
+// TEXTURE3D view.
+//
+// Sixteen 16x16 slices, resolved one at a time out of a single 512x16 surface at
+// x = slice * 32 - which is why the resolve shader grew a source rect.
+struct LutTexture {
+  ComPtr<ID3D12Resource> tex;
+  std::uint32_t rtv_base = 0;  // 16 consecutive RTVs, one per W-slice
+  std::uint32_t srv_slot = dpour_tex::kInvalidSlot;
+  std::uint32_t size = 0;      // 16
+};
+std::unordered_map<std::uint32_t, LutTexture> g_lut_textures;  // array object -> volume
+// Queued by the guest thread, drained by the replay, exactly like PendingResolve.
+struct PendingArrayResolve {
+  std::uint32_t array_object = 0;  // the guest texture-array's D3D object
+  std::uint32_t surface = 0;       // source surface (registry key)
+  std::uint32_t slice = 0;         // FResolveParams::CubeFace carries it
+  std::uint32_t x = 0, y = 0, w = 0, h = 0;  // source rect, in texels
+  std::uint32_t draw_index = 0;
+};
+std::vector<PendingArrayResolve> g_array_resolve_staging;
+std::vector<PendingArrayResolve> g_array_resolves;
 std::unordered_map<std::uint32_t, std::uint32_t> g_resolve_srv;  // d3d tex -> srv (g_reg_mutex)
 extern std::atomic<std::uint64_t> g_frame;
 // === DPOUR MIGRATION 2026-07-29: the freshness gates are gone ================
@@ -1074,7 +1111,14 @@ std::uint32_t CanonicalSurface(std::uint32_t surface) {
 
 ComPtr<ID3D12DescriptorHeap> g_resolve_rtv_heap;
 std::uint32_t g_resolve_rtv_next = 0;
-constexpr std::uint32_t kResolveMaxTextures = 32;
+// Indices handed back by a rebuild, and the bindless slots those rebuilds keep
+// so existing links follow the new resource. See EnsureResolveTexture.
+std::vector<std::uint32_t> g_resolve_rtv_freed;
+std::unordered_map<std::uint32_t, std::uint32_t> g_resolve_srv_keep;
+// 256, not 32, and for the same reason the target registry moved off 48: the
+// game creates resolve destinations for the whole session, and past the ceiling
+// every one of them is served with the exponent bias still in it.
+constexpr std::uint32_t kResolveMaxTextures = 256;
 // STICKY FAILURE - the skate3 discipline, verified in their code: g_r.failed is
 // set at EVERY resource and pipeline creation failure
 // (skate3_native_scene_gpu.cpp:2781, 2843, 2928, 2956, 2974, 3342, 4042 ...),
@@ -1885,7 +1929,12 @@ bool EnsureComposite(ID3D12Device* device) {
 // filtered copy would blur a 1:1 transfer for nothing.
 const char kResolveSrc[] = R"HLSL(
 Texture2D<float4> uSrc : register(t0);
-cbuffer Params : register(b0) { float uScale; float3 uPad; };
+// uSrcRect is the source region in texels: origin in xy, size in zw. Zero size
+// means the whole surface, which is what every ordinary resolve passes. The
+// colour-grading LUT is the one caller that needs a region: it resolves sixteen
+// 16x16 slices out of one 512x16 surface, at x = slice * 32
+// (SceneRenderTargets.cpp:388-394).
+cbuffer Params : register(b0) { float uScale; float3 uPad; float4 uSrcRect; };
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 VSOut VSMain(uint vid : SV_VertexID) {
   VSOut o;
@@ -1897,7 +1946,8 @@ VSOut VSMain(uint vid : SV_VertexID) {
 float4 PSMain(VSOut i) : SV_Target {
   uint2 dim;
   uSrc.GetDimensions(dim.x, dim.y);
-  int2 p = int2(i.uv * float2(dim));
+  float2 span = (uSrcRect.z > 0.0) ? uSrcRect.zw : float2(dim);
+  int2 p = int2(uSrcRect.xy + i.uv * span);
   float4 c = uSrc.Load(int3(p, 0));
   // Colour only. The bias is described throughout the game's source as a COLOUR
   // exponent bias, and the destination formats it is used with (PF_FloatRGB,
@@ -1948,7 +1998,8 @@ bool EnsureResolvePipeline(ID3D12Device* device) {
   params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
   params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
   params[1].Constants.ShaderRegister = 0;
-  params[1].Constants.Num32BitValues = 4;
+  // 8, not 4: the scale and its padding, then the source rect the LUT slices need.
+  params[1].Constants.Num32BitValues = 8;
   params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
 
   D3D12_ROOT_SIGNATURE_DESC rs{};
@@ -1983,15 +2034,146 @@ bool EnsureResolvePipeline(ID3D12Device* device) {
   return true;
 }
 
-// The destination texture for one resolved guest texture object. Created once
-// and kept: the game resolves into the same handful of textures every frame.
+// The volume destination for a texture array the game resolves slice by slice.
+// See g_lut_textures for why it cannot live in the ordinary resolve table.
+LutTexture* EnsureLutTexture(ID3D12Device* device, std::uint32_t array_object,
+                             std::uint32_t slice_w, std::uint32_t slice_h,
+                             std::uint32_t slice_count) {
+  const auto it = g_lut_textures.find(array_object);
+  if (it != g_lut_textures.end()) {
+    return it->second.size == slice_count ? &it->second : nullptr;
+  }
+  if (g_resolve_failed || device == nullptr || slice_w == 0 || slice_h == 0 ||
+      slice_count == 0 || slice_count > 64) {
+    return nullptr;
+  }
+  if (!g_resolve_rtv_heap) {
+    return nullptr;  // built by EnsureResolveTexture; nothing to hang RTVs on yet
+  }
+  LutTexture lt{};
+  lt.size = slice_count;
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC td{};
+  td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE3D;
+  td.Width = slice_w;
+  td.Height = slice_h;
+  td.DepthOrArraySize = static_cast<UINT16>(slice_count);
+  td.MipLevels = 1;
+  td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;  // the LUT is PF_A8R8G8B8
+  td.SampleDesc.Count = 1;
+  td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+  D3D12_CLEAR_VALUE cv{};
+  cv.Format = td.Format;
+  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &td,
+                                             D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, &cv,
+                                             IID_PPV_ARGS(&lt.tex)))) {
+    REXLOG_ERROR("[native-scene] LUT volume {:#x} {}x{}x{} failed", array_object, slice_w, slice_h,
+                 slice_count);
+    return nullptr;
+  }
+  {
+    wchar_t n[64];
+    std::swprintf(n, 64, L"dpour.lut.%08x", array_object);
+    lt.tex->SetName(n);
+  }
+  // One RTV per W-slice, consecutive so the slice index is the offset.
+  lt.rtv_base = g_resolve_rtv_next;
+  if (lt.rtv_base + slice_count > kResolveMaxTextures) {
+    return nullptr;
+  }
+  g_resolve_rtv_next += slice_count;
+  const std::uint32_t stride =
+      device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+  for (std::uint32_t i = 0; i < slice_count; ++i) {
+    D3D12_RENDER_TARGET_VIEW_DESC rv{};
+    rv.Format = td.Format;
+    rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE3D;
+    rv.Texture3D.MipSlice = 0;
+    rv.Texture3D.FirstWSlice = i;
+    rv.Texture3D.WSize = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE h = g_resolve_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += static_cast<std::size_t>(lt.rtv_base + i) * stride;
+    device->CreateRenderTargetView(lt.tex.Get(), &rv, h);
+  }
+  lt.srv_slot = dpour_tex::AllocDescriptorSlot();
+  if (lt.srv_slot == dpour_tex::kInvalidSlot) {
+    return nullptr;
+  }
+  D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+  sv.Format = td.Format;
+  sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;  // the whole point
+  sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  sv.Texture3D.MipLevels = 1;
+  D3D12_CPU_DESCRIPTOR_HANDLE sh{};
+  sh.ptr = static_cast<std::size_t>(dpour_tex::CpuHandleAt(lt.srv_slot));
+  device->CreateShaderResourceView(lt.tex.Get(), &sv, sh);
+  auto [ins, ok] = g_lut_textures.emplace(array_object, std::move(lt));
+  {
+    std::lock_guard<std::mutex> lk(g_reg_mutex);
+    g_resolve_srv[array_object] = ins->second.srv_slot;
+  }
+  REXLOG_INFO("[native-scene] LUT volume registered: array {:#x} {}x{}x{} (srv {})", array_object,
+              slice_w, slice_h, slice_count, ins->second.srv_slot);
+  return &ins->second;
+}
+
+// The destination texture for one resolved guest texture object.
+//
+// === DPOUR MIGRATION 2026-07-29: A MISSING COPY IS NOW A BRIGHTNESS BUG ======
+//
+// "Created once and kept: the game resolves into the same handful of textures
+// every frame" was wrong on both counts, and it stopped being harmless the
+// moment the exponent bias went back to the game's own value.
+//
+// The resolve is where the bias comes OUT - D3DRESOLVE_EXPONENTBIAS(-bias),
+// XeD3DRenderTarget.cpp:519 - so a texture with no copy is served from the
+// surface's own target instead, which still holds the biased values the shaders
+// wrote. That is not a slightly stale picture; it is 2^bias too bright, eight
+// times for anything resolved out of scene colour, and everything above 0.125
+// clamps to white. PROVEN 29.07: the raw target shown with a 1/8 amplify is a
+// correctly exposed image, the same target shown straight is a white screen.
+//
+// Two ways a copy went missing, both of them ceilings we have hit before:
+//
+//   - THE COUNT. 32 destinations, never released, in a game that creates
+//     targetable surfaces for the whole session - the same shape as the
+//     48-target registry ceiling that made the screen go black several minutes
+//     in. Raised, and the index now comes back on rebuild.
+//   - THE SIZE. A different size on a known key returned nullptr FOREVER, so a
+//     guest address reused for a smaller surface killed that texture's copy for
+//     the rest of the session. The colour registry already rebuilds on exactly
+//     this event (see the note there on 0x40cb9c10); this one silently gave up.
 ResolveTexture* EnsureResolveTexture(ID3D12Device* device, std::uint32_t d3d_tex, std::uint32_t w,
                                      std::uint32_t h) {
   auto it = g_resolve_textures.find(d3d_tex);
   if (it != g_resolve_textures.end()) {
-    return it->second.w == w && it->second.h == h ? &it->second : nullptr;
+    if (it->second.w == w && it->second.h == h) {
+      return &it->second;
+    }
+    // The guest reused this address for a differently sized surface. Rebuild
+    // rather than refuse: the descriptor slot and the bindless slot are kept so
+    // every link already pointing here follows the new resource.
+    static std::uint32_t rebuilt = 0;
+    if (rebuilt < 16) {
+      ++rebuilt;
+      REXLOG_INFO("[native-scene] resolve copy {:#x} changed {}x{} -> {}x{} - rebuilding", d3d_tex,
+                  it->second.w, it->second.h, w, h);
+    }
+    DestroyDeferred(std::move(it->second.tex));
+    g_resolve_rtv_freed.push_back(it->second.rtv_index);
+    g_resolve_srv_keep[d3d_tex] = it->second.srv_slot;
+    g_resolve_textures.erase(it);
   }
-  if (g_resolve_failed || g_resolve_rtv_next >= kResolveMaxTextures || w == 0 || h == 0) {
+  if (g_resolve_failed || w == 0 || h == 0 ||
+      (g_resolve_rtv_freed.empty() && g_resolve_rtv_next >= kResolveMaxTextures)) {
+    static bool said = false;
+    if (!said && g_resolve_rtv_next >= kResolveMaxTextures) {
+      said = true;
+      REXLOG_WARN("[native-scene] resolve copy table FULL at {} textures - every later resolve "
+                  "destination is served un-divided, i.e. 2^bias too bright",
+                  kResolveMaxTextures);
+    }
     return nullptr;
   }
   if (!g_resolve_rtv_heap) {
@@ -2033,7 +2215,17 @@ ResolveTexture* EnsureResolveTexture(ID3D12Device* device, std::uint32_t d3d_tex
     std::swprintf(n, 64, L"dpour.resolve.%08x", d3d_tex);
     rt.tex->SetName(n);
   }
-  rt.srv_slot = dpour_tex::AllocDescriptorSlot();
+  // On a rebuild the old bindless slot is reused, so links already pointing at
+  // this texture follow the new resource instead of dangling on the freed one.
+  {
+    const auto kept = g_resolve_srv_keep.find(d3d_tex);
+    if (kept != g_resolve_srv_keep.end()) {
+      rt.srv_slot = kept->second;
+      g_resolve_srv_keep.erase(kept);
+    } else {
+      rt.srv_slot = dpour_tex::AllocDescriptorSlot();
+    }
+  }
   if (rt.srv_slot == dpour_tex::kInvalidSlot) {
     return nullptr;  // the bindless heap is full; the alias still works
   }
@@ -2046,7 +2238,7 @@ ResolveTexture* EnsureResolveTexture(ID3D12Device* device, std::uint32_t d3d_tex
   sh.ptr = static_cast<std::size_t>(dpour_tex::CpuHandleAt(rt.srv_slot));
   device->CreateShaderResourceView(rt.tex.Get(), &sv, sh);
 
-  rt.rtv_index = g_resolve_rtv_next++;
+  rt.rtv_index = TakeIndex(g_resolve_rtv_freed, g_resolve_rtv_next);
   const std::uint32_t stride =
       device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
   D3D12_CPU_DESCRIPTOR_HANDLE rtvh = g_resolve_rtv_heap->GetCPUDescriptorHandleForHeapStart();
@@ -2323,15 +2515,40 @@ bool ResolveCopyEnabled() {
 // that matters (bias kept against bias neutralised, everything else identical)
 // could not be run without a rebuild. That is exactly the A/B this flag exists
 // for, so DPOUR_NR_KEEP_COLOR_BIAS=0 now forces it off again.
-bool KeepColorBias() {
-  static const bool on = [] {
-    const char* v = std::getenv("DPOUR_NR_KEEP_COLOR_BIAS");
-    if (v != nullptr && v[0] != '\0') {
-      return v[0] != '0';
-    }
-    return OwnDeviceMode();
-  }();
+std::atomic<int> g_keep_color_bias{-1};  // -1 = not seeded yet
+
+// DPOUR_NR_LUT=1 - resolve the colour-grading LUT into a real volume texture.
+//
+// DEFAULT OFF, and not out of caution: the build that first carried it hung, and
+// the log shows the array branch never even ran (no "array resolve" line, no
+// "LUT volume registered"), so the regression and the feature are not yet known
+// to be the same thing. A change that coincides with a hang goes behind a gate
+// before it is investigated, not after - otherwise the next measurement is taken
+// on a build nobody trusts.
+//
+// What it does when on is described at g_lut_textures: the game's final shader
+// ASSIGNS its output from tex3D(ColorGradingLUT), so with nothing to serve that
+// sampler the 1x1 white fallback makes every pixel white. That diagnosis stands
+// on its own - it was read out of the game's source and its own log lines - and
+// is independent of whether this particular implementation of the fix is sound.
+bool LutResolveEnabled() {
+  static const bool on = EnvOn("DPOUR_NR_LUT");
   return on;
+}
+
+bool KeepColorBias() {
+  int v = g_keep_color_bias.load(std::memory_order_relaxed);
+  if (v < 0) {
+    const char* e = std::getenv("DPOUR_NR_KEEP_COLOR_BIAS");
+    v = (e != nullptr && e[0] != '\0') ? (e[0] != '0' ? 1 : 0) : (OwnDeviceMode() ? 1 : 0);
+    g_keep_color_bias.store(v, std::memory_order_relaxed);
+  }
+  return v != 0;
+}
+
+void SetKeepColorBias(bool on) {
+  KeepColorBias();  // seed first, so the environment cannot overwrite this later
+  g_keep_color_bias.store(on ? 1 : 0, std::memory_order_relaxed);
 }
 
 // The multiply the CONSOLE applies at sample time, which no shader asks for and
@@ -2409,12 +2626,43 @@ bool C0ProbeEnabled() {
 // never written, yellow written black, blue positive), a positive value scales
 // it. That is how "which target in the chain goes dark first" becomes one run
 // per target instead of an argument.
-const char* ShowSurfaceSpec() {
-  static const char* v = [] {
+// === DPOUR MIGRATION 2026-07-29: LIVE, NOT LATCHED ==========================
+//
+// These two decide what reaches the screen, and until now each of them cost a
+// process restart to change - which is what turned "compare these two" into a
+// twenty-minute round trip through a menu and a loading screen. They are the
+// switches the F3 overlay drives (see RegisterDebugPanel), so they hold their
+// value in an atomic that the environment merely SEEDS.
+//
+// The env vars keep working exactly as before for headless runs and scripts.
+std::mutex g_show_surface_mutex;
+std::string g_show_surface_spec;  // empty = show the frame, not a surface
+
+std::string ShowSurfaceSpecCopy() {
+  static const bool seeded = [] {
     const char* s = std::getenv("DPOUR_NR_SHOW_SURFACE");
-    return (s != nullptr && s[0] != '\0') ? s : nullptr;
+    if (s != nullptr && s[0] != '\0') {
+      std::lock_guard<std::mutex> lk(g_show_surface_mutex);
+      g_show_surface_spec = s;
+    }
+    return true;
   }();
-  return v;
+  (void)seeded;
+  std::lock_guard<std::mutex> lk(g_show_surface_mutex);
+  return g_show_surface_spec;
+}
+
+void SetShowSurfaceSpec(const char* spec) {
+  std::lock_guard<std::mutex> lk(g_show_surface_mutex);
+  g_show_surface_spec = (spec != nullptr) ? spec : "";
+}
+
+// The old shape, kept because a dozen call sites test it for null. The buffer is
+// thread-local so the pointer stays valid for the caller's statement.
+const char* ShowSurfaceSpec() {
+  thread_local std::string held;
+  held = ShowSurfaceSpecCopy();
+  return held.empty() ? nullptr : held.c_str();
 }
 
 bool NameContainsNoCase(const char* haystack, const char* needle) {
@@ -3045,18 +3293,31 @@ bool BackbufferPrioEnabled() {
 // DPOUR_NR_DRAW_AMPLIFY=N - multiply the composited colour by N. Separates a
 // scene that is written far too dark (an EDRAM exponent-bias scale problem)
 // from one that was never written at all; the second shows up as magenta.
+std::atomic<float> g_amplify{0.0f};
+}  // namespace (header-declared pair below)
+
 float AmplifyFactor() {
-  static const float f = [] {
+  static const bool seeded = [] {
     const char* v = std::getenv("DPOUR_NR_DRAW_AMPLIFY");
     const double parsed = (v != nullptr) ? std::atof(v) : 0.0;
     // A negative value selects the classify mode in the composite shader.
-    if (parsed < 0.0) {
-      return -1.0f;
-    }
-    return (parsed > 0.0 && parsed < 4096.0) ? static_cast<float>(parsed) : 0.0f;
+    g_amplify.store(parsed < 0.0                              ? -1.0f
+                    : (parsed > 0.0 && parsed < 4096.0) ? static_cast<float>(parsed)
+                                                        : 0.0f,
+                    std::memory_order_relaxed);
+    return true;
   }();
-  return f;
+  (void)seeded;
+  return g_amplify.load(std::memory_order_relaxed);
 }
+
+void SetAmplifyFactor(float f) {
+  AmplifyFactor();  // make sure the environment seed has already happened
+  g_amplify.store((f < 0.0f) ? -1.0f : ((f > 0.0f && f < 4096.0f) ? f : 0.0f),
+                  std::memory_order_relaxed);
+}
+
+namespace {
 }  // namespace
 
 void BeginFrame() {
@@ -3075,8 +3336,16 @@ void BeginFrame() {
       rex::graphics::SetNativeGuestOutputRenderer(&GuestOutputRenderCallback, nullptr);
       REXLOG_INFO("[native-scene] guest-output renderer registered (draw path {})",
                   Enabled() ? "on" : "off");
+      // The F3 panel goes on the SAME gate, and for the same reason. It first
+      // hung off the present hook, which reads DPOUR_NR - a different variable
+      // from the DPOUR_NR_DRAW every run of this path actually sets - so the
+      // section was never registered and the overlay had nothing extra in it.
+      // Here it follows the renderer itself.
+      RegisterDebugPanel();
     }
   }
+  // Both faces of those knobs, reconciled before anything reads them.
+  SyncDebugKnobs();
   if (!Enabled()) {
     return;
   }
@@ -3092,6 +3361,7 @@ void BeginFrame() {
   std::lock_guard<std::mutex> lock(g_mutex);
   g_staging.clear();
   g_resolve_staging.clear();
+  g_array_resolve_staging.clear();
   g_clear_staging.clear();
   // The render target does not change just because a frame ended, so the pass
   // that was current carries over as slot 0 with a fresh count. Resetting the
@@ -3157,6 +3427,7 @@ void EndFrame() {
   g_vs_cb_cached = kNoStage;  // nothing staged in the fresh arena yet
   g_ps_cb_cached = kNoStage;
   g_resolve_published = g_resolve_staging;
+  g_array_resolves = g_array_resolve_staging;
   g_clear_published = g_clear_staging;
   std::memcpy(g_published_passes, g_passes, sizeof(g_published_passes));
   g_published_pass = best;
@@ -3388,7 +3659,84 @@ bool OnResolveScene(const std::uint8_t* base, std::uint32_t surface_ref,
     rhi_tex = ReadGuestPtr(base, surface_ref + 4);
   }
   if (rhi_tex == 0) {
-    return false;  // depth or cube resolve: no 2D destination
+    // === DPOUR MIGRATION 2026-07-29: THE ARRAY DESTINATION ====================
+    //
+    // Returning here is what painted the screen white, and it took the whole
+    // frame with it because of ONE line in the game's final shader:
+    //
+    //   GammaColor = ColorLookupTable(GammaColor);
+    //     (OurUberPostProcessPixelShader.usf:138 - an ASSIGNMENT, not a blend)
+    //
+    // and on Xbox ColorLookupTable is nothing but tex3D(ColorGradingLUT, ...).
+    // The final colour of every pixel IS a lookup, so whatever that sampler
+    // holds is the frame. Ours held the 1x1 white texture ServeWhite hands back
+    // when it cannot decode, which makes tex3D return (1,1,1) everywhere. The
+    // scene behind it was correct the whole time.
+    //
+    // It could not be decoded because we never linked it, and we never linked it
+    // because the colour-grading LUT does not resolve like anything else:
+    //
+    //   for(UINT Slice = 0; Slice < 16; ++Slice) {
+    //     FResolveParams Param(RenderTargets[LUTBlend].TextureArray, Slice,
+    //                          Slice*32, 0, Slice*32+16, 16);
+    //     RHICopyToResolveTarget(GetLUTBlendSurface(), FALSE, Param);
+    //   }                          (SceneRenderTargets.cpp:388-394)
+    //
+    // That constructor leaves ResolveTarget at 0 and puts the destination in a
+    // SEPARATE field - FResolveParams on Xbox is CubeFace +0 (carrying the SLICE
+    // INDEX here), X1 +4, Y1 +8, X2 +12, Y2 +16, ResolveTarget +20, ArrayTarget
+    // +24 (RHI.h:630-647). We read only +20. And the usual fallback is dead too:
+    // the LUTBlend surface is created with NO resolve texture at all
+    // (SceneRenderTargets.cpp:1095 passes 0), so surface_ref+4 is 0 as well.
+    const std::uint32_t rhi_array =
+        resolve_params != 0 ? ReadGuestPtr(base, resolve_params + 24) : 0;
+    if (rhi_array == 0 || !LutResolveEnabled()) {
+      return false;  // a depth or cube resolve, or the LUT path is gated off
+    }
+    const std::uint32_t array_d3d = ReadGuestPtr(base, rhi_array + 8);
+    if (array_d3d == 0 || !ResolveCopyEnabled()) {
+      return false;
+    }
+    // CubeFace at +0 doubles as the slice index for an array target - the
+    // constructor takes InSlice and stores it there (RHI.h:642-647). The rect is
+    // in texels and already aligned by the caller; RHICopyToResolveTarget only
+    // re-aligns the SIZE for non-array targets (:426-431), so it is taken as is.
+    std::int32_t slice = 0, x1 = 0, y1 = 0, x2 = 0, y2 = 0;
+    if (ObjectReadable(base, resolve_params, 20)) {
+      slice = static_cast<std::int32_t>(LoadBE32(base + resolve_params + 0));
+      x1 = static_cast<std::int32_t>(LoadBE32(base + resolve_params + 4));
+      y1 = static_cast<std::int32_t>(LoadBE32(base + resolve_params + 8));
+      x2 = static_cast<std::int32_t>(LoadBE32(base + resolve_params + 12));
+      y2 = static_cast<std::int32_t>(LoadBE32(base + resolve_params + 16));
+    }
+    if (slice < 0 || slice >= 64 || x2 <= x1 || y2 <= y1) {
+      return false;
+    }
+    {
+      std::lock_guard<std::mutex> dl(g_mutex);
+      if (g_array_resolve_staging.size() < 64) {
+        g_array_resolve_staging.push_back(PendingArrayResolve{
+            array_d3d, CanonicalSurface(surface_object), static_cast<std::uint32_t>(slice),
+            static_cast<std::uint32_t>(x1), static_cast<std::uint32_t>(y1),
+            static_cast<std::uint32_t>(x2 - x1), static_cast<std::uint32_t>(y2 - y1),
+            static_cast<std::uint32_t>(g_staging.size())});
+      }
+    }
+    // The link is what stops the sampler falling through to the white fallback.
+    {
+      std::lock_guard<std::mutex> lk(g_reg_mutex);
+      g_texture_link[array_d3d] = CanonicalSurface(surface_object);
+    }
+    static std::uint32_t announced = 0;
+    if (announced < 4) {
+      ++announced;
+      dpour_surfaces::Surface s;
+      REXLOG_INFO("[native-scene] array resolve: \"{}\" surface {:#x} slice {} rect {},{} {}x{} "
+                  "-> array {:#x}",
+                  dpour_surfaces::Find(surface_object, s) ? s.name : "?", surface_object, slice, x1,
+                  y1, x2 - x1, y2 - y1, array_d3d);
+    }
+    return false;  // handled as an array; not an ordinary 2D resolve
   }
   const std::uint32_t d3d_tex = ReadGuestPtr(base, rhi_tex + 8);
   if (d3d_tex == 0) {
@@ -4914,10 +5262,12 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   PassSlot passes_snap[kMaxPasses];
   std::uint64_t items_frame = 0;
   static thread_local std::vector<PendingClear> clears;
+  static thread_local std::vector<PendingArrayResolve> array_resolves;
   {
     std::lock_guard<std::mutex> lock(g_mutex);
     items = g_published;
     resolves = g_resolve_published;
+    array_resolves = g_array_resolves;
     clears = g_clear_published;
     arena = &g_arenas[g_published_arena_index];
     std::memcpy(passes_snap, g_published_passes, sizeof(passes_snap));
@@ -5531,6 +5881,7 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   // the whole reason a resolve exists and the reason an end-of-frame copy would
   // be wrong.
   std::size_t resolve_next = 0;
+  std::size_t array_next = 0;
   std::uint32_t resolves_run = 0;
   const auto run_resolves_upto = [&](std::uint32_t draw_index) {
     if (!ResolveCopyEnabled()) {
@@ -5646,8 +5997,9 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
       // shares. With PSR_ColorBiasFactor forced to 1 instead, nothing multiplied,
       // so there is nothing to undo.
       const float scale = KeepColorBias() ? pr.scale : 1.0f;
-      const float consts[4] = {scale, 0.0f, 0.0f, 0.0f};
-      dl->D3DSetGraphicsRoot32BitConstants(1, 4, consts, 0);
+      // Zero size = the whole surface, which is every ordinary resolve.
+      const float consts[8] = {scale, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+      dl->D3DSetGraphicsRoot32BitConstants(1, 8, consts, 0);
       dl->D3DSetPipelineState(g_resolve_pso.Get());
       const D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(dst->w), static_cast<float>(dst->h),
                               0.0f, 1.0f};
@@ -5667,6 +6019,87 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
       // Hand the list back to the game's own pipeline. Setting a root signature
       // drops every root argument with it, so the next draw has to re-bind the
       // target, the PSO and the topology as if nothing were current.
+      dl->D3DSetGraphicsRootSignature(dpour_pipeline::RootSignature());
+      dpour_pipeline::BindDescriptorTables(dl, dpour_tex::GpuHandleStart());
+      last_pso = nullptr;
+      last_topology = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+      last_vs_cb = 0;
+      last_ps_cb = 0;
+      last_sh_cb = 0;
+      last_vbv_count = 0;
+      last_ibv = D3D12_INDEX_BUFFER_VIEW{};
+      current_pass = 0xFFFFFFFFu;
+    }
+
+    // THE ARRAY RESOLVES, at their own positions in the same stream. Same shape
+    // as above, three differences: the destination is one W-slice of a volume,
+    // the source is a RECT of the surface rather than all of it, and there is no
+    // exponent bias to undo (the LUT surface's is 0).
+    while (LutResolveEnabled() && array_next < array_resolves.size() &&
+           array_resolves[array_next].draw_index <= draw_index) {
+      const PendingArrayResolve ar = array_resolves[array_next++];
+      const auto asrc_it = g_reg_targets.find(ar.surface);
+      if (asrc_it == g_reg_targets.end() ||
+          asrc_it->second.srv_slot == dpour_tex::kInvalidSlot) {
+        continue;
+      }
+      NativeTarget& asrc = asrc_it->second;
+      if (!EnsureResolvePipeline(device)) {
+        return;
+      }
+      // The volume is square in its slice count: sixteen 16x16 slices for a
+      // 16x16x16 LUT, which is what the rect size says.
+      LutTexture* lut = EnsureLutTexture(device, ar.array_object, ar.w, ar.h, ar.h);
+      if (lut == nullptr || ar.slice >= lut->size) {
+        continue;
+      }
+      if (current_reg == &asrc) {
+        close_current();
+        current_pass = 0xFFFFFFFFu;
+      }
+      transition_target(asrc, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      D3D12_RESOURCE_BARRIER lut_to_rt{};
+      lut_to_rt.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+      lut_to_rt.Transition.pResource = lut->tex.Get();
+      lut_to_rt.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+      lut_to_rt.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+      lut_to_rt.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+      dl->D3DResourceBarrier(1, &lut_to_rt);
+
+      const std::uint32_t lstride =
+          device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+      D3D12_CPU_DESCRIPTOR_HANDLE lrtv = g_resolve_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+      lrtv.ptr += static_cast<std::size_t>(lut->rtv_base + ar.slice) * lstride;
+      dl->D3DOMSetRenderTargets(1, &lrtv, FALSE, nullptr);
+      dl->D3DSetGraphicsRootSignature(g_resolve_root.Get());
+      D3D12_GPU_DESCRIPTOR_HANDLE lsrc{};
+      lsrc.ptr = dpour_tex::GpuHandleAt(asrc.srv_slot);
+      dl->D3DSetGraphicsRootDescriptorTable(0, lsrc);
+      const float lconsts[8] = {1.0f,
+                                0.0f,
+                                0.0f,
+                                0.0f,
+                                static_cast<float>(ar.x),
+                                static_cast<float>(ar.y),
+                                static_cast<float>(ar.w),
+                                static_cast<float>(ar.h)};
+      dl->D3DSetGraphicsRoot32BitConstants(1, 8, lconsts, 0);
+      dl->D3DSetPipelineState(g_resolve_pso.Get());
+      const D3D12_VIEWPORT lvp{0.0f, 0.0f, static_cast<float>(ar.w), static_cast<float>(ar.h),
+                               0.0f, 1.0f};
+      const D3D12_RECT lsc{0, 0, static_cast<LONG>(ar.w), static_cast<LONG>(ar.h)};
+      dl->RSSetViewport(lvp);
+      dl->RSSetScissorRect(lsc);
+      dl->D3DIASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+      dl->D3DIASetVertexBuffers(0, 0, nullptr);
+      dl->D3DIASetIndexBuffer(nullptr);
+      dl->D3DDrawInstanced(3, 1, 0, 0);
+
+      D3D12_RESOURCE_BARRIER lut_back = lut_to_rt;
+      lut_back.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+      lut_back.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+      dl->D3DResourceBarrier(1, &lut_back);
+      ++resolves_run;
       dl->D3DSetGraphicsRootSignature(dpour_pipeline::RootSignature());
       dpour_pipeline::BindDescriptorTables(dl, dpour_tex::GpuHandleStart());
       last_pso = nullptr;

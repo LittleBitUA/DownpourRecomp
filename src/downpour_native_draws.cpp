@@ -33,6 +33,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <unordered_map>
 
 #include <rex/hook.h>     // REX_HOOK_RAW, REX_EXTERN, PPCContext
 #include <rex/logging.h>  // REXLOG_INFO
@@ -1030,9 +1032,28 @@ REX_HOOK_RAW(sub_829CDDC0) {
       std::memcpy(&v, base + ref, 4);
       surface_object = _byteswap_ulong(v);
     }
-    // r5 = const FResolveParams& - the explicit destination override, which the
-    // RHI consults BEFORE the surface's own resolve texture.
-    replaced = dpour_scene::OnResolveScene(base, ref, surface_object, ctx.r5.u32);
+    // === DPOUR MIGRATION 2026-07-29: r4, NOT r5 ==============================
+    //
+    // const FResolveParams& is the THIRD parameter in the C++ signature, so this
+    // hook took it from r5 and had done since it was written. r5 measured 0, 2
+    // and 4 - small integers, never a pointer - which meant the explicit
+    // destination override was never once read correctly, and the whole array
+    // branch (the colour-grading LUT) could not exist.
+    //
+    // r4 is the pointer, proven twice over by what it points AT rather than by
+    // any argument about the ABI:
+    //
+    //   ordinary resolve   *r4 = [0, -1, -1, -1, -1, 0, 0]
+    //                      a default-constructed FResolveParams, exactly
+    //   LUTBlend slice 0   *r4 = [0, 0, 0, 0x10, 0x10, 0, 0x411e1410]
+    //                      CubeFace=slice, X1=0, Y1=0, X2=16, Y2=16,
+    //                      ResolveTarget=0, ArrayTarget=the texture array
+    //
+    // and the second is character-for-character the call the engine makes,
+    // FResolveParams(TextureArray, Slice, Slice*32, 0, Slice*32+16, 16)
+    // (SceneRenderTargets.cpp:391). The field layout in RHI.h was right all
+    // along; only the base was wrong.
+    replaced = dpour_scene::OnResolveScene(base, ref, surface_object, ctx.r4.u32);
   }
   if (HooksEnabled()) {
     static std::atomic<std::uint64_t> _cnt{0};

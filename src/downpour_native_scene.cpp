@@ -574,9 +574,10 @@ constexpr std::uint32_t kBackbufferKey = 0xB0BACBADu;
 // host buffer, and then discarded because it belonged to the wrong pass. That is
 // roughly ten times the work for the same picture, and it showed: gameplay ran
 // at 10 FPS with nothing drawn at all.
-std::uint32_t g_target_color = 0;
-std::uint32_t g_target_depth = 0;
-bool g_have_target = false;
+// (g_target_color / g_target_depth / g_have_target stood here: the winning
+// pass's surfaces, published every frame and read by nothing. They were the
+// handles the old single-scene-target design switched on. Every draw now goes to
+// its own surface's target, so "which pair is THE target" has no consumer left.)
 // The depth surface the world's BASE pass targets, learned from the first
 // shaded world draw. It is what separates the camera depth prepass (same
 // surface, belongs in our scene) from a shadow-depth pass (different surface,
@@ -2924,9 +2925,6 @@ void EndFrame() {
   g_published_frame = g_frame.load(std::memory_order_relaxed);
   g_published_w.store(g_passes[best].view_w, std::memory_order_relaxed);
   g_published_h.store(g_passes[best].view_h, std::memory_order_relaxed);
-  g_target_color = g_passes[best].color;
-  g_target_depth = g_passes[best].depth;
-  g_have_target = true;
 }
 
 void SetRenderTarget(std::uint32_t color_guest, std::uint32_t depth_guest,

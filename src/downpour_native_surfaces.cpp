@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <set>
+#include <string>
 #include <unordered_map>
 
 #include <rex/logging.h>
@@ -32,6 +34,9 @@ std::unordered_map<std::uint32_t, Surface> g_surfaces;
 std::uint32_t g_family_primary = 0;
 std::uint32_t g_screen_w = 1280;
 std::uint32_t g_screen_h = 720;
+// "SurfaceA|SurfaceB" pairs already reported as overlapping, so the log carries
+// each distinct collision once instead of once per object.
+std::set<std::string> g_reported_pairs;
 
 bool NameIs(const char* a, const char* b) { return _stricmp(a, b) == 0; }
 
@@ -154,17 +159,31 @@ std::uint32_t EdramOffset(const char* name, std::uint32_t tiles) {
 //   A16B16G16R16_EDRAM -> A16B16G16R16       : 5
 //   anything else                            : 0
 //
-// PF_FloatRGB is therefore ambiguous from here: DefaultColor and
-// DefaultColorFixedPoint are both created with it and differ only in the texture
-// they resolve into (SceneRenderTargets.cpp:1041 vs :1052). The authoritative
-// value is the one the game itself computed and stored in FXeSurfaceInfo at +20.
+// so only the formats that CANNOT reach a biased branch answer it here.
+//
+// PF_FloatRGB is ambiguous: DefaultColor and DefaultColorFixedPoint are both
+// created with it and differ only in the texture they resolve into
+// (SceneRenderTargets.cpp:1041 vs :1052) - 3 and 5.
+//
+// PF_A16B16G16R16 is ambiguous for the same reason, which THIS CROSS-CHECK
+// FOUND, 29.07: it warned on TranslucencyBuffer, where the game had stored 0 and
+// the table said 5. The game was right. Its surface format is PF_A16B16G16R16
+// but its texture is PF_FloatRGBA (SceneRenderTargets.cpp:1148-1150), i.e.
+// A16B16G16R16F, and the branch wants the fixed-point A16B16G16R16 - which
+// FilterColor does use, and which correctly reads 5. The surface format alone
+// never decided this one; assuming it did was the bug.
+//
+// The authoritative value is always the one the game itself computed and stored
+// in FXeSurfaceInfo at +20. This function exists only to say when our reading of
+// that struct has drifted, so it must stay silent wherever it cannot be certain.
 std::int32_t ExpectedBias(std::uint32_t pixel_format) {
   switch (pixel_format) {
-    case kPF_FloatRGB:
-      return -1;  // 3 or 5, decided by the resolve texture
-    case kPF_A16B16G16R16:
-      return 5;
+    case kPF_FloatRGB:        // 3 into a float texture, 5 into a fixed-point one
+    case kPF_A16B16G16R16:    // 5 into A16B16G16R16, 0 into A16B16G16R16F
+      return -1;
     default:
+      // Every remaining format misses all three branches of
+      // XeGetRenderTargetColorExpBias whatever it resolves into.
       return 0;
   }
 }
@@ -180,6 +199,7 @@ bool Overlaps(const Surface& a, const Surface& b) {
 void Reset() {
   std::lock_guard<std::mutex> lk(g_mutex);
   g_surfaces.clear();
+  g_reported_pairs.clear();
   g_family_primary = 0;
 }
 
@@ -235,19 +255,29 @@ bool Register(std::uint32_t object, const char* name, std::uint32_t w, std::uint
               s.name, object, w, h, pixel_format, s.edram_offset, s.edram_offset + s.edram_size,
               s.edram_size, s.expected_bias, s.group);
 
-  // Name the collisions once, so that a surface pair the game reuses in a way
-  // this layer did not expect shows up as a line here instead of as a wrong
-  // picture three passes later. Overlap is NORMAL - the layout is built out of
-  // it - so this is INFO, and only against surfaces of the other kind.
+  // Name the collisions, so that a surface pair the game reuses in a way this
+  // layer did not expect shows up as a line here instead of as a wrong picture
+  // three passes later. Overlap is NORMAL - the layout is built out of it - so
+  // this is INFO.
+  //
+  // ONCE PER PAIR OF NAMES. Measured on the first run: 780 lines, almost all of
+  // them AuxColor against another AuxColor, because the game creates about
+  // twenty of those at different sizes and every one collided with every
+  // earlier one. Same name is the same buffer used again at another size, which
+  // is not the finding; a DIFFERENT name on the same tiles is.
   for (const auto& [other_obj, other] : g_surfaces) {
-    if (other_obj == object || other.is_depth != s.is_depth || other.group == s.group) {
+    if (other_obj == object || other.is_depth != s.is_depth || other.group == s.group ||
+        NameIs(other.name, s.name) || !Overlaps(s, other)) {
       continue;
     }
-    if (Overlaps(s, other)) {
-      REXLOG_INFO("[surfaces]   overlaps \"{}\" {:#x} [{}..{}) - separate targets here; the "
-                  "engine moves content between them itself",
-                  other.name, other_obj, other.edram_offset, other.edram_offset + other.edram_size);
+    char pair[72];
+    std::snprintf(pair, sizeof(pair), "%s|%s", s.name, other.name);
+    if (!g_reported_pairs.insert(pair).second) {
+      continue;
     }
+    REXLOG_INFO("[surfaces]   overlaps \"{}\" {:#x} [{}..{}) - separate targets here; the "
+                "engine moves content between them itself",
+                other.name, other_obj, other.edram_offset, other.edram_offset + other.edram_size);
   }
   return true;
 }

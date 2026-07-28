@@ -41,6 +41,9 @@ if(NOT DPOUR_NO_NATIVE_RENDER)
     src/downpour_native_geo.cpp
     # Phase 4: decode the game's Xenos textures into native D3D12 textures.
     src/downpour_native_tex.cpp
+    # The surface / EDRAM / resolve layer, transcribed from the game's own
+    # renderer (XeD3DRenderTarget.cpp + SceneRenderTargets.cpp).
+    src/downpour_native_surfaces.cpp
     # Phase 5: read the game's vertex declarations so every vertex factory
     # (BSP, terrain, foliage, decals) is captured, not just static meshes.
     src/downpour_native_decl.cpp

@@ -38,6 +38,7 @@
 #include "downpour_native_pipeline.h"
 #include "downpour_native_shaders.h"
 #include "downpour_native_state.h"
+#include "downpour_native_surfaces.h"  // the game's own EDRAM / bias tables
 #include "downpour_native_tex.h"
 #include "downpour_native_ue3.h"  // the engine's own per-mesh verdict
 #include "downpour_native_vbuffers.h"
@@ -472,6 +473,12 @@ struct PendingResolve {
   std::uint32_t d3d_tex = 0;     // destination D3D texture object (link key)
   std::int32_t bias = 0;         // XeSurfaceInfo.ColorExpBias
   std::uint32_t draw_index = 0;  // how many draws had been staged when it fired
+  // The scale the copy applies, 2^-bias folded with the console's own sample-time
+  // multiply (see TextureExpAdjust). Computed where the resolving SURFACE is
+  // still known: `surface` above is its registry key, which for the DefaultColor
+  // family is the primary's, and the family's three members disagree on the
+  // divisor by design - 8, 1 and 32, measured 28.07.
+  float scale = 1.0f;
 };
 
 // The game's own Clear, captured as a stream item - RenderCommandType::Clear in
@@ -597,10 +604,9 @@ std::atomic<std::uint64_t> g_scene_depth_writes{0};
 // ("DefaultColor" plus its Raw / FixedPoint aliases over the same EDRAM) and
 // scene depth ("DefaultDepth") - from the RHICreateTargetableSurface hook.
 // Binding any colour alias IS the start of the scene on Downpour's non-tiling
-// path. Aliases are few and fixed; recreation (video mode change) just
-// re-fills the same slots.
-constexpr std::uint32_t kMaxSceneAliases = 4;
-std::atomic<std::uint32_t> g_scene_color_aliases[kMaxSceneAliases]{};
+// path. The family itself lives in dpour_surfaces, which decides membership at
+// creation from the engine's own allocation; what is kept here is only the most
+// recently bound member, which is what the scene pass keys on.
 std::atomic<std::uint32_t> g_scene_color_surface{0};
 std::atomic<std::uint32_t> g_scene_depth_surface{0};
 // The FXeTexture2D the "DefaultColor" surface resolves into (creation arg).
@@ -789,19 +795,20 @@ struct ResolveTexture {
 };
 std::unordered_map<std::uint32_t, ResolveTexture> g_resolve_textures;  // render thread only
 std::unordered_map<std::uint32_t, std::uint32_t> g_resolve_srv;  // d3d tex -> srv (g_reg_mutex)
-// WHEN each of those was last actually written by us, in guest frames. A slot
-// that exists is not a slot that holds this frame's content: the ghost of the
-// loading screen in the menu was a texture whose copy stopped being refreshed
-// three states ago and kept being served anyway. Both maps live under
-// g_reg_mutex; the helpers below assume the caller already holds it.
-std::unordered_map<std::uint32_t, std::uint64_t> g_resolve_copy_frame;  // d3d tex -> guest frame
-std::unordered_map<std::uint32_t, std::uint64_t> g_surface_drawn_frame;  // surface -> guest frame
 extern std::atomic<std::uint64_t> g_frame;
-// Three guest frames of slack, not one: capture runs a frame ahead of the replay
-// that makes the copy, and a loading stall replays one published snapshot for a
-// while. Two would be the tight bound; the third is there so a hitch does not
-// flicker the picture between native and decoded.
-constexpr std::uint64_t kFreshFrames = 3;
+// === DPOUR MIGRATION 2026-07-29: the freshness gates are gone ================
+//
+// They asked "was this copy refreshed recently enough to serve?" and the answer
+// was always yes: the gate shipped default-off after it turned the menu white,
+// so FrameIsFresh returned true unconditionally in every build since. Deleting
+// it changes nothing that runs.
+//
+// It should never have been a question in the first place. The reference does
+// not date its copies, and now that the game's own protocol is what moves
+// content - a resolve out and a full-screen quad back in, at the engine's own
+// call sites (SceneRenderTargets.cpp:494-523) - a copy is refreshed exactly when
+// the game refreshes it. Staleness was a symptom of copies that were not
+// happening, and the fix for that was to make them happen.
 
 // DEFAULT OFF - it made the menu WHITE, which is worse than the ghost it was
 // meant to remove. Measured 2026-07-26, reverted the same minute.
@@ -823,10 +830,6 @@ bool AliasKeyOn() {
   return on;
 }
 
-bool FreshGateOff() {
-  static const bool on = EnvOn("DPOUR_NR_FRESH_GATE");
-  return !on;
-}
 
 // DPOUR_NR_FLAT=1 - THE skate3 MODEL. Stop reproducing the game's frame graph.
 //
@@ -919,19 +922,8 @@ bool EdramAliasOn() {
 // RHICreateTargetableSurface, which the create hook records - not by size, not
 // by draw count.
 bool IsSceneColorSurface(std::uint32_t surface) {
-  if (surface == 0) {
-    return false;
-  }
-  for (const auto& slot : g_scene_color_aliases) {
-    const std::uint32_t cur = slot.load(std::memory_order_relaxed);
-    if (cur == 0) {
-      return false;
-    }
-    if (cur == surface) {
-      return true;
-    }
-  }
-  return false;
+  const std::uint32_t primary = dpour_surfaces::FamilyPrimary();
+  return surface != 0 && primary != 0 && dpour_surfaces::GroupOf(surface) == primary;
 }
 
 // DPOUR_NR_OWN_DEVICE=1. THE UNLEASHED/MARATHON ARRANGEMENT: we own the device,
@@ -1036,41 +1028,21 @@ bool YieldWithoutSceneOn() {
 }
 
 // The surface the registry should key on: for a DefaultColor family member, the
-// primary (slot 0); for anything else, itself.
+// primary; for anything else, itself.
+//
+// The answer now comes from the surface layer, which decides it at creation from
+// the engine's own allocation (SceneRenderTargets.cpp:1038-1053 - three
+// RHICreateSharedTexture2D views of one SceneColorMemoryBuffer) instead of from
+// a four-slot alias array filled by name prefix. Same answer for this game, but
+// it is now a recorded property of each surface rather than a search, and a
+// surface created after the array filled up can no longer fall out of the family.
 std::uint32_t CanonicalSurface(std::uint32_t surface) {
   if (!EdramAliasOn() || surface == 0) {
     return surface;
   }
-  const std::uint32_t primary = g_scene_color_aliases[0].load(std::memory_order_relaxed);
-  if (primary == 0 || primary == surface) {
-    return surface;
-  }
-  for (std::uint32_t i = 1; i < kMaxSceneAliases; ++i) {
-    const std::uint32_t cur = g_scene_color_aliases[i].load(std::memory_order_relaxed);
-    if (cur == 0) {
-      break;
-    }
-    if (cur == surface) {
-      return primary;
-    }
-  }
-  return surface;
+  return dpour_surfaces::GroupOf(surface);
 }
 
-bool FrameIsFresh(const std::unordered_map<std::uint32_t, std::uint64_t>& when, std::uint32_t key) {
-  if (FreshGateOff()) {
-    return true;
-  }
-  const auto it = when.find(key);
-  if (it == when.end()) {
-    return false;
-  }
-  const std::uint64_t now = g_frame.load(std::memory_order_relaxed);
-  return now <= it->second + kFreshFrames;
-}
-
-bool CopyIsFresh(std::uint32_t d3d_tex) { return FrameIsFresh(g_resolve_copy_frame, d3d_tex); }
-bool SurfaceIsFresh(std::uint32_t surface) { return FrameIsFresh(g_surface_drawn_frame, surface); }
 ComPtr<ID3D12DescriptorHeap> g_resolve_rtv_heap;
 std::uint32_t g_resolve_rtv_next = 0;
 constexpr std::uint32_t kResolveMaxTextures = 32;
@@ -2175,9 +2147,63 @@ bool ResolveCopyEnabled() {
 // scaling too and the whole chain is consistent with itself. What it replaces:
 // half the resolve copies were not happening (7 of 17 in the last run), so half
 // the samples stayed 8x too bright - which is the white screen.
+//
+// === DPOUR MIGRATION 2026-07-29: THE CHAIN IS NOT OURS TO CLOSE ==============
+//
+// It is consistent with itself and NOT with the game, and the game's own source
+// says where it breaks. c0 is not the only place the bias reaches a shader: the
+// engine also computes bias-derived scalars on the CPU and pushes them into
+// ordinary material constants we never see -
+//
+//   const FLOAT SceneColorScale = appPow(2.0f, GCurrentColorExpBias);
+//   SetPixelShaderValue(..., EmissiveAlphaMaskScale,
+//                       bSceneColorTextureIsRaw ? 1.0f : SceneColorScale);
+//     (ShadowRendering.h:880-882, and again BranchingPCFShadowRendering.h:673-675)
+//
+// and the shader multiplies a sampled scene value by it outright
+// ("scale by EmissiveAlphaMaskScale is needed to convert to unit range",
+// ModShadowCommon.usf:75-76). Zeroing our half of the pair leaves that half at 8.
+//
+// The reason the workaround was needed has also gone: "half the resolve copies
+// were not happening" was a missing-copy problem, and the divisor is now taken
+// from the surface being resolved rather than from the family it belongs to
+// (see the resolve below), which is what the game does - the multiply on write
+// and the divide on resolve are the same surface's bias by construction
+// (XeD3DCommands.cpp:714 and XeD3DRenderTarget.cpp:519).
+//
+// Implied by own-device for that reason. The environment variable still forces
+// it on outside that mode.
 bool KeepColorBias() {
-  static const bool on = EnvOn("DPOUR_NR_KEEP_COLOR_BIAS");
+  static const bool on = EnvOn("DPOUR_NR_KEEP_COLOR_BIAS") || OwnDeviceMode();
   return on;
+}
+
+// The multiply the CONSOLE applies at sample time, which no shader asks for and
+// no constant carries: XeGetTextureExpBias (XeD3DRenderTarget.cpp:117) returns 2
+// when a A2B10G10R10F_EDRAM surface resolves into a A2B10G10R10 texture, and
+// RHICopyToResolveTarget writes it straight into the texture header on the line
+// after the resolve - `D3DTexture2D->Format.ExpAdjust = ...` (:537). The GPU then
+// scales every fetch from that texture by 2^ExpAdjust.
+//
+// That is the DefaultColorFixedPoint path and only it: surface PF_FloatRGB into
+// SceneColorRaw's fixed-point texture (SceneRenderTargets.cpp:1052-1053), which
+// is also the only PF_FloatRGB surface whose bias is 5. The two together are the
+// point - resolve divides by 32, the fetch multiplies by 4, and the net 1/8 is
+// the same scene the ordinary path resolves. Applying the divide without the
+// multiply leaves that path eight times too dark.
+//
+// We have no texture header to write, so it folds into the copy's scale, which
+// is the same arithmetic one step earlier.
+std::int32_t TextureExpAdjust(std::uint32_t surface_object, std::int32_t bias) {
+  if (bias != 5) {
+    return 0;
+  }
+  dpour_surfaces::Surface s;
+  if (!dpour_surfaces::Find(surface_object, s)) {
+    return 0;
+  }
+  // PF_A16B16G16R16 surfaces are the other bias-5 case and take no adjustment.
+  return s.pixel_format == dpour_surfaces::kPF_FloatRGB ? 2 : 0;
 }
 
 // DPOUR_NR_PS_C0 - the value written into PSR_ColorBiasFactor.x when the bias is
@@ -3241,36 +3267,47 @@ bool OnResolveScene(const std::uint8_t* base, std::uint32_t surface_ref,
       bias = 0;
     }
     // WHOSE BIAS, AND WHOSE TARGET. The copy divides by 2^-bias read from the
-    // surface being resolved, but it writes the CANONICAL surface's target -
+    // surface being resolved, and it writes the CANONICAL surface's target -
     // and the DefaultColor family aliases one EDRAM range through three
     // surfaces of different formats, which is exactly what
-    // XeGetRenderTargetColorExpBias keys on (XeD3DRenderTarget.cpp:94). If the
-    // three disagree, some content is divided by an exponent it was never
-    // multiplied by. One line per distinct surface, ever - enough to see
-    // whether the family agrees.
+    // XeGetRenderTargetColorExpBias keys on (XeD3DRenderTarget.cpp:94). That the
+    // three disagree is CORRECT and deliberate, measured 28.07 as 3 / 0 / 5:
+    // DefaultColor resolves the scene back to linear, DefaultColorRaw keeps the
+    // biased bits on purpose ("the raw bits ... without any format conversion",
+    // SceneRenderTargets.cpp:1044), DefaultColorFixedPoint divides by 32 because
+    // the console multiplies by 4 again at fetch. So the divisor belongs to the
+    // surface, never to the family - which is why it is computed HERE, where the
+    // surface is still known, and carried rather than re-derived from the key.
+    const std::int32_t exp_adjust = TextureExpAdjust(surface_object, bias);
+    const float scale = std::ldexp(1.0f, -bias + exp_adjust);
+    // The struct read above is a guess about a layout; the surface layer knows
+    // what the game's own table would have produced. Where they disagree, one of
+    // the two is wrong and it matters - say so once per surface rather than
+    // divide a whole pass by the wrong power of two in silence.
     {
       static std::unordered_map<std::uint32_t, std::int32_t> seen;
       const auto prev = seen.find(surface_object);
       if (prev == seen.end() || prev->second != bias) {
         seen[surface_object] = bias;
-        char nm[24] = "?";
-        {
-          std::lock_guard<std::mutex> lk(g_reg_mutex);
-          const auto meta = g_surface_meta.find(surface_object);
-          if (meta != g_surface_meta.end() && meta->second.name[0] != '\0') {
-            std::snprintf(nm, sizeof(nm), "%s", meta->second.name);
-          }
-        }
+        dpour_surfaces::Surface s;
+        const bool known = dpour_surfaces::Find(surface_object, s);
         REXLOG_INFO("[native-scene] resolve bias: \"{}\" surface {:#x} -> canonical {:#x}, "
-                    "ColorExpBias {} (divide by {})",
-                    nm, surface_object, CanonicalSurface(surface_object), bias,
-                    std::ldexp(1.0f, bias));
+                    "ColorExpBias {}, fetch exp {} => scale {}",
+                    known ? s.name : "?", surface_object, CanonicalSurface(surface_object), bias,
+                    exp_adjust, scale);
+        if (known && s.expected_bias >= 0 && s.expected_bias != bias) {
+          REXLOG_WARN("[native-scene] resolve bias DISAGREES with the game's own table for "
+                      "\"{}\": read {} from FXeSurfaceInfo+20, XeGetRenderTargetColorExpBias "
+                      "says {} for pf={} - one of the two is wrong",
+                      s.name, bias, s.expected_bias, s.pixel_format);
+        }
       }
     }
     std::lock_guard<std::mutex> dl(g_mutex);
     if (g_resolve_staging.size() < 64) {
       g_resolve_staging.push_back(PendingResolve{CanonicalSurface(surface_object), alias, bias,
-                                                 static_cast<std::uint32_t>(g_staging.size())});
+                                                 static_cast<std::uint32_t>(g_staging.size()),
+                                                 scale});
     }
   }
 
@@ -3390,7 +3427,7 @@ std::uint32_t RtBackedSrvSlot(std::uint32_t texture_rhi_guest, std::uint32_t bas
     // rather than to the guest-memory decode: the decode is what corrupted the
     // loading-screen glyphs when this path refused outright.
     const auto copy = g_resolve_srv.find(alias);
-    if (copy != g_resolve_srv.end() && CopyIsFresh(alias)) {
+    if (copy != g_resolve_srv.end()) {
       g_rt_copy.fetch_add(1, std::memory_order_relaxed);
       return copy->second;
     }
@@ -3411,10 +3448,9 @@ std::uint32_t RtBackedSrvSlot(std::uint32_t texture_rhi_guest, std::uint32_t bas
   //
   // This is also why refusing the alias outright once corrupted the loading
   // screen's glyphs: back then it refused for surfaces we HAD rendered, whose
-  // guest memory we never wrote. The freshness test refuses only the opposite
-  // case, so the decode is the right answer exactly when it is taken.
+  // guest memory we never wrote.
   const auto srv = g_surface_srv.find(surface);
-  if (srv != g_surface_srv.end() && SurfaceIsFresh(surface)) {
+  if (srv != g_surface_srv.end()) {
     g_rt_surface.fetch_add(1, std::memory_order_relaxed);
     return srv->second;
   }
@@ -3441,6 +3477,7 @@ void RetireSurface(std::uint32_t resource_or_surface) {
   }
   g_retire_matched.fetch_add(1, std::memory_order_relaxed);
   g_surface_meta.erase(surface);
+  dpour_surfaces::Unregister(surface);
   g_pending_surface_retire.push_back(surface);
 }
 
@@ -3467,6 +3504,10 @@ void OnTargetableSurfaceCreated(const std::uint8_t* base, std::uint32_t sret,
   REXLOG_INFO("[native-scene] targetable surface {:08x} usage \"{}\" {}x{} pf={}", surface, name,
               size_x, size_y, pixel_format);
   if (surface != 0 && size_x >= 1 && size_x <= 4096 && size_y >= 1 && size_y <= 4096) {
+    // The surface layer records the same creation from the game's own rules:
+    // EDRAM range, tile count, expected bias and which surfaces genuinely share
+    // one range's live content. See downpour_native_surfaces.h.
+    dpour_surfaces::Register(surface, name, size_x, size_y, pixel_format, resolve_texture);
     const bool depth = std::strstr(name, "Depth") != nullptr;
     std::lock_guard<std::mutex> lk(g_reg_mutex);
     SurfaceMeta m{size_x, size_y, depth};
@@ -3493,35 +3534,15 @@ void OnTargetableSurfaceCreated(const std::uint8_t* base, std::uint32_t sret,
   // surface is created as "DefaultColor", with "DefaultColorRaw" and
   // "DefaultColorFixedPoint" aliasing the same EDRAM for raw/fixed-point
   // passes. Any of the three being bound means the scene is being drawn.
+  //
+  // The family membership itself is decided in the surface layer at Register(),
+  // which also handles the level-load case: a reload recreates all three, the
+  // primary always leads (SceneRenderTargets.cpp:1041 ahead of :1046 and :1052),
+  // and registering it starts a new generation. The four-slot alias array this
+  // replaced could not do that - once its slots were taken the new objects were
+  // never recorded, and after the first level load the scene stopped being marked
+  // at all.
   if (std::strncmp(name, "DefaultColor", 12) == 0 && surface != 0) {
-    // A level load RECREATES the whole DefaultColor family. The old fill-empty
-    // logic could never record the new objects once the slots were taken - so
-    // after the first level load the scene was never marked again (gameplay
-    // captured ~30 draws/frame and the native frame went black). The primary
-    // alias always leads the recreated family: wipe and start over on it.
-    if (std::strcmp(name, "DefaultColor") == 0) {
-      for (auto& slot : g_scene_color_aliases) {
-        slot.store(0, std::memory_order_relaxed);
-      }
-      g_scene_color_aliases[0].store(surface, std::memory_order_relaxed);
-      static std::atomic<std::uint32_t> generations{0};
-      const std::uint32_t gen = generations.fetch_add(1, std::memory_order_relaxed);
-      if (gen > 0) {
-        REXLOG_INFO("[native-scene] DefaultColor recreated (generation {}): alias slots reset",
-                    gen + 1);
-      }
-    } else {
-      for (auto& slot : g_scene_color_aliases) {
-        const std::uint32_t cur = slot.load(std::memory_order_relaxed);
-        if (cur == surface) {
-          break;
-        }
-        if (cur == 0) {
-          slot.store(surface, std::memory_order_relaxed);
-          break;
-        }
-      }
-    }
     g_scene_color_surface.store(surface, std::memory_order_relaxed);
     // Only the primary alias carries the resolve texture we care about.
     if (std::strcmp(name, "DefaultColor") == 0 && resolve_texture != 0) {
@@ -4948,12 +4969,10 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
         sh.ptr = static_cast<std::size_t>(dpour_tex::CpuHandleAt(scene_bindless));
         device->CreateShaderResourceView(g_color.Get(), &sv, sh);
         scene_srv_res = g_color.Get();
+        std::vector<std::uint32_t> family;
+        dpour_surfaces::FamilyMembers(family);
         std::lock_guard<std::mutex> lk(g_reg_mutex);
-        for (const auto& slot : g_scene_color_aliases) {
-          const std::uint32_t alias = slot.load(std::memory_order_relaxed);
-          if (alias == 0) {
-            break;
-          }
+        for (const std::uint32_t alias : family) {
           g_surface_srv[alias] = scene_bindless;
         }
       }
@@ -5238,13 +5257,6 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
     cur_has_rtv = true;
     cur_has_dsv = true;
     current_reg = t;
-    // This surface now holds content we drew, as of this guest frame. What reads
-    // it later (the alias path in RtBackedSrvSlot) uses that to tell "our target"
-    // from "our empty target".
-    {
-      std::lock_guard<std::mutex> lk(g_reg_mutex);
-      g_surface_drawn_frame[target_key] = items_frame;
-    }
     // Downsample/utility passes must not become "the frame": only a full-size
     // target may represent it for the composite.
     if (t->w >= 1024) {
@@ -5452,12 +5464,13 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
       D3D12_GPU_DESCRIPTOR_HANDLE srcgpu{};
       srcgpu.ptr = dpour_tex::GpuHandleAt(src.srv_slot);
       dl->D3DSetGraphicsRootDescriptorTable(0, srcgpu);
-      // Nothing to undo when nothing multiplied: with PSR_ColorBiasFactor forced
-      // to 1 the shaders write unbiased colour, so the copy is a straight copy.
-      // (The game's own resolve passes D3DRESOLVE_EXPONENTBIAS(-bias) here,
-      // XeD3DRenderTarget.cpp:519, which is what this mirrors when the bias is
-      // left in place.)
-      const float scale = KeepColorBias() ? std::ldexp(1.0f, -pr.bias) : 1.0f;
+      // The game's own resolve passes D3DRESOLVE_EXPONENTBIAS(-bias) here
+      // (XeD3DRenderTarget.cpp:519) and sets the destination texture's fetch
+      // exponent on the next line (:537); pr.scale is those two folded together,
+      // taken from the surface that was resolved rather than from the target it
+      // shares. With PSR_ColorBiasFactor forced to 1 instead, nothing multiplied,
+      // so there is nothing to undo.
+      const float scale = KeepColorBias() ? pr.scale : 1.0f;
       const float consts[4] = {scale, 0.0f, 0.0f, 0.0f};
       dl->D3DSetGraphicsRoot32BitConstants(1, 4, consts, 0);
       dl->D3DSetPipelineState(g_resolve_pso.Get());
@@ -5476,14 +5489,6 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
       back.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
       dl->D3DResourceBarrier(1, &back);
       ++resolves_run;
-      // This destination now holds this frame's content. Anything that samples it
-      // later is entitled to our copy; anything sampling a destination we did NOT
-      // refresh gets the guest texture instead.
-      {
-        std::lock_guard<std::mutex> lk(g_reg_mutex);
-        g_resolve_copy_frame[pr.d3d_tex] = items_frame;
-      }
-
       // Hand the list back to the game's own pipeline. Setting a root signature
       // drops every root argument with it, so the next draw has to re-bind the
       // target, the PSO and the topology as if nothing were current.

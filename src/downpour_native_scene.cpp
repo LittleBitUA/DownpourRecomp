@@ -3027,6 +3027,23 @@ bool OnResolveScene(const std::uint8_t* base, std::uint32_t surface_ref,
   const bool is_new = g_texture_link.find(alias) == g_texture_link.end() ||
                       g_texture_link[alias] != link_surface;
   g_texture_link[alias] = link_surface;
+  // AND UNDER THE OBJECT, ALWAYS. The address key above exists for this engine's
+  // shared render-target memory, and it is the right key whenever the fetch
+  // constant can be read. But the moment it cannot, the only thing a sampler
+  // binding carries is the D3DBaseTexture pointer itself - and the link was
+  // filed under an address the caller has no way to compute. Measured 28.07:
+  // that is EXACTLY the failing case. `WHITE served ... reason 1 (no fetch)`
+  // means the fetch failed, so Acquire asked RtBackedSrvSlot(object, 0), and the
+  // lookup missed a link that was sitting right there under its address. The
+  // final composition quad then sampled white, which is the screen the user saw.
+  //
+  // The reference files this link on the OBJECT and nothing else
+  // (UnleashedRecomp ProcStretchRect: texture->sourceSurface = surface), because
+  // its texture objects ARE its own structs. Ours must answer to both questions,
+  // so it answers to both keys.
+  if (alias != d3d_tex) {
+    g_texture_link[d3d_tex] = link_surface;
+  }
   // EVERY distinct link, not just the first: one link tells us the mechanism
   // works, but not whether the SCENE's surface is among them - which is the
   // only one the game's final composition actually samples.

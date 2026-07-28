@@ -716,6 +716,35 @@ struct NativeTarget {
   std::uint64_t cleared_frame = 0;
 };
 std::unordered_map<std::uint32_t, NativeTarget> g_reg_targets;  // render thread only
+
+// === DPOUR MIGRATION 2026-07-29: ONE DEPTH SURFACE, MANY COLOUR SURFACES =====
+//
+// A NativeTarget carrying its own depth was our invention, and the game's own
+// prepass is where it falls apart (SceneRenderTargets.cpp:543):
+//
+//   // Set the scene depth surface and a DUMMY buffer as color buffer
+//   RHISetRenderTarget( GetLightAttenuationSurface(), GetSceneDepthSurface());
+//   RHISetColorWriteEnable(FALSE);
+//
+// The depth prepass binds DefaultDepth with LightAttenuation as the colour
+// target, and the base pass binds THE SAME DefaultDepth with DefaultColor. One
+// depth surface, two colour surfaces, and the second pass depends on what the
+// first wrote. With depth owned by the colour target, the prepass filled
+// LightAttenuation's private depth and the base pass got a freshly cleared one -
+// so the entire depth prepass was discarded every frame, and every
+// depth-equal test against it had nothing to be equal to.
+//
+// The reference has no such coupling: every guest surface is its own resource
+// and SetRenderTarget / SetDepthStencilSurface bind whichever pair the game
+// asks for. This registry is that - keyed by the DEPTH surface object, which
+// the device-level hook already records per pass.
+struct NativeDepth {
+  ComPtr<ID3D12Resource> tex;
+  std::uint32_t dsv_index = 0;
+  std::uint32_t w = 0, h = 0;
+  std::uint64_t cleared_frame = 0;
+};
+std::unordered_map<std::uint32_t, NativeDepth> g_reg_depths;  // render thread only
 ComPtr<ID3D12DescriptorHeap> g_reg_rtv_heap;
 ComPtr<ID3D12DescriptorHeap> g_reg_dsv_heap;
 std::uint32_t g_reg_rtv_next = 0;
@@ -1267,6 +1296,80 @@ NativeTarget* GetOrCreateRegTarget(ID3D12Device* device, std::uint32_t key, std:
   return &ins->second;
 }
 
+// The depth surface the game bound, as its own resource. See g_reg_depths for
+// why it cannot belong to a colour target. Size comes from the surface record,
+// which the create hook fills for depth surfaces exactly as it does for colour.
+NativeDepth* GetOrCreateRegDepth(ID3D12Device* device, std::uint32_t key) {
+  if (key == 0 || device == nullptr || g_reg_failed) {
+    return nullptr;
+  }
+  std::uint32_t w = 0, h = 0;
+  {
+    std::lock_guard<std::mutex> lk(g_reg_mutex);
+    const auto meta = g_surface_meta.find(key);
+    if (meta == g_surface_meta.end() || meta->second.w == 0 || meta->second.h == 0) {
+      return nullptr;  // never created through the hook: no size, no buffer
+    }
+    w = meta->second.w;
+    h = meta->second.h;
+  }
+  const auto it = g_reg_depths.find(key);
+  if (it != g_reg_depths.end()) {
+    // The guest reuses surface addresses, so a size change is a different
+    // surface on the same key - the same rule the colour registry follows.
+    if (it->second.w == w && it->second.h == h) {
+      return &it->second;
+    }
+    DestroyDeferred(std::move(it->second.tex));
+    g_reg_dsv_freed.push_back(it->second.dsv_index);
+    g_reg_depths.erase(it);
+  }
+  if (g_reg_depths.size() >= kRegMaxTargets) {
+    return nullptr;
+  }
+  NativeDepth d{};
+  d.dsv_index = TakeIndex(g_reg_dsv_freed, g_reg_dsv_next);
+  d.w = w;
+  d.h = h;
+  D3D12_HEAP_PROPERTIES heap{};
+  heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+  D3D12_RESOURCE_DESC dd{};
+  dd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  dd.Width = w;
+  dd.Height = h;
+  dd.DepthOrArraySize = 1;
+  dd.MipLevels = 1;
+  dd.Format = kDepthResFormat;
+  dd.SampleDesc.Count = 1;
+  dd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+  D3D12_CLEAR_VALUE dclear{};
+  dclear.Format = kDepthFormat;
+  dclear.DepthStencil.Depth = g_depth_clear;
+  if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &dd,
+                                             D3D12_RESOURCE_STATE_DEPTH_WRITE, &dclear,
+                                             IID_PPV_ARGS(&d.tex)))) {
+    g_reg_dsv_freed.push_back(d.dsv_index);
+    REXLOG_ERROR("[native-scene] shared depth {:#x} {}x{} failed", key, w, h);
+    return nullptr;
+  }
+  {
+    wchar_t n[64];
+    std::swprintf(n, 64, L"dpour.depth.%08x", key);
+    d.tex->SetName(n);
+  }
+  const std::uint32_t dsv_stride =
+      device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_DSV);
+  D3D12_CPU_DESCRIPTOR_HANDLE dsvh = g_reg_dsv_heap->GetCPUDescriptorHandleForHeapStart();
+  dsvh.ptr += static_cast<std::size_t>(d.dsv_index) * dsv_stride;
+  D3D12_DEPTH_STENCIL_VIEW_DESC dv{};
+  dv.Format = kDepthFormat;
+  dv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+  device->CreateDepthStencilView(d.tex.Get(), &dv, dsvh);
+  auto [ins, ok] = g_reg_depths.emplace(key, std::move(d));
+  REXLOG_INFO("[native-scene] shared depth registered: surface {:#x} {}x{}", key, w, h);
+  return &ins->second;
+}
+
 // The guest has retired this surface, so its target and its three descriptor
 // indices go back into circulation - the DestructResource role of the reference
 // (video.cpp:708-718), which frees a GuestSurface's descriptor the moment the
@@ -1565,6 +1668,50 @@ bool g_comp_failed = false;
 // thing left for us is to clear to the other end of the range.
 std::atomic<int> g_invert_z{-1};
 float g_depth_clear = 1.0f;  // (declared above for the target registry)
+
+// === DPOUR MIGRATION 2026-07-29: ...AND TO WRITE THE OTHER END TOO ===========
+//
+// "The only thing left" was wrong, and the game's own SetRenderTarget says what
+// was missing (XeD3DCommands.cpp:700-707):
+//
+//   if (GInvertZ) {
+//     GDirect3DDevice->GetViewport(&D3DViewport);
+//     Exchange<FLOAT>(D3DViewport.MinZ, D3DViewport.MaxZ);
+//     GDirect3DDevice->SetViewport(&D3DViewport);
+//   }
+//
+// A swapped MinZ/MaxZ makes the rasteriser write 1-z instead of z. We took the
+// flipped clear and the flipped comparison and then wrote z, so the two halves
+// disagreed: with a clear of 0 and GREATER_EQUAL, a fragment at z=0.5 beats one
+// at z=0.2, i.e. FAR GEOMETRY WINS OVER NEAR. Only whatever happened to be
+// furthest survived the depth test, and a depth prepass filled with the far
+// plane rejects nearly every base-pass fragment behind it.
+//
+// MEASURED, run 188: 21915343 pixels passed over 593 frames - 37k per frame
+// against 921600 in one 1280x720 screen, four percent, while the state census
+// showed RB_DEPTHCONTROL ZFUNC=6 (GREATER_EQUAL) on almost every draw. Runs 184
+// through 187 sit in the same band, so this is not new; it is what a black
+// screen with a correct pipeline behind it looks like.
+//
+// Applies to guest geometry only. The composite, the resolve copy and the
+// output blit draw their own full-screen quads at a fixed depth and have no
+// business inheriting the game's convention.
+// ONE SIGNAL FOR ALL THREE. The clear, the viewport and the captured-clear flip
+// have to agree or they reproduce this same bug in another direction, and until
+// now they did not: the clear read the comparison census while the flip read a
+// guest global whose address the code itself calls disputed. The census is what
+// the targets are already built from ("clear 0" in every recent log), so it is
+// what the other two follow.
+bool GuestInvertedDepth() { return dpour_state::ObservedInvertedDepth(); }
+
+struct DepthRange {
+  float min_depth;
+  float max_depth;
+};
+
+DepthRange GuestDepthRange() {
+  return GuestInvertedDepth() ? DepthRange{1.0f, 0.0f} : DepthRange{0.0f, 1.0f};
+}
 
 // The composite. Our pass draws only what the game's scene pass drew, so
 // everything it did NOT draw - the UI, the menus, the movies, every pass we do
@@ -2171,10 +2318,19 @@ bool ResolveCopyEnabled() {
 // and the divide on resolve are the same surface's bias by construction
 // (XeD3DCommands.cpp:714 and XeD3DRenderTarget.cpp:519).
 //
-// Implied by own-device for that reason. The environment variable still forces
-// it on outside that mode.
+// Implied by own-device for that reason - but SET EITHER WAY, not just on. The
+// first version of this could only be forced ON, which meant the one comparison
+// that matters (bias kept against bias neutralised, everything else identical)
+// could not be run without a rebuild. That is exactly the A/B this flag exists
+// for, so DPOUR_NR_KEEP_COLOR_BIAS=0 now forces it off again.
 bool KeepColorBias() {
-  static const bool on = EnvOn("DPOUR_NR_KEEP_COLOR_BIAS") || OwnDeviceMode();
+  static const bool on = [] {
+    const char* v = std::getenv("DPOUR_NR_KEEP_COLOR_BIAS");
+    if (v != nullptr && v[0] != '\0') {
+      return v[0] != '0';
+    }
+    return OwnDeviceMode();
+  }();
   return on;
 }
 
@@ -5239,16 +5395,35 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
     transition_target(*t, D3D12_RESOURCE_STATE_RENDER_TARGET);
     D3D12_CPU_DESCRIPTOR_HANDLE rtvh = g_reg_rtv_heap->GetCPUDescriptorHandleForHeapStart();
     rtvh.ptr += static_cast<std::size_t>(t->rtv_index) * rtv_stride;
+    // THE DEPTH THE GAME BOUND, not one this colour target owns. The prepass
+    // and the base pass share DefaultDepth across two different colour surfaces
+    // (SceneRenderTargets.cpp:543), so the depth buffer has to be keyed on the
+    // depth surface and cleared on its own schedule. A pass whose depth surface
+    // we never saw created falls back to the colour target's own buffer, which
+    // is what every pass used before this.
+    NativeDepth* nd = GetOrCreateRegDepth(device, ps.depth_object);
     D3D12_CPU_DESCRIPTOR_HANDLE dsvh = g_reg_dsv_heap->GetCPUDescriptorHandleForHeapStart();
-    dsvh.ptr += static_cast<std::size_t>(t->dsv_index) * dsv_stride;
-    if (t->cleared_frame != replay_index) {
+    dsvh.ptr += static_cast<std::size_t>(nd != nullptr ? nd->dsv_index : t->dsv_index) * dsv_stride;
+    const bool first_colour_bind = t->cleared_frame != replay_index;
+    if (first_colour_bind) {
       dl->D3DClearRenderTargetView(rtvh, clear_color, 0, nullptr);
-      dl->D3DClearDepthStencilView(dsvh, D3D12_CLEAR_FLAG_DEPTH, g_depth_clear, 0, 0, nullptr);
       t->cleared_frame = replay_index;
     }
+    // Once per replay per DEPTH surface. Clearing it with the colour target
+    // would wipe the prepass the moment the base pass bound its own colour.
+    if (nd != nullptr) {
+      if (nd->cleared_frame != replay_index) {
+        dl->D3DClearDepthStencilView(dsvh, D3D12_CLEAR_FLAG_DEPTH, g_depth_clear, 0, 0, nullptr);
+        nd->cleared_frame = replay_index;
+      }
+    } else if (first_colour_bind) {
+      dl->D3DClearDepthStencilView(dsvh, D3D12_CLEAR_FLAG_DEPTH, g_depth_clear, 0, 0, nullptr);
+    }
     dl->D3DOMSetRenderTargets(1, &rtvh, FALSE, &dsvh);
-    const D3D12_VIEWPORT vp{0.0f, 0.0f, static_cast<float>(t->w), static_cast<float>(t->h),
-                            0.0f, 1.0f};
+    // The game's own depth convention, not ours - see GuestDepthRange.
+    const DepthRange dr = GuestDepthRange();
+    const D3D12_VIEWPORT vp{0.0f,          0.0f, static_cast<float>(t->w), static_cast<float>(t->h),
+                            dr.min_depth, dr.max_depth};
     const D3D12_RECT sc{0, 0, static_cast<LONG>(t->w), static_cast<LONG>(t->h)};
     dl->RSSetViewport(vp);
     dl->RSSetScissorRect(sc);
@@ -5525,9 +5700,9 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
       if (pc.clear_depth && cur_has_dsv) {
         // The game's own RHIClear applies the GInvertZ flip inside; the captured
         // value is engine-side, so the flip is mirrored here where our depth
-        // convention is decided.
-        const float d = g_invert_z.load(std::memory_order_relaxed) == 1 ? 1.0f - pc.depth
-                                                                        : pc.depth;
+        // convention is decided - from the same signal as the clear and the
+        // viewport, see GuestInvertedDepth.
+        const float d = GuestInvertedDepth() ? 1.0f - pc.depth : pc.depth;
         dl->D3DClearDepthStencilView(cur_dsvh, D3D12_CLEAR_FLAG_DEPTH, d, 0, 0, nullptr);
       }
     }
@@ -5576,8 +5751,10 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
     }
     dl->D3DClearDepthStencilView(fdsv, D3D12_CLEAR_FLAG_DEPTH, g_depth_clear, 0, 0, nullptr);
     dl->D3DOMSetRenderTargets(1, &frtv, FALSE, &fdsv);
-    const D3D12_VIEWPORT fvp{0.0f, 0.0f, static_cast<float>(tw), static_cast<float>(th),
-                             0.0f, 1.0f};
+    // Guest geometry here too, so the game's depth convention applies.
+    const DepthRange fdr = GuestDepthRange();
+    const D3D12_VIEWPORT fvp{0.0f,          0.0f, static_cast<float>(tw), static_cast<float>(th),
+                             fdr.min_depth, fdr.max_depth};
     const D3D12_RECT fsc{0, 0, static_cast<LONG>(tw), static_cast<LONG>(th)};
     dl->RSSetViewport(fvp);
     dl->RSSetScissorRect(fsc);

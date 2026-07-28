@@ -2211,6 +2211,50 @@ bool C0ProbeEnabled() {
   return on;
 }
 
+// DPOUR_NR_SHOW_SURFACE=<name fragment | 0xADDR> - put ONE surface's target on
+// the screen, whole, instead of the frame.
+//
+// Not a crutch and not an invention: skate3 - the only reference working under
+// our constraints, observing a game it does not own - carries 991 lines of
+// diagnostics plus a 1259-line debug dialog with its own frame-snapshot format
+// and buffer dumps. Unleashed and Marathon need none of that because they own
+// every resource, so a target of theirs cannot be mysteriously empty. We are
+// permanently in skate3's position for buffers and textures (the game builds its
+// own D3D headers; there is nothing to take ownership of), so we need skate3's
+// tooling.
+//
+// Combines with DPOUR_NR_DRAW_AMPLIFY: -1 classifies the chosen target (grey
+// never written, yellow written black, blue positive), a positive value scales
+// it. That is how "which target in the chain goes dark first" becomes one run
+// per target instead of an argument.
+const char* ShowSurfaceSpec() {
+  static const char* v = [] {
+    const char* s = std::getenv("DPOUR_NR_SHOW_SURFACE");
+    return (s != nullptr && s[0] != '\0') ? s : nullptr;
+  }();
+  return v;
+}
+
+bool NameContainsNoCase(const char* haystack, const char* needle) {
+  if (haystack == nullptr || needle == nullptr || needle[0] == '\0') {
+    return false;
+  }
+  for (const char* h = haystack; *h != '\0'; ++h) {
+    const char* a = h;
+    const char* b = needle;
+    while (*a != '\0' && *b != '\0' &&
+           std::tolower(static_cast<unsigned char>(*a)) ==
+               std::tolower(static_cast<unsigned char>(*b))) {
+      ++a;
+      ++b;
+    }
+    if (*b == '\0') {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool SkipGuestDraws() {
   static const bool on = EnvOn("DPOUR_NR_DRAW_SKIPGUEST");
   return on;
@@ -4519,7 +4563,15 @@ bool CompositeToGuestOutput(ID3D12Device* device, rex::graphics::d3d12::Deferred
   D3D12_CPU_DESCRIPTOR_HANDLE comp_cpu = g_srv_heap->GetCPUDescriptorHandleForHeapStart();
   comp_cpu.ptr += static_cast<SIZE_T>(comp_slot) * srv_inc;
   D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
-  sv.Format = kColorFormat;
+  // THE SOURCE'S OWN FORMAT, not a constant. Every registry target is built with
+  // its guest surface's format once SurfaceFormatOn is in force (own-device
+  // implies it), so the surfaces in this game are a mix - kColorFormat here
+  // described only the ones that happened to match. A view whose format
+  // disagrees with its resource is not an error you get told about: the sample
+  // just returns black, which is indistinguishable from an empty target and was
+  // read as one.
+  const D3D12_RESOURCE_DESC src_desc = src->GetDesc();
+  sv.Format = src_desc.Format;
   sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
   sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
   sv.Texture2D.MipLevels = 1;
@@ -5104,7 +5156,9 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
       // the way the references do. Only under own-device: with the emulated
       // pipeline still running, its frame and ours would fight over the same
       // texture.
-      if (OwnDeviceMode() && bind_guest_output_direct()) {
+      // Not while a surface is being inspected: that mode hands the presenter's
+      // image to the composite, and the two cannot both own it.
+      if (ShowSurfaceSpec() == nullptr && OwnDeviceMode() && bind_guest_output_direct()) {
         current_reg = nullptr;
         score_target(out_res, width, kBackbufferKey);
         return true;
@@ -5500,7 +5554,12 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
     cur_has_rtv = true;
     cur_has_dsv = true;
     pass_ok = true;
-  } else if (OwnDeviceMode()) {
+  } else if (OwnDeviceMode() && ShowSurfaceSpec() == nullptr) {
+    // Inspecting a surface means the composite owns the presenter's image; this
+    // start-of-replay bind would claim it first and the inspection would show
+    // the empty image instead of the surface. (Measured: SHOW_SURFACE logged
+    // "on screen" for three runs while direct-to-output frames kept climbing -
+    // two owners, and the other one won.)
     bind_guest_output_direct();
   }
   for (std::size_t item_index = 0; item_index < items.size(); ++item_index) {
@@ -5766,6 +5825,72 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   // FLAT MODE: the one target IS the frame. Hand it to the blit, which is the
   // whole of our "post chain" - skate3 runs a real one here (resolve, SSAO,
   // bloom, tonemap) and writes the result to guest_output the same way.
+  // ONE TARGET, WHOLE SCREEN. Overrides what the composite shows - this mode
+  // exists to answer "what is actually IN this surface", so anything else on
+  // screen would only be in the way.
+  //
+  // It picks the SOURCE and lets the normal composite below run, rather than
+  // compositing here and returning. The first version did return early, which
+  // skipped handing the presenter's image back from RENDER_TARGET to its
+  // internal state, and the device was removed with INVALID_CALL on the first
+  // frame. The guest-output state machine has one owner; a diagnostic does not
+  // get to be a second one.
+  if (ShowSurfaceSpec() != nullptr) {
+    close_current();
+    const char* spec = ShowSurfaceSpec();
+    std::uint32_t key = 0;
+    if (spec[0] == '0' && (spec[1] == 'x' || spec[1] == 'X')) {
+      key = static_cast<std::uint32_t>(std::strtoul(spec + 2, nullptr, 16));
+    } else {
+      // EXACT NAME WINS. "DefaultColor", "DefaultColorRaw" and
+      // "DefaultColorFixedPoint" are three surfaces of identical size aliasing
+      // one EDRAM range, so a substring match plus a largest-area tiebreak is
+      // decided by hash-map order - it picked FixedPoint when asked for
+      // DefaultColor. Exact match first, substring only as a fallback, lowest
+      // address to break any remaining tie.
+      std::lock_guard<std::mutex> lk(g_reg_mutex);
+      std::uint32_t exact = 0;
+      std::uint32_t partial = 0;
+      for (const auto& entry : g_surface_meta) {
+        const char* nm = entry.second.name;
+        if (nm[0] == '\0') {
+          continue;
+        }
+        const bool is_exact = _stricmp(nm, spec) == 0;
+        if (is_exact && (exact == 0 || entry.first < exact)) {
+          exact = entry.first;
+        } else if (!is_exact && NameContainsNoCase(nm, spec) &&
+                   (partial == 0 || entry.first < partial)) {
+          partial = entry.first;
+        }
+      }
+      key = exact != 0 ? exact : partial;
+    }
+    const auto shown = g_reg_targets.find(key);
+    bool found = false;
+    if (shown != g_reg_targets.end() && shown->second.color) {
+      transition_target(shown->second, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+      last_target_res = shown->second.color.Get();
+      found = true;
+    }
+    static std::uint32_t announced = 0;
+    if (announced < 3) {
+      ++announced;
+      char nm[24] = "?";
+      std::uint32_t sw = 0, sh = 0;
+      {
+        std::lock_guard<std::mutex> lk(g_reg_mutex);
+        const auto meta = g_surface_meta.find(key);
+        if (meta != g_surface_meta.end()) {
+          std::snprintf(nm, sizeof(nm), "%s", meta->second.name);
+          sw = meta->second.w;
+          sh = meta->second.h;
+        }
+      }
+      REXLOG_INFO("[native-scene] SHOW_SURFACE \"{}\" -> surface {:#x} \"{}\" {}x{} ({})", spec,
+                  key, nm, sw, sh, found ? "on screen" : "NO TARGET - nothing to show");
+    }
+  }
   if (flat && g_color) {
     D3D12_RESOURCE_BARRIER to_srv{};
     to_srv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
@@ -5913,7 +6038,11 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
     D3D12_CPU_DESCRIPTOR_HANDLE comp_cpu = g_srv_heap->GetCPUDescriptorHandleForHeapStart();
     comp_cpu.ptr += static_cast<SIZE_T>(comp_slot) * srv_inc;
     D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
-    sv.Format = kColorFormat;
+    // Same rule as the guest-output composite: the view takes the RESOURCE's
+    // format. A registry target carries its guest surface's format, so a
+    // constant here describes only the subset that happens to agree, and the
+    // rest sample black without a word of complaint.
+    sv.Format = last_target_res->GetDesc().Format;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sv.Texture2D.MipLevels = 1;

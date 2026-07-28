@@ -2068,6 +2068,37 @@ bool KeepColorBias() {
   return on;
 }
 
+// DPOUR_NR_PS_C0 - the value written into PSR_ColorBiasFactor.x when the bias is
+// neutralised. Default 1.0, the game's own no-bias value. It is a knob only so
+// the multiply can be PROVEN to reach the shader: the pixel bank is uploaded on
+// the CPU and read on the GPU, and nothing between the two is observable from
+// here. Set it to something extreme and the picture either changes - the bank
+// arrives - or it does not, and the constants never reach the shader at all.
+float PixelC0Value() {
+  static const float v = [] {
+    const char* s = std::getenv("DPOUR_NR_PS_C0");
+    if (s == nullptr || s[0] == '\0') {
+      return 1.0f;
+    }
+    const double d = std::strtod(s, nullptr);
+    return std::isfinite(d) ? static_cast<float>(d) : 1.0f;
+  }();
+  return v;
+}
+
+// DPOUR_NR_C0_PROBE - photograph the pixel constant bank at draw time.
+//
+// The classify probe put the defect between "the pixel shader ran" and "the
+// pixel has colour", and the game's source names the only thing in that gap:
+// every shader returns BiasColor(c) = float4(c.rgb * SCENE_COLOR_BIAS_FACTOR.x,
+// c.a) (Common.usf:286). RGB scaled, alpha untouched - which is exactly the
+// yellow the classifier reported. So c0.x is either zero or it is not, and this
+// prints it rather than reasoning about it.
+bool C0ProbeEnabled() {
+  static const bool on = EnvOn("DPOUR_NR_C0_PROBE");
+  return on;
+}
+
 bool SkipGuestDraws() {
   static const bool on = EnvOn("DPOUR_NR_DRAW_SKIPGUEST");
   return on;
@@ -3333,6 +3364,57 @@ void SetViewport(std::uint32_t min_x, std::uint32_t min_y, std::uint32_t max_x,
 
 namespace {
 
+// One photograph of the pixel constant bank, capped so a probe run stays
+// readable. `dev` is the guest's own big-endian register file (null when the
+// device shadow is off), `staged` is the host-order bytes about to be uploaded,
+// read AFTER the bias override so the line says what the shader will actually
+// see rather than what the game asked for.
+void ProbePixelBank(const std::uint8_t* dev, const std::uint8_t* staged, std::uint32_t bytes,
+                    std::uint64_t ps_hash) {
+  static std::uint32_t printed = 0;
+  if (printed >= 16) {
+    return;
+  }
+  ++printed;
+
+  float dev_c0[4]{};
+  std::uint32_t nonzero = 0;
+  std::uint32_t top_reg = 0;
+  if (dev != nullptr) {
+    for (int i = 0; i < 4; ++i) {
+      dev_c0[i] = LoadBEFloat(dev + i * 4);
+    }
+    // Whether the bank address is right at all: a register file the game has
+    // been writing to for minutes cannot be all zeroes, and if it is, every
+    // material constant we upload is zero and the black frame needs no further
+    // explanation.
+    for (std::uint32_t r = 0; r < dpour_consts::kRegisters; ++r) {
+      for (int c = 0; c < 4; ++c) {
+        if (LoadBEFloat(dev + (r * 4 + c) * 4) != 0.0f) {
+          ++nonzero;
+          top_reg = r;
+        }
+      }
+    }
+  }
+
+  float hook_c0[4]{};
+  dpour_consts::CopyPixelBank(hook_c0, sizeof(hook_c0));
+
+  float up_c0[4]{};
+  if (staged != nullptr && bytes >= 16) {
+    std::memcpy(up_c0, staged, sizeof(up_c0));
+  }
+
+  REXLOG_INFO(
+      "[c0probe] ps {:#x} | device bank {}: c0 ({:.4f} {:.4f} {:.4f} {:.4f}), "
+      "{} non-zero floats of {}, top register {} | hook c0 ({:.4f} {:.4f} {:.4f} {:.4f}) "
+      "| UPLOADING c0 ({:.4f} {:.4f} {:.4f} {:.4f}) in {} bytes",
+      ps_hash, dev != nullptr ? "live" : "ABSENT", dev_c0[0], dev_c0[1], dev_c0[2], dev_c0[3],
+      nonzero, dpour_consts::kRegisters * 4u, top_reg, hook_c0[0], hook_c0[1], hook_c0[2],
+      hook_c0[3], up_c0[0], up_c0[1], up_c0[2], up_c0[3], bytes);
+}
+
 // The constant snapshot shared by regular and UP draws: the float banks (cached
 // per revision so a run of draws with unchanged constants shares one upload),
 // and the per-draw shared block (texture table, samplers, bool/loop banks).
@@ -3419,10 +3501,13 @@ bool FillDrawConstants(const std::uint8_t* base, const DrawDesc& d,
         // PSR_ColorBiasFactor (Engine/Inc/RHI.h:452) is float4 register 0.
         if (!KeepColorBias() && bytes >= 16) {
           float* c0 = reinterpret_cast<float*>(cpu);
-          c0[0] = 1.0f;
+          c0[0] = PixelC0Value();
           c0[1] = 0.0f;
           c0[2] = 0.0f;
           c0[3] = 0.0f;
+        }
+        if (C0ProbeEnabled()) {
+          ProbePixelBank(dev_ps, cpu, bytes, d.ps->ucode_hash);
         }
         g_ps_cb_cached = handle;
         g_ps_cb_bytes = bytes;

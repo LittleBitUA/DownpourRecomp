@@ -57,13 +57,20 @@ std::uint64_t PixelRevision();
 
 // THE DEVICE'S OWN CONSTANT SHADOW - the authoritative bank.
 //
-// Shadowing the setters is not enough for this build. Measured live: the pixel
-// bank never saw a write above register 33, which no UE3 material set can be
-// true of, and the scene's shaders were confirmed running and writing rgb
-// exactly zero with a live alpha - the signature of a material multiplied by a
-// constant we never captured. The XDK inlines constant writes straight into the
-// device's register file at many call sites, exactly as it inlines
-// SetRenderState (see downpour_native_state.h for the same lesson).
+// Shadowing the setters is not enough for this build, and the exact shortfall is
+// measured rather than guessed (DPOUR_NR_C0_PROBE, 2026-07-28): the setter shadow
+// holds register 0 at ZERO for every draw while the device's own file holds 1, 8
+// or 32 there. That register is PSR_ColorBiasFactor, which every pixel shader
+// multiplies its rgb by (Common.usf:286), so a shadow that misses it turns the
+// whole scene black. The XDK inlines constant writes straight into the device's
+// register file at many call sites, exactly as it inlines SetRenderState (see
+// downpour_native_state.h for the same lesson).
+//
+// (An earlier note here argued the shadow was broadly incomplete because it
+// topped out at register 33. The device file tops out at 32, so the shadow was
+// in fact nearly complete - it missed register 0 specifically. The conclusion
+// was right for the wrong reason; the correction is kept because the reason is
+// what tells you where else to look.)
 //
 // So read the file itself. From the recompiled commit path (sub_82D1E250):
 //   VS float constants at device + 1920   (register N at +(N+120)*16)

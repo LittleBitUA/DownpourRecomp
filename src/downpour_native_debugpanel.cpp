@@ -77,26 +77,41 @@ constexpr AmplifyPreset kAmplifyPresets[] = {
 
 bool FloatsClose(float a, float b) { return std::fabs(a - b) < 1e-6f; }
 
+// === DPOUR MIGRATION 2026-07-29: READ-ONLY, AND WHY =========================
+//
+// This started as sliders and a surface picker. Pressing F3 then crashed the
+// game, and the widgets are not what this project is for: the same three knobs
+// are cvars under Downpour/Native Render in the F4 settings overlay, which was
+// interactive long before any of this and needs nothing from us.
+//
+// What was actually risky was not the widgets but what they required. The SDK's
+// debug overlay had ALWAYS declined input capture - "Passive readout, keyboard
+// toggles handled at app level, no in-dialog input" - and making it interactive
+// changed how a shared subsystem routes input for every title that uses it. A
+// convenience is not worth that.
+//
+// So the section is a readout again, registered with wants_input = false, and
+// the overlay behaves exactly as it did before this file existed. What it shows
+// is still worth having: the game's own surface table, which no other view has.
 void DrawPanel() {
-  // --- what reaches the screen ------------------------------------------------
-  ImGui::TextUnformatted("Shown");
-  ImGui::Separator();
-
-  std::string current = ShowSurfaceSpecCopy();
-  const bool showing_frame = current.empty();
-  if (ImGui::RadioButton("the game's frame", showing_frame)) {
-    SetShowSurfaceSpec(nullptr);
+  const std::string current = ShowSurfaceSpecCopy();
+  const float amp = AmplifyFactor();
+  ImGui::Text("shown: %s   amplify: %s   bias: %s",
+              current.empty() ? "the game's frame" : current.c_str(),
+              amp == 0.0f ? "off" : (amp < 0.0f ? "classify" : "on"),
+              KeepColorBias() ? "the game's own" : "neutralised");
+  for (const auto& p : kAmplifyPresets) {
+    if (FloatsClose(amp, p.value)) {
+      ImGui::TextDisabled("  %s - %s", p.label, p.why);
+      break;
+    }
   }
-  ImGui::SameLine();
-  ImGui::TextDisabled("(?)");
-  if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip("The composed frame, through the post chain and the final quad.\n"
-                      "Anything else below bypasses all of that and shows one surface whole.");
-  }
+  ImGui::TextDisabled("change these in Settings (F4) -> Downpour -> Native Render");
 
-  // The picker is the game's own surface table - it names every one of them at
+  // The game's own surface table: it names every one of them at
   // RHICreateTargetableSurface, and the surface layer records the name, the
-  // size, the EDRAM range and the family it belongs to.
+  // size, the EDRAM range and the family it belongs to. Refreshed once a second
+  // so the list does not fight the guest thread for the table's lock.
   static std::vector<dpour_surfaces::Surface> surfaces;
   static double last_refresh = -1.0;
   const double now = ImGui::GetTime();
@@ -104,8 +119,6 @@ void DrawPanel() {
     last_refresh = now;
     surfaces.clear();
     dpour_surfaces::ListSurfaces(surfaces);
-    // Colour first, then by name, so the interesting ones are not scattered
-    // among twenty AuxColors of different sizes.
     std::sort(surfaces.begin(), surfaces.end(),
               [](const dpour_surfaces::Surface& a, const dpour_surfaces::Surface& b) {
                 if (a.is_depth != b.is_depth) {
@@ -115,72 +128,16 @@ void DrawPanel() {
                 return c != 0 ? c < 0 : a.object < b.object;
               });
   }
-
-  if (ImGui::BeginCombo("surface", showing_frame ? "(none)" : current.c_str())) {
-    for (const auto& s : surfaces) {
-      char label[96];
-      std::snprintf(label, sizeof(label), "%s  %ux%u  %#x%s", s.name, s.w, s.h, s.object,
-                    s.is_depth ? "  [depth]" : "");
-      char spec[32];
-      std::snprintf(spec, sizeof(spec), "%#x", s.object);
-      if (ImGui::Selectable(label, current == spec)) {
-        SetShowSurfaceSpec(spec);
-      }
-      if (ImGui::IsItemHovered()) {
-        ImGui::SetTooltip("EDRAM [%u..%u)  %u tiles\nnative target: %#x%s", s.edram_offset,
-                          s.edram_offset + s.edram_size, s.edram_size, s.group,
-                          s.group != s.object ? "  (shares the DefaultColor family's)" : "");
-      }
+  ImGui::Text("surfaces: %d", static_cast<int>(surfaces.size()));
+  int shown = 0;
+  for (const auto& s : surfaces) {
+    if (s.is_depth || ++shown > 12) {
+      continue;
     }
-    ImGui::EndCombo();
+    ImGui::TextDisabled("  %-24s %4ux%-4u  EDRAM [%u..%u)%s", s.name, s.w, s.h, s.edram_offset,
+                        s.edram_offset + s.edram_size,
+                        s.group != s.object ? "  shares DefaultColor" : "");
   }
-  if (!showing_frame) {
-    ImGui::SameLine();
-    if (ImGui::SmallButton("back to frame")) {
-      SetShowSurfaceSpec(nullptr);
-    }
-  }
-
-  // --- exposure ---------------------------------------------------------------
-  ImGui::Spacing();
-  ImGui::TextUnformatted("Exposure");
-  ImGui::Separator();
-
-  float amp = AmplifyFactor();
-  for (const auto& p : kAmplifyPresets) {
-    if (ImGui::RadioButton(p.label, FloatsClose(amp, p.value))) {
-      SetAmplifyFactor(p.value);
-      amp = p.value;
-    }
-    if (ImGui::IsItemHovered()) {
-      ImGui::SetTooltip("%s", p.why);
-    }
-  }
-  if (amp > 0.0f) {
-    float slider = amp;
-    if (ImGui::SliderFloat("x", &slider, 0.01f, 64.0f, "%.4f", ImGuiSliderFlags_Logarithmic)) {
-      SetAmplifyFactor(slider);
-    }
-  }
-
-  // --- the exponent bias ------------------------------------------------------
-  ImGui::Spacing();
-  ImGui::TextUnformatted("EDRAM exponent bias");
-  ImGui::Separator();
-
-  bool keep = KeepColorBias();
-  if (ImGui::Checkbox("keep the game's own bias", &keep)) {
-    SetKeepColorBias(keep);
-  }
-  if (ImGui::IsItemHovered()) {
-    ImGui::SetTooltip(
-        "ON  - the game's shaders multiply by 2^bias (PSR_ColorBiasFactor) and each\n"
-        "      resolve divides by the SAME surface's bias. This is what the console does.\n"
-        "OFF - c0 is forced to 1 and the resolves stop scaling. Self-consistent, but the\n"
-        "      engine also pushes bias-derived scalars into constants we cannot reach\n"
-        "      (EmissiveAlphaMaskScale, ShadowRendering.h:880), so those stay at 8.");
-  }
-  ImGui::TextDisabled("a surface's divisor comes from the surface, never from its family");
 }
 
 }  // namespace
@@ -262,7 +219,9 @@ void RegisterDebugPanel() {
     return;
   }
   registered = true;
-  rex::ui::RegisterDebugOverlaySection("Downpour native render", &DrawPanel, /*wants_input=*/true);
+  // wants_input = FALSE. See DrawPanel: the SDK's overlay has always been a
+  // passive readout, and promoting it changed input routing for every title.
+  rex::ui::RegisterDebugOverlaySection("Downpour native render", &DrawPanel, /*wants_input=*/false);
 }
 
 }  // namespace dpour_scene

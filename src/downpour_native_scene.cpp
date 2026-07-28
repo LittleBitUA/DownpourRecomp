@@ -3240,6 +3240,33 @@ bool OnResolveScene(const std::uint8_t* base, std::uint32_t surface_ref,
     if (bias < -8 || bias > 8) {
       bias = 0;
     }
+    // WHOSE BIAS, AND WHOSE TARGET. The copy divides by 2^-bias read from the
+    // surface being resolved, but it writes the CANONICAL surface's target -
+    // and the DefaultColor family aliases one EDRAM range through three
+    // surfaces of different formats, which is exactly what
+    // XeGetRenderTargetColorExpBias keys on (XeD3DRenderTarget.cpp:94). If the
+    // three disagree, some content is divided by an exponent it was never
+    // multiplied by. One line per distinct surface, ever - enough to see
+    // whether the family agrees.
+    {
+      static std::unordered_map<std::uint32_t, std::int32_t> seen;
+      const auto prev = seen.find(surface_object);
+      if (prev == seen.end() || prev->second != bias) {
+        seen[surface_object] = bias;
+        char nm[24] = "?";
+        {
+          std::lock_guard<std::mutex> lk(g_reg_mutex);
+          const auto meta = g_surface_meta.find(surface_object);
+          if (meta != g_surface_meta.end() && meta->second.name[0] != '\0') {
+            std::snprintf(nm, sizeof(nm), "%s", meta->second.name);
+          }
+        }
+        REXLOG_INFO("[native-scene] resolve bias: \"{}\" surface {:#x} -> canonical {:#x}, "
+                    "ColorExpBias {} (divide by {})",
+                    nm, surface_object, CanonicalSurface(surface_object), bias,
+                    std::ldexp(1.0f, bias));
+      }
+    }
     std::lock_guard<std::mutex> dl(g_mutex);
     if (g_resolve_staging.size() < 64) {
       g_resolve_staging.push_back(PendingResolve{CanonicalSurface(surface_object), alias, bias,

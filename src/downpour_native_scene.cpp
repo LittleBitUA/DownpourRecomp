@@ -80,13 +80,24 @@ bool EnvOn(const char* name) {
   return v != nullptr && v[0] != '\0' && v[0] != '0';
 }
 
-// The whole 32-bit guest space except the null page. The previous upper bound
-// of 0xC0000000 was an invention, and it cost the world: appPhysicalAlloc hands
-// out vertex memory at 0xF3xxxxxx, so every static mesh whose data lives there
-// failed ResolveBuffer with fetch == BaseAddress == 0xF3... - 1744 of the 3577
-// dropped draws in the 28.07 census. Safety against bad pointers is
-// SpanReadable's page probe, not an address-range guess.
-inline bool GuestAddrPlausible(std::uint32_t a) { return a >= 0x1000u; }
+// TWO ADDRESS KINDS, TWO CHECKS. Getting this wrong cost a whole session:
+//
+//   OBJECT POINTERS (FXeVertexBuffer*, IDirect3DVertexBuffer9*, FLinearColor*)
+//   come out of the game's virtual heap and are measured at 0x4xxxxxxx-0xBxxxxxxx.
+//   The 0xC0000000 ceiling is a real sanity check for these, and it is the only
+//   thing standing between a garbage field and a read of arbitrary memory that
+//   happens to be committed.
+//
+//   DATA ADDRESSES (what a Xenos fetch constant points at) come out of
+//   appPhysicalAlloc and are measured at 0xF3xxxxxx-0xF5xxxxxx - ABOVE that
+//   ceiling. Applying the pointer check to them dropped every static mesh in
+//   the world (censused 28.07: fetch == BaseAddress == 0xF3df9000, refused).
+//
+// Commit eb2612a loosened the SHARED predicate to fix the second case, which
+// silently loosened the first as well - in ten call sites including the Clear
+// colour and the user-pointer draw data. Two names now, one job each.
+inline bool GuestAddrPlausible(std::uint32_t a) { return a >= 0x1000u && a < 0xC0000000u; }
+inline bool GuestDataAddrPlausible(std::uint32_t a) { return a >= 0x1000u; }
 
 bool SpanReadable(const void* p, std::size_t n) {
   MEMORY_BASIC_INFORMATION mbi{};
@@ -164,7 +175,9 @@ bool ReadFetchAt(const std::uint8_t* base, std::uint32_t d3d, std::uint32_t off,
   const std::uint32_t f1 = LoadBE32(base + d3d + off + 4);
   const std::uint32_t addr = f0 & 0xFFFFFFFCu;
   const std::uint64_t bytes = static_cast<std::uint64_t>((f1 >> 2) & 0xFFFFFFu) * 4ull;
-  if (!GuestAddrPlausible(addr) || bytes < 4 || bytes > (48ull << 20)) {
+  // A DATA address - the physical heap above 0xC0000000 is fair game HERE, and
+  // nowhere else in this file. See the two predicates at the top.
+  if (!GuestDataAddrPlausible(addr) || bytes < 4 || bytes > (48ull << 20)) {
     return false;
   }
   out.addr = addr;

@@ -347,6 +347,15 @@ bool AcquireBuffer(ID3D12Device* device, const std::uint8_t* base, std::uint32_t
         b.gpu[i] = 0;
       }
     }
+    // THE SLOTS ARE GONE AS OF HERE, so the record must stop claiming to have
+    // them. Every exit below this point used to leave `live` set with null
+    // slots and zero GPU addresses, and the fast path at the top of the next
+    // call ("live, big enough, fresh") would then hand out
+    // BufferLocation = 0 as a vertex buffer view - far worse than dropping the
+    // draw. It survived only because the cap exit happened to latch the buffer
+    // dead forever; removing that latch (12ecb42, reverted) exposed it.
+    b.live = false;
+    b.size = 0;
     if (g_bytes + static_cast<std::uint64_t>(size) * slots > kMaxResidentBytes) {
       g_rejected.fetch_add(1, std::memory_order_relaxed);
       b.failures = kMaxFailures;

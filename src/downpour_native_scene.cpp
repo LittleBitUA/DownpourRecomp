@@ -753,6 +753,18 @@ std::vector<std::uint32_t> g_pending_surface_retire;
 // move.
 std::atomic<std::uint64_t> g_retire_calls{0};
 std::atomic<std::uint64_t> g_retire_matched{0};
+// WHAT THE GAME'S FINAL COMPOSITION ACTUALLY SAMPLES.
+//
+// The world reaches its own targets and the back-buffer pass reaches the
+// presenter's image; between them sit the two draws the game makes into the back
+// buffer, which sample the intermediate targets through RtBackedSrvSlot. A black
+// frame at this point means those samples come back empty, and there are exactly
+// four ways out of that function - so count all four rather than reason about
+// which one it is.
+std::atomic<std::uint64_t> g_rt_nolink{0};    // no resolve ever linked this texture
+std::atomic<std::uint64_t> g_rt_copy{0};      // served the real resolve copy
+std::atomic<std::uint64_t> g_rt_surface{0};   // served the surface's own target
+std::atomic<std::uint64_t> g_rt_stale{0};     // linked, but nothing we rendered
 constexpr std::uint32_t kRegMaxTargets = 256;
 
 std::uint32_t TakeIndex(std::vector<std::uint32_t>& freed, std::uint32_t& next) {
@@ -3260,6 +3272,7 @@ std::uint32_t RtBackedSrvSlot(std::uint32_t texture_rhi_guest, std::uint32_t bas
     std::lock_guard<std::mutex> lk(g_reg_mutex);
     const auto link = g_texture_link.find(alias);
     if (link == g_texture_link.end()) {
+      g_rt_nolink.fetch_add(1, std::memory_order_relaxed);
       return dpour_tex::kInvalidSlot;
     }
     surface = link->second;
@@ -3307,6 +3320,7 @@ std::uint32_t RtBackedSrvSlot(std::uint32_t texture_rhi_guest, std::uint32_t bas
     // loading-screen glyphs when this path refused outright.
     const auto copy = g_resolve_srv.find(alias);
     if (copy != g_resolve_srv.end() && CopyIsFresh(alias)) {
+      g_rt_copy.fetch_add(1, std::memory_order_relaxed);
       return copy->second;
     }
   }
@@ -3330,8 +3344,10 @@ std::uint32_t RtBackedSrvSlot(std::uint32_t texture_rhi_guest, std::uint32_t bas
   // case, so the decode is the right answer exactly when it is taken.
   const auto srv = g_surface_srv.find(surface);
   if (srv != g_surface_srv.end() && SurfaceIsFresh(surface)) {
+    g_rt_surface.fetch_add(1, std::memory_order_relaxed);
     return srv->second;
   }
+  g_rt_stale.fetch_add(1, std::memory_order_relaxed);
   return dpour_tex::kInvalidSlot;
 }
 
@@ -5968,6 +5984,14 @@ void LogStats() {
                 g_surface_meta.size(), g_texture_link.size(), g_surface_srv.size(),
                 g_retire_calls.load(std::memory_order_relaxed),
                 g_retire_matched.load(std::memory_order_relaxed));
+  }
+  {
+    REXLOG_INFO("[native-scene] RT sampling: {} served our target, {} served a resolve copy, "
+                "{} linked but never rendered, {} never linked at all",
+                g_rt_surface.load(std::memory_order_relaxed),
+                g_rt_copy.load(std::memory_order_relaxed),
+                g_rt_stale.load(std::memory_order_relaxed),
+                g_rt_nolink.load(std::memory_order_relaxed));
   }
   REXLOG_INFO("[native-scene] UP draws: {} begun, {} captured, {} dropped, {} over the frame cap",
               g_up_seen.load(std::memory_order_relaxed),

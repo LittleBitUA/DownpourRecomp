@@ -106,6 +106,9 @@ std::atomic<std::uint32_t> g_stream_vb[kMaxStreams] = {};      // FXeVertexBuffe
 std::atomic<std::uint32_t> g_stream_d3dvb[kMaxStreams] = {};   // IDirect3DVertexBuffer9* (device)
 std::atomic<std::uint32_t> g_stream_stride[kMaxStreams] = {};  // bytes per vertex
 std::atomic<std::uint32_t> g_stream_offset[kMaxStreams] = {};  // byte offset applied at draw time
+// 1 when g_stream_vb[s] and g_stream_d3dvb[s] were seen in ONE RHI->device
+// call, so the RHI object's own BaseAddress describes the bound buffer.
+std::atomic<std::uint32_t> g_stream_paired[kMaxStreams] = {};
 std::atomic<std::uint32_t> g_stream_fresh{0};   // streams rebound for the next draw
 std::atomic<std::uint32_t> g_last_ib{0};
 // RHIDrawIndexedPrimitive(IndexBuffer, PrimitiveType, BaseVertexIndex, MinIndex,
@@ -269,16 +272,45 @@ REX_HOOK_RAW(sub_82D19E60) {
 }
 
 // --- geometry state ----------------------------------------------------------
-// RHISetStreamSource(StreamIndex, VertexBuffer, Stride, ...) - the RHI-level
-// binding: which buffer and what stride.
+// IDENTITY FROM THE API, NOT FROM PARSING GPU STATE.
+//
+// This is the reference's defining property, available to us without owning the
+// resource. In UnleashedRecomp, SetStreamSource receives the buffer as a host
+// struct (video.cpp:5116) and its address and size are simply fields - there is
+// nothing to deduce. Here the same pair arrives, one call inside the other, on
+// one thread:
+//
+//   RHISetStreamSource(StreamIndex, VertexBuffer, Stride, ...)      <- our hook
+//     -> GDirect3DDevice->SetStreamSource(StreamIndex,
+//            VertexBuffer->Resource, 0, Stride)                     <- our hook
+//        (XeD3DCommands.cpp:145)
+//
+// So marking the window makes the pairing a FACT: the D3D object the device
+// receives IS the Resource of the RHI object we just saw, and that RHI object
+// carries FXeGPUResource::BaseAddress at +12 - the very field AllocVertexBuffer
+// wrote (XeD3DVertexBuffer.cpp:63). No fetch constant has to be found, decoded
+// or agreed with.
+//
+// It also draws the line the fetch comparison was drawing by accident:
+// FGPUMemMove's defrag binds a STACK-BUILT vertex buffer straight at the device
+// (XeD3DUtil.cpp:143) with no RHI call around it. That bind arrives outside the
+// window, so it pairs with nothing and is refused BY CONSTRUCTION rather than
+// by noticing that two addresses disagree.
+thread_local std::uint32_t t_rhi_stream = 0xFFFFFFFFu;
+thread_local std::uint32_t t_rhi_object = 0;
+
 REX_EXTERN(__imp__sub_829C8AA8);
 REX_HOOK_RAW(sub_829C8AA8) {
   const std::uint32_t stream = ctx.r3.u32;
   if (NativeActive() && stream < kMaxStreams) {
     g_stream_vb[stream].store(ctx.r4.u32, std::memory_order_relaxed);
     g_stream_stride[stream].store(ctx.r5.u32, std::memory_order_relaxed);
+    t_rhi_stream = stream;
+    t_rhi_object = ctx.r4.u32;
   }
   __imp__sub_829C8AA8(ctx, base);
+  t_rhi_stream = 0xFFFFFFFFu;
+  t_rhi_object = 0;
 }
 
 // Device SetStreamSource(dev, StreamNumber, pStreamData, OffsetInBytes, Stride).
@@ -297,6 +329,15 @@ REX_HOOK_RAW(sub_82D1A5C0) {
     // is a draw dropped - which was happening to 43372 of them.
     g_stream_d3dvb[stream].store(ctx.r5.u32, std::memory_order_relaxed);
     g_stream_stride[stream].store(ctx.r7.u32, std::memory_order_relaxed);
+    // Paired only when this bind came from inside RHISetStreamSource for the
+    // SAME stream. Anything else is a raw device bind whose RHI shadow belongs
+    // to some older binding and must not be believed.
+    if (t_rhi_stream == stream) {
+      g_stream_vb[stream].store(t_rhi_object, std::memory_order_relaxed);
+      g_stream_paired[stream].store(1, std::memory_order_relaxed);
+    } else {
+      g_stream_paired[stream].store(0, std::memory_order_relaxed);
+    }
     // RHIDrawIndexedPrimitive re-binds exactly the streams the bound vertex
     // declaration uses, immediately before the draw. That makes this mask the
     // vertex layout of the draw about to happen - which is how we tell UE3's
@@ -441,6 +482,7 @@ void FillCommonDrawInputs(dpour_scene::DrawDesc& d, std::uint32_t prim_type) {
     // OffsetInBytes = Stride * BaseVertexIndex just before the draw, so the
     // per-draw vertex offset is here and the device call always passes 0.
     d.stream_offset[s] = g_stream_offset[s].load(std::memory_order_relaxed);
+    d.vb_paired[s] = g_stream_paired[s].load(std::memory_order_relaxed);
   }
 }
 

@@ -194,6 +194,11 @@ struct DrawDesc {
   std::uint32_t vb_d3d[kMaxStreams] = {};
   std::uint32_t stride[kMaxStreams] = {};
   std::uint32_t stream_offset[kMaxStreams] = {};  // stride * BaseVertexIndex
+  // Set when vb_guest[s] and vb_d3d[s] were captured inside ONE
+  // RHISetStreamSource -> device SetStreamSource call. Then the RHI object's
+  // BaseAddress field IS the bound buffer's data, with nothing to deduce - the
+  // property the references get for free by owning the resource.
+  std::uint32_t vb_paired[kMaxStreams] = {};
   std::uint32_t ib_guest = 0;
   std::uint32_t prim_type = 0;  // D3DPRIMITIVETYPE
   bool indexed = false;

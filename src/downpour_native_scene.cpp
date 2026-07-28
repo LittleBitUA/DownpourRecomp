@@ -674,6 +674,25 @@ extern float g_depth_clear;  // defined with the scene targets below
 std::mutex g_reg_mutex;
 std::unordered_map<std::uint32_t, SurfaceMeta> g_surface_meta;       // surface obj -> size
 std::unordered_map<std::uint32_t, std::uint32_t> g_texture_link;     // texture obj -> surface obj
+// SURFACES A RESOLVE POINTS AT MUST HAVE A TARGET BEFORE ANYTHING SAMPLES THEM.
+//
+// The reference creates the host texture inside CreateSurface (video.cpp:3184),
+// so every guest surface owns one from birth and a sample can never find
+// nothing. Ours built targets lazily, in bind_pass, which means only surfaces we
+// had already DRAWN into had an SRV - measured 28.07: 15 of 54. The scene's own
+// resolve was among the missing:
+//
+//   resolve link: key 0x411c1c00 <- surface 0x40cb8f40 (1280x720) srv -1
+//
+// 0x40cb8f40 is DefaultColorRaw, and 0x411c1c00 is the texture the game's final
+// composition quad samples - the one the white census names every session. The
+// link was right, the surface simply had no texture behind it, so the sample
+// fell through to white and painted the screen.
+//
+// EVERY surface, at creation - the reference makes no exception and neither do
+// we. The device lives on the render thread, so the guest thread queues and the
+// replay drains.
+std::vector<std::uint32_t> g_pending_surface_targets;
 std::unordered_map<std::uint32_t, std::uint32_t> g_surface_srv;      // surface obj -> bindless SRV
 struct NativeTarget {
   ComPtr<ID3D12Resource> color;
@@ -746,6 +765,31 @@ bool AliasKeyOn() {
 bool FreshGateOff() {
   static const bool on = EnvOn("DPOUR_NR_FRESH_GATE");
   return !on;
+}
+
+// DPOUR_NR_FLAT=1 - THE skate3 MODEL. Stop reproducing the game's frame graph.
+//
+// Three references, two working models, and ours was neither (28.07 analysis):
+//
+//   A. Unleashed/Marathon replace D3D9 entirely, so every guest resource IS
+//      their struct and the game's frame graph can be reproduced faithfully -
+//      they own every node of it.
+//   B. skate3 does the opposite: it never touches the game's render targets,
+//      resolves or post quads. It takes the geometry, renders ITS OWN scene
+//      into ITS OWN target with ITS OWN post chain, and writes that straight
+//      into guest_output (skate3_native_scene_gpu.cpp:7918 clear + :10475
+//      output).
+//
+// We were pursuing A's goal (reproduce the graph) without A's prerequisite
+// (own the resources), which is why every repaired link only revealed the next
+// one: a graph rebuilt from outside has no bound on how many nodes are still
+// wrong. This flag takes B instead - every captured draw goes into one scene
+// target in submission order, and one blit puts it on screen. The pass table,
+// the vote, the per-surface registry, the resolve links and the composite are
+// all bypassed; if this works they get deleted rather than configured.
+bool FlatSceneMode() {
+  static const bool on = EnvOn("DPOUR_NR_FLAT");
+  return on;
 }
 
 // DPOUR_NR_SKIP_DEPTH_RESOLVE=1. Skip the resolve COPY for surfaces the game
@@ -3044,6 +3088,14 @@ bool OnResolveScene(const std::uint8_t* base, std::uint32_t surface_ref,
   if (alias != d3d_tex) {
     g_texture_link[d3d_tex] = link_surface;
   }
+  // Something will sample this surface, so it needs a texture to be sampled
+  // FROM - now, not once a draw happens to land in it. See the note on
+  // g_pending_surface_targets.
+  if (link_surface != 0 &&
+      std::find(g_pending_surface_targets.begin(), g_pending_surface_targets.end(),
+                link_surface) == g_pending_surface_targets.end()) {
+    g_pending_surface_targets.push_back(link_surface);
+  }
   // EVERY distinct link, not just the first: one link tells us the mechanism
   // works, but not whether the SCENE's surface is among them - which is the
   // only one the game's final composition actually samples.
@@ -3184,6 +3236,21 @@ void OnTargetableSurfaceCreated(const std::uint8_t* base, std::uint32_t sret,
     std::snprintf(m.name, sizeof(m.name), "%s", name);
     m.dxgi = DxgiFromPixelFormat(pixel_format);
     g_surface_meta[surface] = m;
+    // THE SURFACE GETS ITS TEXTURE HERE, exactly as CreateSurface does
+    // (video.cpp:3184): texture, view and descriptor index allocated at
+    // creation, for every surface, unconditionally. Not when a draw first lands
+    // in it, not when a resolve first points at it - at birth. That is the
+    // property that makes "sample a surface" always answerable in the
+    // references, and its absence is what served white here: measured 28.07,
+    // 15 of 54 surfaces had a texture, and the scene's own resolve destination
+    // was among the 39 that did not.
+    //
+    // Depth surfaces take the reference's other branch (DEPTH_TARGET) and are
+    // transient there by its own account (video.cpp:3572); our registry target
+    // is a colour target, so they are not queued for one.
+    if (!depth) {
+      g_pending_surface_targets.push_back(surface);
+    }
   }
   // The engine's own names (SceneRenderTargets.cpp:1042/1058): the scene colour
   // surface is created as "DefaultColor", with "DefaultColorRaw" and
@@ -3553,6 +3620,18 @@ bool CaptureDraw(const std::uint8_t* base, const DrawDesc& d) {
       pass_rtv_format = g_passes[g_pass_current].rtv_format;
       pass_no_depth = g_passes[g_pass_current].no_depth;
     }
+    // ONE TARGET MEANS ONE FORMAT. A pipeline that names a render-target format
+    // the bound target does not have is a draw the hardware DISCARDS IN
+    // SILENCE - no error, no debug-layer message unless it is switched on. We
+    // have already lost a day to the depth half of this rule (a PSO naming a
+    // DSV while none was bound turned every menu black); the colour half is the
+    // same rule and it is why flat mode came out black while the log happily
+    // reported submitting draws of 101550 indices. Every draw's PSO carried its
+    // ORIGINAL pass surface's format, and flat mode binds one target of ours.
+    if (FlatSceneMode()) {
+      pass_rtv_format = kColorFormat;
+      pass_no_depth = false;
+    }
     // Reference shape: EVERY pass is captured and rendered into its own native
     // target. The old "resolve only the voted pass" filter is gone - it was
     // the reason shadows, post-processing and the UI never existed natively.
@@ -3708,14 +3787,46 @@ bool CaptureDraw(const std::uint8_t* base, const DrawDesc& d) {
       g_no_stream.fetch_add(1, std::memory_order_relaxed);
       return false;
     }
-    BufferFetch fetch;
+    // THE API ALREADY ANSWERED THIS. When the stream was paired - the D3D object
+    // came out of RHISetStreamSource for this same stream - the bound buffer is
+    // the RHI object, and FXeGPUResource::BaseAddress at +12 is where its data
+    // lives, because AllocVertexBuffer put it there
+    // (XeD3DVertexBuffer.cpp:63 XGOffsetResourceAddress(Resource, BaseAddress)).
+    //
+    // This is what owning the resource would buy, obtained without owning it:
+    // the reference reads buffer->buffer and buffer->dataSize off its own struct
+    // and never looks at a fetch constant. The fetch is consulted below only for
+    // a SIZE, and is allowed to disagree without costing the draw - it cannot
+    // contradict the game's own field about where the data is.
+    BufferFetch fetch{};
     std::uint8_t fail = kVbFailNone;
-    if (!ResolveBuffer(base, d.vb_guest[s], d.vb_d3d[s], fetch, &fail)) {
-      g_size_unknown.fetch_add(1, std::memory_order_relaxed);
-      g_no_vbobj.fetch_add(1, std::memory_order_relaxed);
-      NoteVbObjFail(base, s, d.vb_guest[s], d.vb_d3d[s], d.stride[s], fail);
-      return false;
+    const bool have_fetch = ResolveBuffer(base, d.vb_guest[s], d.vb_d3d[s], fetch, &fail);
+    std::uint32_t data_addr = 0;
+    if (d.vb_paired[s] != 0 && GuestAddrPlausible(d.vb_guest[s]) &&
+        ObjectReadable(base, d.vb_guest[s], 20)) {
+      const std::uint32_t ba = LoadBE32(base + d.vb_guest[s] + 12);
+      if (GuestDataAddrPlausible(ba)) {
+        data_addr = ba;
+      }
     }
+    if (data_addr == 0) {
+      // Unpaired: a raw device bind, which is FGPUMemMove's defrag and nothing
+      // else we want. Without the pairing there is no object to believe, so the
+      // fetch remains the only evidence - and if it does not agree with an RHI
+      // object, the draw is not ours to reproduce.
+      if (!have_fetch) {
+        g_size_unknown.fetch_add(1, std::memory_order_relaxed);
+        g_no_vbobj.fetch_add(1, std::memory_order_relaxed);
+        NoteVbObjFail(base, s, d.vb_guest[s], d.vb_d3d[s], d.stride[s], fail);
+        return false;
+      }
+      data_addr = fetch.addr;
+    }
+    // A size from the fetch counts only when it describes THIS buffer.
+    if (!have_fetch || fetch.addr != data_addr) {
+      fetch.size = 0;
+    }
+    fetch.addr = data_addr;
     g_size_known.fetch_add(1, std::memory_order_relaxed);
     // The RHI object carries the usage flags that say whether the game repacks
     // this buffer; when the draw only reached us through the device it is
@@ -3840,6 +3951,11 @@ void CaptureUPBegin(const std::uint8_t* base, const UPDraw& u) {
       pass_rtv_format = g_passes[g_pass_current].rtv_format;
       pass_no_depth = g_passes[g_pass_current].no_depth;
     }
+  }
+  // One target, one format - see the note in CaptureDraw.
+  if (FlatSceneMode()) {
+    pass_rtv_format = kColorFormat;
+    pass_no_depth = false;
   }
 
   const DrawDesc& d = u.d;
@@ -4386,8 +4502,18 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   // buffer, which is not known until a draw has been captured. Creating them on
   // the first frame instead baked in the wrong end of the depth range and every
   // later comparison failed.
-  const std::uint32_t tw = g_published_w.load(std::memory_order_relaxed);
-  const std::uint32_t th = g_published_h.load(std::memory_order_relaxed);
+  // FLAT MODE SIZES THE TARGET BY THE OUTPUT, NOT BY A VOTE. g_published_w/h is
+  // the winning pass's viewport, and measured 28.07 that vote picked a 512x16
+  // utility pass: the whole frame was rendered into a sixteen-pixel-tall strip
+  // and blitted up to the screen, which is the smeared horizontal band the user
+  // photographed. skate3 has no such quantity - its scene target is
+  // guest_output sized (skate3_native_scene_gpu.cpp:3993 EnsureOutputSizedTargets)
+  // because the frame is the frame.
+  const bool flat_mode = FlatSceneMode();
+  const std::uint32_t tw =
+      flat_mode ? width : g_published_w.load(std::memory_order_relaxed);
+  const std::uint32_t th =
+      flat_mode ? height : g_published_h.load(std::memory_order_relaxed);
   if (!EnsureTargets(device, tw, th) || !EnsureComposite(device)) {
     return false;
   }
@@ -4453,6 +4579,43 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
 
   if (!EnsureRegHeaps(device)) {
     return false;
+  }
+  // EVERY SURFACE A RESOLVE POINTS AT GETS ITS TEXTURE HERE - the reference's
+  // CreateSurface, moved to the first moment we have a device. Until this
+  // existed, a surface only had an SRV once a draw had landed in it, so the
+  // scene's own resolve destination sampled white on every frame that drew the
+  // world into a pass we had not yet built a target for.
+  {
+    std::vector<std::uint32_t> pending;
+    {
+      std::lock_guard<std::mutex> lk(g_reg_mutex);
+      pending.swap(g_pending_surface_targets);
+    }
+    for (const std::uint32_t key : pending) {
+      std::uint32_t sw = 0, sh = 0;
+      DXGI_FORMAT sfmt = kColorFormat;
+      bool is_depth = false;
+      {
+        std::lock_guard<std::mutex> lk(g_reg_mutex);
+        const auto meta = g_surface_meta.find(key);
+        if (meta == g_surface_meta.end()) {
+          continue;  // never saw it created; its size is not ours to invent
+        }
+        sw = meta->second.w;
+        sh = meta->second.h;
+        is_depth = meta->second.is_depth;
+        if (SurfaceFormatOn() && meta->second.dxgi != DXGI_FORMAT_UNKNOWN) {
+          sfmt = meta->second.dxgi;
+        }
+      }
+      // Depth resolves are never sampled as colour, and the reference does not
+      // copy them at all ("depth stencil textures in this game are guaranteed
+      // to be transient", video.cpp:3572).
+      if (is_depth || sw == 0 || sh == 0) {
+        continue;
+      }
+      GetOrCreateRegTarget(device, key, sw, sh, true, sfmt);
+    }
   }
   // The scene target's bindless SRV, so textures the game resolves the scene
   // into sample OUR scene. Recreated in place whenever g_color is rebuilt.
@@ -5071,7 +5234,40 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   // frame (black, plus whatever did draw) instead of returning false and
   // letting the presenter show guest memory the Xenos never rasterised - which
   // was the standing white screen.
-  if (OwnDeviceMode()) {
+  // THE FLAT SCENE: one target, every draw, submission order (skate3's model).
+  // Bound once here and never switched, so the item loop below skips the pass
+  // machinery entirely.
+  const bool flat = flat_mode;
+  if (flat) {
+    D3D12_CPU_DESCRIPTOR_HANDLE frtv = g_rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE fdsv = g_dsv_heap->GetCPUDescriptorHandleForHeapStart();
+    // DPOUR_NR_FLAT_PROBE=1: clear the scene target to a colour nothing in this
+    // game produces. It answers, in one run, the question every measurement so
+    // far has left open - does ANYTHING written into this target reach the
+    // screen? A magenta screen means the target, the blit, the presenter and the
+    // swapchain are all sound and the draws are the problem; a black screen
+    // means the chain is broken downstream of the draws and every conclusion
+    // drawn from draw counters has been about the wrong half of the pipeline.
+    static const bool probe = EnvOn("DPOUR_NR_FLAT_PROBE");
+    if (probe) {
+      const float magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+      dl->D3DClearRenderTargetView(frtv, magenta, 0, nullptr);
+    } else {
+      dl->D3DClearRenderTargetView(frtv, clear_color, 0, nullptr);
+    }
+    dl->D3DClearDepthStencilView(fdsv, D3D12_CLEAR_FLAG_DEPTH, g_depth_clear, 0, 0, nullptr);
+    dl->D3DOMSetRenderTargets(1, &frtv, FALSE, &fdsv);
+    const D3D12_VIEWPORT fvp{0.0f, 0.0f, static_cast<float>(tw), static_cast<float>(th),
+                             0.0f, 1.0f};
+    const D3D12_RECT fsc{0, 0, static_cast<LONG>(tw), static_cast<LONG>(th)};
+    dl->RSSetViewport(fvp);
+    dl->RSSetScissorRect(fsc);
+    cur_rtvh = frtv;
+    cur_dsvh = fdsv;
+    cur_has_rtv = true;
+    cur_has_dsv = true;
+    pass_ok = true;
+  } else if (OwnDeviceMode()) {
     bind_guest_output_direct();
   }
   for (std::size_t item_index = 0; item_index < items.size(); ++item_index) {
@@ -5080,8 +5276,31 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
       break;
     }
     // The game's own Clears, at their recorded positions (ProcClear's job).
-    run_clears_upto(static_cast<std::uint32_t>(item_index));
-    if (it.pass != current_pass) {
+    // In flat mode they would wipe the one target mid-frame, since every pass's
+    // clear now lands on the same surface - so the single clear above is the
+    // frame's only one.
+    if (!flat) {
+      run_clears_upto(static_cast<std::uint32_t>(item_index));
+    }
+    // FLAT COLOUR, PER-PASS DEPTH.
+    //
+    // One colour target is the point; one DEPTH buffer across every pass is a
+    // mistake I made building it. The game renders shadow maps, reflections and
+    // downsample passes from other viewpoints entirely, and flattening them
+    // onto a single depth buffer lets whichever drew first occlude the world.
+    // Measured: 52.7M pixels passed all tests over 572 frames, i.e. the draws
+    // DO rasterise - but only ~7k-92k pixels per frame survive, 0.2% of a
+    // 2560x1440 screen. That is not a missing image, that is an image being
+    // depth-killed by geometry from a different camera.
+    //
+    // Clearing depth when the guest's pass changes restores each pass's own
+    // depth semantics without reintroducing a pass TABLE, a vote, or a target
+    // registry: we only watch the number change.
+    if (flat && it.pass != current_pass) {
+      current_pass = it.pass;
+      dl->D3DClearDepthStencilView(cur_dsvh, D3D12_CLEAR_FLAG_DEPTH, g_depth_clear, 0, 0, nullptr);
+    }
+    if (!flat && it.pass != current_pass) {
       // THE COPY GOES HERE, WHERE THE REFERENCE PUTS IT.
       //
       // Unleashed does not batch its stretch-rect copies at the end of the
@@ -5311,7 +5530,44 @@ bool RenderRecorded(ID3D12Device* device, rex::graphics::d3d12::DeferredCommandL
   // photo viewer, the CAS editor, the warmup gate); it never counts draws and
   // compares against a constant. Neither should we: "the game drew into its back
   // buffer" is a fact about the frame, "sixteen" is a guess about it.
-  if (guestout_is_bound) {
+  // FLAT MODE: the one target IS the frame. Hand it to the blit, which is the
+  // whole of our "post chain" - skate3 runs a real one here (resolve, SSAO,
+  // bloom, tonemap) and writes the result to guest_output the same way.
+  if (flat && g_color) {
+    D3D12_RESOURCE_BARRIER to_srv{};
+    to_srv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    to_srv.Transition.pResource = g_color.Get();
+    to_srv.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    to_srv.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    to_srv.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    dl->D3DResourceBarrier(1, &to_srv);
+    guestout_drawn = CompositeToGuestOutput(device, dl, out_res, width, height, g_color.Get());
+    D3D12_RESOURCE_BARRIER back = to_srv;
+    back.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    back.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    dl->D3DResourceBarrier(1, &back);
+    // PROBE STAGE 2: write magenta into the PRESENTER'S OWN IMAGE with nothing
+    // but a clear - no composite pipeline, no shader, no descriptor heap, no
+    // sampling. This is the most primitive write the callback can make. If the
+    // screen is still black after it, then nothing this callback records ever
+    // reaches the display and every draw-side measurement so far has been
+    // answering a question about the wrong half of the pipeline.
+    static const bool probe_out = EnvOn("DPOUR_NR_FLAT_PROBE");
+    if (probe_out && bind_guest_output_direct()) {
+      const float magenta[4] = {1.0f, 0.0f, 1.0f, 1.0f};
+      dl->D3DClearRenderTargetView(cur_rtvh, magenta, 0, nullptr);
+      transition_guest_output(D3D12_RESOURCE_STATE_RENDER_TARGET,
+                              rex::ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+      guestout_is_bound = false;
+      guestout_drawn = true;
+    }
+    static std::atomic<std::uint64_t> n{0};
+    const std::uint64_t i = n.fetch_add(1, std::memory_order_relaxed);
+    if (i == 0 || (i % 600) == 0) {
+      REXLOG_INFO("[native-scene] FLAT: {} draws into one {}x{} target -> guest output ({})",
+                  issued, tw, th, guestout_drawn ? "shown" : "BLIT FAILED");
+    }
+  } else if (guestout_is_bound) {
     // The game's composition went straight into the presenter's image, so there
     // is nothing left to composite - only the state to hand back. This is the
     // branch the references have (and the one below is the branch they do not).

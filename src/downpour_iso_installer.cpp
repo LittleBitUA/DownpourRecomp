@@ -312,9 +312,18 @@ bool InstallGameDataFromIso(const std::filesystem::path& iso_path,
     return false;
   }
 
-  // Extract in disc order for sequential reads. Files already extracted with
-  // the right size are skipped so an interrupted install can resume.
+  // Extract in disc order for sequential reads, except default.xex, which
+  // goes last: it doubles as the "install complete" marker
+  // (IsGameDataInstalled), so writing it only after everything else
+  // guarantees an interrupted extraction re-opens the installer on next
+  // launch and resumes. Files already extracted with the right size are
+  // skipped, so that resume is cheap.
   std::sort(files.begin(), files.end(), [](const DiscFileEntry& a, const DiscFileEntry& b) {
+    const bool a_is_marker = a.relative_path == "default.xex";
+    const bool b_is_marker = b.relative_path == "default.xex";
+    if (a_is_marker != b_is_marker) {
+      return b_is_marker;
+    }
     return a.start_sector < b.start_sector;
   });
   for (const auto& f : files) {

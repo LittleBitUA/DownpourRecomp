@@ -13,6 +13,7 @@ include(generated/rexglue.cmake)
 # Sources
 set(DOWNPOUR_SOURCES
     src/main.cpp
+    src/downpour_iso_installer.cpp
     src/downpour_title_update_installer.cpp
 )
 

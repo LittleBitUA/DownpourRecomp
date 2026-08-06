@@ -4,14 +4,17 @@
 
 #pragma once
 
+#include <cstdlib>
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <string_view>
 
 #include <rex/filesystem.h>
 #include <rex/logging.h>
 #include <rex/rex_app.h>
 
+#include "downpour_iso_installer.h"
 #include "downpour_title_update_installer.h"
 
 class DownpourApp : public rex::ReXApp {
@@ -24,22 +27,68 @@ class DownpourApp : public rex::ReXApp {
         downpour_PPCImageConfig));
   }
 
-  // Gate the runtime launch behind Title Update 1: if the user has not yet
-  // staged default.xexp next to the game files, open the installer wizard and
-  // pause path finalization until they finish. Mirrors the Skate 3 / EA
-  // installer pattern (see mchughalex/skate3recomp/src/skate3_app_common.cpp).
-  // Honors a DOWNPOUR_INSTALL_TU env override for headless installs.
+  // Gate the runtime launch behind the two first-run install steps:
+  //
+  //  1. Game data — if assets/default.xex is missing, open the disc image
+  //     installer wizard: the user picks their own Downpour .iso and its
+  //     XDVDFS game partition is extracted into game_data_root. The wizard
+  //     also best-effort auto-stages TU1 so a fresh install usually needs
+  //     exactly one user action (picking the ISO).
+  //  2. Title Update 1 — if default.xexp is still not staged (offline
+  //     install, mirror down), open the TU installer wizard.
+  //
+  // Mirrors the Skate 3 / EA installer pattern (see
+  // mchughalex/skate3recomp/src/skate3_app_common.cpp). Honors
+  // DOWNPOUR_INSTALL_ISO and DOWNPOUR_INSTALL_TU env overrides for headless
+  // installs (a path to the source file, or "download" for the TU).
   std::optional<rex::PathConfig> OnFinalizePaths(
       const rex::PathConfig& defaults,
       std::function<void(rex::PathConfig)> resume) override {
     rex::PathConfig runtime_paths = defaults;
-    if (downpour::IsTitleUpdateInstalled(runtime_paths.game_data_root)) {
+    const auto& game_root = runtime_paths.game_data_root;
+
+    if (!downpour::IsGameDataInstalled(game_root)) {
+      if (const char* iso = std::getenv("DOWNPOUR_INSTALL_ISO");
+          iso != nullptr && *iso != '\0') {
+        std::string error;
+        REXLOG_INFO("Installing game data from DOWNPOUR_INSTALL_ISO={}", iso);
+        if (!downpour::InstallGameDataFromIso(iso, game_root, nullptr, nullptr,
+                                              error)) {
+          REXLOG_ERROR("Automated game data installation failed: {}", error);
+        }
+      }
+    }
+    if (!downpour::IsGameDataInstalled(game_root)) {
+      REXLOG_INFO(
+          "Silent Hill: Downpour game data not found at {}; launching the "
+          "disc image installer.",
+          game_root.string());
+      downpour::ShowIsoInstallWizard(imgui_drawer(), std::move(runtime_paths),
+                                     std::move(resume));
+      return std::nullopt;
+    }
+
+    if (!downpour::IsTitleUpdateInstalled(game_root)) {
+      if (const char* tu = std::getenv("DOWNPOUR_INSTALL_TU");
+          tu != nullptr && *tu != '\0') {
+        std::string error;
+        REXLOG_INFO("Installing title update from DOWNPOUR_INSTALL_TU={}", tu);
+        const bool ok =
+            std::string_view(tu) == "download"
+                ? downpour::TryDownloadAndStageTitleUpdate(game_root, error)
+                : downpour::StageTitleUpdateFromFile(tu, game_root, error);
+        if (!ok) {
+          REXLOG_ERROR("Automated title update installation failed: {}", error);
+        }
+      }
+    }
+    if (downpour::IsTitleUpdateInstalled(game_root)) {
       return runtime_paths;
     }
     REXLOG_INFO(
         "Silent Hill: Downpour Title Update 1 not staged at {}; launching the "
         "title update installer.",
-        runtime_paths.game_data_root.string());
+        game_root.string());
     downpour::ShowTitleUpdateInstallWizard(
         imgui_drawer(), std::move(runtime_paths), std::move(resume));
     return std::nullopt;

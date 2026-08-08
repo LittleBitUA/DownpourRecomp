@@ -46,6 +46,7 @@ constexpr std::string_view kVolumeMagic = "MICROSOFT*XBOX*MEDIA";
 constexpr std::array<uint64_t, 3> kPartitionBases = {0x0ull, 0xFD90000ull, 0x2080000ull};
 constexpr uint8_t kAttributeDirectory = 0x10;
 constexpr uint16_t kEmptyDirectorySentinel = 0xFFFF;
+constexpr uint32_t kMaxDirectoryDepth = 32;
 
 uint16_t Le16(const uint8_t* p) {
   return static_cast<uint16_t>(p[0] | (p[1] << 8));
@@ -101,7 +102,24 @@ class XdvdfsImageReader {
     }
     const uint32_t root_sector = Le32(descriptor.data());
     const uint32_t root_size = Le32(descriptor.data() + 4);
-    return WalkDirectory(root_sector, root_size, {}, files, error);
+    return WalkDirectory(root_sector, root_size, {}, 0, files, error);
+  }
+
+  bool HasXex2Magic(const DiscFileEntry& entry, std::string& error) {
+    std::array<char, 4> magic{};
+    file_.clear();
+    file_.seekg(static_cast<std::streamoff>(partition_base_ +
+                                            static_cast<uint64_t>(entry.start_sector) *
+                                                kSectorSize));
+    if (!file_.read(magic.data(), magic.size())) {
+      error = "The disc image's default.xex is truncated.";
+      return false;
+    }
+    if (std::string_view(magic.data(), magic.size()) != "XEX2") {
+      error = "The disc image's default.xex is corrupt (missing XEX2 header).";
+      return false;
+    }
+    return true;
   }
 
   bool ExtractFile(const DiscFileEntry& entry, const std::filesystem::path& destination,
@@ -148,7 +166,14 @@ class XdvdfsImageReader {
  private:
   bool WalkDirectory(uint32_t table_sector, uint32_t table_size,
                      const std::filesystem::path& relative_dir,
+                     uint32_t depth,
                      std::vector<DiscFileEntry>& files, std::string& error) {
+    if (depth > kMaxDirectoryDepth) {
+      error = "The disc image's directory tree exceeds the supported depth of " +
+              std::to_string(kMaxDirectoryDepth) + ".";
+      REXLOG_ERROR("{}", error);
+      return false;
+    }
     if (table_size == 0) {
       return true;  // Empty directory.
     }
@@ -184,12 +209,23 @@ class XdvdfsImageReader {
       const uint32_t size = Le32(table.data() + offset + 8);
       const uint8_t attributes = table[offset + 12];
       const uint8_t name_length = table[offset + 13];
-      if (name_length > 0 && offset + 14 + name_length <= table.size()) {
+      if (offset + 14 + name_length <= table.size()) {
         const std::string name(reinterpret_cast<const char*>(table.data() + offset + 14),
                                name_length);
-        const auto child_path = relative_dir / name;
+        const std::filesystem::path name_path(name);
+        if (name.empty() || name == "." || name == ".." ||
+            name.find('\0') != std::string::npos || name.find('/') != std::string::npos ||
+            name.find('\\') != std::string::npos || name_path.is_absolute() ||
+            name_path.has_root_name() || name_path.has_root_directory()) {
+          error = "The disc image contains an unsafe directory entry name.";
+          REXLOG_ERROR("Rejecting unsafe XDVDFS entry name '{}' under '{}'.", name,
+                       relative_dir.string());
+          return false;
+        }
+        const auto child_path = relative_dir / name_path;
         if (attributes & kAttributeDirectory) {
-          if (!WalkDirectory(start_sector, size, child_path, files, error)) {
+          if (!WalkDirectory(start_sector, size, child_path, depth + 1, files,
+                             error)) {
             return false;
           }
         } else {
@@ -230,6 +266,11 @@ std::filesystem::path PickIsoFile() {
     return {};
   }
   return filename;
+}
+#elif defined(__APPLE__)
+std::filesystem::path PickIsoFile() {
+  REXLOG_ERROR("The ISO file picker is not implemented on macOS.");
+  return {};
 }
 #else
 std::filesystem::path PickIsoFile() {
@@ -286,13 +327,16 @@ bool InstallGameDataFromIso(const std::filesystem::path& iso_path,
   if (!reader.ListFiles(files, error)) {
     return false;
   }
-  const bool has_xex = std::any_of(files.begin(), files.end(), [](const DiscFileEntry& f) {
+  const auto xex = std::find_if(files.begin(), files.end(), [](const DiscFileEntry& f) {
     return f.relative_path == "default.xex";
   });
-  if (!has_xex) {
+  if (xex == files.end()) {
     error =
         "The disc image does not contain default.xex at its root; it is not a "
         "Silent Hill: Downpour game disc.";
+    return false;
+  }
+  if (!reader.HasXex2Magic(*xex, error)) {
     return false;
   }
 

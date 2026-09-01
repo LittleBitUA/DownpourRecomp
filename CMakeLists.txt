@@ -8,6 +8,67 @@ project(downpour LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# === DPOUR MIGRATION 2026-08-01: CPU baseline (issue #11) =====================
+#
+# We were shipping -march=x86-64-v3, which MANDATES AVX2 + BMI2 + FMA. Measured
+# on the shipped rexruntimerd.dll: 4898 AVX2-only instructions across 259
+# distinct functions, including std::_Hash_vec::_Assign_grow,
+# VirtualFileSystem::UnregisterSymbolicLink and XexModule::ApplyPatch - i.e.
+# ordinary whole-program auto-vectorisation, not runtime-dispatched kernels. So
+# it is a hard requirement, not a fast path.
+#
+# x86-64-v3 means Intel Haswell (2013) / AMD Excavator (2015) or newer. The
+# reporter in issue #11 has an FX-8300 (Piledriver, 2012): it HAS AVX, and no
+# AVX2. downpour.exe imports rexruntimerd.dll statically, so the bad
+# instructions are reached during DLL init, before main() and before logging -
+# which is exactly what was reported: 0xc0000142 (STATUS_DLL_INIT_FAILED) and a
+# log folder that never appears.
+#
+# NOTE the thread on issue #11 calls this "AVX". That is wrong and it matters:
+# the affected owners DO have AVX. The line is AVX2.
+#
+# Copied from skate3recomp (_ref_skate3/CMakeLists.txt:92-137), including the
+# part that is easy to miss: Snappy runs its OWN feature detection and does not
+# see directory-level compile options, so lowering -march alone still leaves
+# AVX2/BMI2 code in the binary. Their comment says so verbatim.
+#
+# Default OFF = the compatible build, as in the reference.
+option(DPOUR_ENABLE_X86_64_V3
+    "Build x86_64 desktop binaries for x86-64-v3 CPUs (AVX2/BMI2)"
+    OFF)
+
+if(NOT APPLE AND CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
+    if(DPOUR_ENABLE_X86_64_V3)
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            add_compile_options(-march=x86-64-v3)
+            set(SNAPPY_REQUIRE_AVX2 ON CACHE BOOL
+                "Match Snappy feature detection to the project x86-64-v3 target" FORCE)
+            set(SNAPPY_HAVE_SSSE3 1 CACHE INTERNAL
+                "x86-64-v3 requires SSSE3; Snappy checks do not see directory compile options" FORCE)
+            set(SNAPPY_HAVE_X86_CRC32 1 CACHE INTERNAL
+                "x86-64-v3 requires SSE4.2 CRC32; Snappy checks do not see directory compile options" FORCE)
+            set(SNAPPY_HAVE_BMI2 1 CACHE INTERNAL
+                "x86-64-v3 requires BMI2; Snappy checks do not see directory compile options" FORCE)
+        elseif(MSVC)
+            add_compile_options(/arch:AVX2)
+        endif()
+    else()
+        if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+            add_compile_options(-march=x86-64 -mtune=generic -mssse3)
+        endif()
+        set(SNAPPY_REQUIRE_AVX OFF CACHE BOOL
+            "Do not require AVX for the compatibility build" FORCE)
+        set(SNAPPY_REQUIRE_AVX2 OFF CACHE BOOL
+            "Do not require AVX2 for the compatibility build" FORCE)
+        set(SNAPPY_HAVE_SSSE3 0 CACHE INTERNAL
+            "Keep Snappy on its scalar path for the compatibility build" FORCE)
+        set(SNAPPY_HAVE_X86_CRC32 0 CACHE INTERNAL
+            "Compatibility build must not require SSE4.2 CRC32" FORCE)
+        set(SNAPPY_HAVE_BMI2 0 CACHE INTERNAL
+            "Compatibility build must not require BMI2" FORCE)
+    endif()
+endif()
+
 include(generated/rexglue.cmake)
 
 # Sources
@@ -16,68 +77,11 @@ set(DOWNPOUR_SOURCES
     src/downpour_title_update_installer.cpp
 )
 
-# dpour-fork 2026-07-25: one switch that builds the game with NO native render
-# at all - not merely with it disabled at runtime.
-#
-# Every native-render feature is already off unless its environment variable is
-# set, but "off at runtime" is an argument, and an argument is not a measurement.
-# Configuring with -DDPOUR_NO_NATIVE_RENDER=ON produces a binary that cannot
-# contain any of it, so a frame-time comparison between the two settles whether
-# this code costs anything at all.
-option(DPOUR_NO_NATIVE_RENDER "Build without the native render layer entirely" OFF)
-if(NOT DPOUR_NO_NATIVE_RENDER)
-    list(APPEND DOWNPOUR_SOURCES
-    # === DPOUR MIGRATION 2026-07-24: native-render Phase 0 hook harness +
-    # Phase 1a isolated D3D12 device bring-up. Remove these lines + delete the
-    # src/downpour_native_render.cpp / src/downpour_native_d3d12.cpp files to
-    # fully revert.
-    src/downpour_native_render.cpp
-    src/downpour_native_d3d12.cpp
-    # Phase 1b: on-screen native overlay (UIDrawer on the runtime's swapchain).
-    src/downpour_native_overlay.cpp
-    # Phase 2: RHI render-path hooks (log-only proof of resolved addresses).
-    src/downpour_native_draws.cpp
-    # Phase 3: capture the game's real geometry + draw it with native D3D12.
-    src/downpour_native_geo.cpp
-    # Phase 4: decode the game's Xenos textures into native D3D12 textures.
-    src/downpour_native_tex.cpp
-    # The surface / EDRAM / resolve layer, transcribed from the game's own
-    # renderer (XeD3DRenderTarget.cpp + SceneRenderTargets.cpp).
-    src/downpour_native_surfaces.cpp
-    # Phase 5: read the game's vertex declarations so every vertex factory
-    # (BSP, terrain, foliage, decals) is captured, not just static meshes.
-    src/downpour_native_decl.cpp
-    # Phase 3 (shaders): harvest Xenos shader containers from guest RAM so
-    # XenosRecomp can translate them to DXIL offline.
-    src/downpour_shader_dump.cpp
-    # Phase 5 (shaders): load those translated shaders back and pair them with
-    # whatever the game binds - the game's own materials instead of ours.
-    src/downpour_native_shaders.cpp
-    # Phase 5 (shaders): the root signature / PSO / constant plumbing those
-    # translated shaders require. The layout is dictated by the DXIL, not by us.
-    src/downpour_native_pipeline.cpp
-    # Phase 5 (shaders): host vertex/index buffers with the dword byte swap the
-    # reference does at Unlock - see the header for why the moment differs here.
-    src/downpour_native_vbuffers.cpp
-    # Phase 5 (shaders): the guest's VS/PS constant banks, which the translated
-    # shaders address by register number.
-    src/downpour_native_constants.cpp
-    # Phase 5 (draw path): the guest's pipeline state, read out of the Xenos
-    # register shadow inside its D3D device - the XDK inlines SetRenderState, so
-    # there is no function to hook and the shadow IS the state.
-    src/downpour_native_state.cpp
-    # Phase 5 (draw path): the game's own draws, replayed on our own D3D12
-    # pipeline into our own targets. This is what all of the above was for.
-    src/downpour_native_scene.cpp
-    # Phase 6 (data-driven layer, the skate3recomp approach): the ENGINE's own
-    # per-frame mesh stream, tapped at FMeshDrawingPolicy::DrawMesh. Carries
-    # what the D3D layer cannot recover - transform, material, priority group.
-    src/downpour_native_ue3.cpp
-    )
-endif()
-if(DPOUR_NO_NATIVE_RENDER)
-    add_compile_definitions(DPOUR_NO_NATIVE_RENDER=1)
-endif()
+# dpour-fork 2026-08-08: the native render layer is RETIRED by owner decision.
+# All of its sources and docs live in _archived_native_render/; the guard
+# macro below keeps the app-side hooks compiled out. The game renders through
+# the SDK's emulated path only.
+add_compile_definitions(DPOUR_NO_NATIVE_RENDER=1)
 
 # dpour-fork 2026-07-03: embed the unique game icon on Windows so
 # downpour.exe shows the silhouette+doorway art in Explorer / taskbar /

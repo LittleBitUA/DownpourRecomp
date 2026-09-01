@@ -30,6 +30,17 @@ bool IsTitleUpdateInstalled(const std::filesystem::path& game_root);
 bool StageTitleUpdateFromFile(const std::filesystem::path& source,
                               const std::filesystem::path& game_root, std::string& error);
 
+// Downloads the TU container from the configured downpour_title_update_url,
+// stages its payload into game_root, and verifies the result. Used to chain
+// the title update automatically behind the game data (ISO) installer.
+bool TryDownloadAndStageTitleUpdate(const std::filesystem::path& game_root, std::string& error);
+
+// Shared installer-wizard completion: restart the process so the fresh launch
+// picks up freshly-staged files (resuming the runtime inline hangs on Win32);
+// falls back to the SDK resume callback where restarting is unavailable.
+void RelaunchSelfOrResume(rex::PathConfig runtime_paths,
+                          std::function<void(rex::PathConfig)> complete);
+
 void ShowTitleUpdateInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig runtime_paths,
                                   std::function<void(rex::PathConfig)> complete);
 bool RunTitleUpdateInstallWizardBlocking(rex::ui::WindowedAppContext& app_context,

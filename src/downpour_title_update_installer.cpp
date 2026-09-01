@@ -642,6 +642,54 @@ bool DownloadAndStageTitleUpdate(const std::filesystem::path& game_root,
 
 }  // namespace
 
+bool TryDownloadAndStageTitleUpdate(const std::filesystem::path& game_root, std::string& error) {
+  std::atomic<uint64_t> copied_bytes{0};
+  std::atomic<uint64_t> total_bytes{0};
+  if (!DownloadAndStageTitleUpdate(game_root, copied_bytes, total_bytes, error)) {
+    return false;
+  }
+  if (!IsTitleUpdateInstalled(game_root)) {
+    error = "The title update could not be verified after installation.";
+    return false;
+  }
+  return true;
+}
+
+void RelaunchSelfOrResume(rex::PathConfig runtime_paths,
+                          std::function<void(rex::PathConfig)> complete) {
+#if defined(_WIN32)
+  wchar_t exe_path[MAX_PATH];
+  DWORD len = GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
+  if (len > 0 && len < MAX_PATH) {
+    // Reuse our current command line verbatim so any --flags
+    // (game_data_root override, dev cvars, etc.) survive.
+    std::wstring cmd = GetCommandLineW();
+    // CreateProcessW needs a mutable buffer for lpCommandLine.
+    std::vector<wchar_t> cmd_buf(cmd.begin(), cmd.end());
+    cmd_buf.push_back(L'\0');
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    if (CreateProcessW(exe_path, cmd_buf.data(), nullptr, nullptr, FALSE, 0, nullptr, nullptr,
+                       &si, &pi)) {
+      CloseHandle(pi.hThread);
+      CloseHandle(pi.hProcess);
+      REXLOG_INFO(
+          "Install step complete; restarting downpour.exe to pick up the "
+          "freshly-staged files. Process exits now.");
+      ExitProcess(0);
+    }
+    REXLOG_ERROR(
+        "Failed to spawn fresh downpour.exe after install (Win32 error {}); "
+        "falling back to inline resume callback.",
+        GetLastError());
+  }
+#endif
+  if (complete) {
+    complete(std::move(runtime_paths));
+  }
+}
+
 bool IsTitleUpdateInstalled(const std::filesystem::path& game_root) {
   for (const auto& payload : kPayloads) {
     const auto staged = game_root / std::filesystem::path(std::string(payload.staged_path));
@@ -783,40 +831,7 @@ void ShowTitleUpdateInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig 
         // restart the process. The fresh launch sees TU1 already
         // installed (IsTitleUpdateInstalled == true), skips the wizard,
         // and boots straight into the game.
-        //
-        // We still keep `complete` and `runtime_paths` captured so the
-        // non-Windows fallback below has a chance to work the old way.
-#if defined(_WIN32)
-        wchar_t exe_path[MAX_PATH];
-        DWORD len = GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
-        if (len > 0 && len < MAX_PATH) {
-          // Reuse our current command line verbatim so any --flags
-          // (game_data_root override, dev cvars, etc.) survive.
-          std::wstring cmd = GetCommandLineW();
-          // CreateProcessW needs a mutable buffer for lpCommandLine.
-          std::vector<wchar_t> cmd_buf(cmd.begin(), cmd.end());
-          cmd_buf.push_back(L'\0');
-          STARTUPINFOW si{};
-          si.cb = sizeof(si);
-          PROCESS_INFORMATION pi{};
-          if (CreateProcessW(exe_path, cmd_buf.data(), nullptr, nullptr, FALSE,
-                             0, nullptr, nullptr, &si, &pi)) {
-            CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
-            REXLOG_INFO(
-                "Title update installed; restarting downpour.exe to pick up "
-                "the freshly-staged payload. Process exits now.");
-            ExitProcess(0);
-          }
-          REXLOG_ERROR(
-              "Failed to spawn fresh downpour.exe after TU install (Win32 "
-              "error {}); falling back to inline resume callback.",
-              GetLastError());
-        }
-#endif
-        if (complete) {
-          complete(std::move(runtime_paths));
-        }
+        RelaunchSelfOrResume(std::move(runtime_paths), std::move(complete));
       });
 }
 

@@ -20,12 +20,23 @@
 // what validation names on the spot; carrying our own layer means never being
 // blind to that class again.
 //
-// Absent the D3D12 folder these exports are harmless: the loader falls back to
-// the system runtime.
+// 2026-09-03 (issue #29): the exports are NOT harmless without the folder. The
+// loader only ignores them when the OS inbox runtime is already >= the exported
+// version (Windows 11 24H2+, where 1.1.7 was built and tested). On any older
+// Windows the loader insists on D3D12SDKPath\D3D12Core.dll, and when it is
+// missing every D3D12CreateDevice fails -> "Failed to get an adapter supporting
+// Direct3D 12 with the feature level of at least 11_0" at boot. v1.1.6 shipped
+// no exports and the same machines booted fine. The native-render work that
+// needed the validation layer is retired, so the exports are opt-in for local
+// debugging only: build with -DDPOUR_AGILITY_SDK=1 and put D3D12\D3D12Core.dll
+// (+ d3d12SDKLayers.dll) next to the executable. Release builds use the inbox
+// runtime, exactly like 1.1.6.
+#if defined(DPOUR_AGILITY_SDK) && DPOUR_AGILITY_SDK
 extern "C" {
 __declspec(dllexport) extern const unsigned int D3D12SDKVersion = 614;
 __declspec(dllexport) extern const char* D3D12SDKPath = ".\\D3D12\\";
 }
+#endif
 // === END DPOUR MIGRATION 2026-07-28 ==========================================
 
 REX_DEFINE_APP(downpour, DownpourApp::Create)

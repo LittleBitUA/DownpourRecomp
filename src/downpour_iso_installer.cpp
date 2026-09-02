@@ -394,11 +394,12 @@ void ShowIsoInstallWizard(rex::ui::ImGuiDrawer* drawer, rex::PathConfig runtime_
   const auto game_root = runtime_paths.game_data_root;
 
   rex::ui::AcquireWizardDialog::Options options;
-  options.title = "Silent Hill: Downpour — Game Data";
+  // ASCII only: the overlay font atlas has no em-dash glyph (renders '?').
+  options.title = "Silent Hill: Downpour - Game Data";
   options.intro =
       "This port needs the game files from your own legally-owned Xbox 360 copy "
       "of Silent Hill: Downpour. Select your disc image (.iso) and its contents "
-      "will be extracted here — nothing else to do.";
+      "will be extracted here - nothing else to do.";
   options.target_directory = game_root.string();
   options.initial_status =
       "Select the disc image dumped from your copy of the game (USA or Europe "

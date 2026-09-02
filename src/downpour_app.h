@@ -138,7 +138,7 @@ class DownpourApp : public rex::ReXApp {
   // also use the window title to label captures, which is why we want it
   // clean and stable rather than version-stamped per build.
   std::string GetWindowTitle() const override {
-    return "Silent Hill: Downpour v1.1.7 | \xc2\xabLittle Bit\xc2\xbb";
+    return "Silent Hill: Downpour v1.1.8 | \xc2\xabLittle Bit\xc2\xbb";
   }
 
   // === DPOUR MIGRATION 2026-07-24: native-render Phase 1b ===

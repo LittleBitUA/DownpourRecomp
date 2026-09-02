@@ -12,11 +12,14 @@
 
 ![Murphy close-up — Silent Hill: Downpour running natively on PC](docs/screenshots/murphy-closeup.png)
 
-## [⬇  Download v1.1.7 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
+## [⬇  Download v1.1.8 for Windows](https://github.com/LittleBitUA/DownpourRecomp/releases/latest)
 
 </div>
 
 ---
+
+> [!IMPORTANT]
+> **v1.1.8 (hotfix, 2026-09-03)** — v1.1.7 refused to start on **Windows 10 / older Windows 11** with `Failed to get an adapter supporting Direct3D 12` ([issue #29](https://github.com/LittleBitUA/DownpourRecomp/issues/29)): the executable demanded a DirectX Agility runtime that was not in the package. v1.1.8 is v1.1.7 with that dependency removed — it uses the system Direct3D 12 runtime again, exactly like v1.1.6. Nothing else changed; if v1.1.7 already runs for you, updating changes nothing visible.
 
 > [!NOTE]
 > **v1.1.7 is out** — and it is deliberately **not** a "final" anything. It's a compilation of every update that has been accumulating on the dev machine since v1.1.6, shipped as one package **before something bigger** that is already in the works.

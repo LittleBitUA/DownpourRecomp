@@ -21,7 +21,7 @@
 > [!NOTE]
 > **v1.1.7 is out** — and it is deliberately **not** a "final" anything. It's a compilation of every update that has been accumulating on the dev machine since v1.1.6, shipped as one package **before something bigger** that is already in the works.
 >
-> Highlights: a **first-run disc-image installer** (community contribution by [Alexbeav](https://github.com/Alexbeav) — point it at your own ISO and it extracts everything itself), **no more AVX2 requirement** (pre-2013 CPUs boot the game now), **mouse look rebuilt on raw input** with direct displacement mapping, **nine correctness fixes ported from upstream ReXGlue v0.10**, **audio mix fixes** (bass is back in stereo mixes; one-shot SFX no longer crunch), and **achievements with unlock toasts** — press **F5** in-game to see your list. [Full notes below.](#whats-new-in-v117)
+> Highlights: a **first-run disc-image installer** (community contribution by [Alexbeav](https://github.com/Alexbeav) — point it at your own ISO and it extracts everything itself), **no more AVX2 requirement** (pre-2013 CPUs boot the game now), **mouse look rebuilt on raw input** with direct displacement mapping, **nine correctness fixes ported from upstream ReXGlue v0.10**, **audio mix fixes** (bass is back in stereo mixes; one-shot SFX no longer crunch), and **achievements with unlock toasts** — press **F7** in-game to see your list. [Full notes below.](#whats-new-in-v117)
 >
 > Already on v1.1.x? Launch `PlayDownpour.exe` and click the pill banner — v1.1.7 installs in place; your saves, settings, and warm shader cache are preserved (and backed up to `%TEMP%` first, automatically).
 >
@@ -90,9 +90,9 @@ Hand-ported (the fork can't rebase — upstream rewrote history) and verified ag
 * **One-shot SFX crunch root-caused**: the decoder reset between sounds called `avcodec_flush_buffers`, which is a **no-op** for the XMA codec — the previous sound's MDCT spectral tail leaked into the next sound's first frame. The reset now forces a codec reopen, which actually discards the history.
 * Clean audio-worker shutdown (drain with a timeout before the last-resort terminate).
 
-### 🏆 Achievements — press F5
+### 🏆 Achievements — press F7
 
-Achievement support with **unlock toasts** ships in the runtime (thanks to the upstream SDK community). Press **F5** in-game to open the achievement list and your unlock progress. Unlocks are tracked locally and persist across sessions — there is no Xbox Live, nothing leaves your machine.
+Achievement support with **unlock toasts** ships in the runtime (thanks to the upstream SDK community). Press **F7** in-game to open the achievement list and your unlock progress. Unlocks are tracked locally and persist across sessions — there is no Xbox Live, nothing leaves your machine.
 
 ### 🧹 Housekeeping
 
@@ -168,7 +168,7 @@ If something feels off about a claim in these docs, open an issue — we'll back
 | **CPU execution** | PowerPC native | Dynamic recompiler (JIT) | **Statically recompiled to native x86-64** |
 | **CPU requirement** | n/a | AVX-capable | **any x86-64 CPU with SSSE3** (v1.1.7+) |
 | **Shader cache** | n/a | rebuilds per-driver-update | **ships pre-warmed** (~1,370 PSOs) |
-| **Achievements** | Xbox Live | no | **local unlocks + toasts, F5 list** (v1.1.7+) |
+| **Achievements** | Xbox Live | no | **local unlocks + toasts, F7 list** (v1.1.7+) |
 | **Colour grade** | as authored | none | **7 ASC-CDL presets** |
 | **Portable layout** | n/a | %AppData% / OS paths | **saves + cache stay in the game folder** |
 | **Modding hooks** | none | limited | C++ source-level hooks |
@@ -196,7 +196,7 @@ The download is **the application only**. You bring the game:
 4. **First run:** the installer wizard asks for your game dump — point it at your ISO (or an already-extracted `assets/` tree) and, when prompted, at your `default.xexp` Title Update file (or let it download TU1). Extraction is resumable if interrupted.
 5. Play. First boot compiles the GPU-vendor shader library (~13 s on an RTX 5070); every subsequent boot is instant.
 
-In-game: **F4** — settings overlay (hot-reloadable cvars), **F5** — achievements, **F3** — diagnostics. The launcher's tabs (Graphics / Mouse / Controls / UE3 Engine / Debug) cover the same settings with sliders, and write them to `downpour.toml` next to the executable.
+In-game: **F4** — settings overlay (hot-reloadable cvars), **F7** — achievements, **F3** — diagnostics. The launcher's tabs (Graphics / Mouse / Controls / UE3 Engine / Debug) cover the same settings with sliders, and write them to `downpour.toml` next to the executable.
 
 The layout is **portable**: saves, config, and the warm shader cache all live in the game folder. Move the folder — everything moves with it.
 
@@ -308,7 +308,7 @@ Yes — this is the first time the game can be played with a mouse and keyboard,
 <details>
 <summary><b>Do achievements unlock?</b></summary>
 
-**Yes, since v1.1.7** — locally. Unlocks pop a toast in-game, persist across sessions, and the full list with your progress is on **F5**. There is no Xbox Live backend, so nothing syncs to Microsoft servers — and nothing needs to.
+**Yes, since v1.1.7** — locally. Unlocks pop a toast in-game, persist across sessions, and the full list with your progress is on **F7**. There is no Xbox Live backend, so nothing syncs to Microsoft servers — and nothing needs to.
 
 </details>
 

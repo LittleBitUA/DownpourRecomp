@@ -347,6 +347,8 @@ Open a [GitHub Issue](https://github.com/LittleBitUA/DownpourRecomp/issues) with
 
 Windows 10/11 x86-64, Visual Studio 2022 (17.8+) with C++ workload, CMake ≥ 3.25, Ninja ≥ 1.11, LLVM/Clang on `PATH`, and a legal copy of the game (`title id 4B4E0823`, hash `7A3D5809776EE6AB`).
 
+For the experimental Apple Silicon build, see [macOS port status and build notes](docs/MACOS_PORT.md). It has no release artifact or gameplay validation yet.
+
 ### Steps
 
 ```bash

@@ -32,6 +32,10 @@
 
 #include <rex/ui/window_win.h>
 #elif defined(__APPLE__)
+#include <SDL3/SDL.h>
+#include <rex/ui/window_sdl.h>
+
+#include "downpour_file_picker.h"
 #else
 #include <gtk/gtk.h>
 #endif
@@ -580,6 +584,11 @@ std::filesystem::path PickTitleUpdateFile() {
   }
   return filename;
 }
+#elif defined(__APPLE__)
+std::filesystem::path PickTitleUpdateFile() {
+  return PickFileWithNativeDialog(
+      "Select the Silent Hill: Downpour Title Update 1 package", {});
+}
 #else
 std::filesystem::path PickTitleUpdateFile() {
   GtkWidget* dialog = gtk_file_chooser_dialog_new(
@@ -906,6 +915,18 @@ bool RunTitleUpdateInstallWizardBlocking(rex::ui::WindowedAppContext& app_contex
     }
     if (hwnd) {
       RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+    }
+#elif defined(__APPLE__)
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+      if (event.type == SDL_EVENT_QUIT) {
+        app_context.QuitFromUIThread();
+        break;
+      }
+      rex::ui::SDLWindow::HandleSDLEvent(event);
+    }
+    if (window) {
+      window->RequestPaint();
     }
 #else
     if (window) {

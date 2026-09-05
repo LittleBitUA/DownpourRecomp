@@ -41,7 +41,7 @@ class DownpourApp : public rex::ReXApp {
   static std::unique_ptr<rex::ui::WindowedApp> Create(
       rex::ui::WindowedAppContext& ctx) {
     return std::unique_ptr<DownpourApp>(new DownpourApp(ctx, "downpour",
-        PPCImageConfig));
+        downpour_PPCImageConfig));
   }
 
   // Gate the runtime launch behind Title Update 1: if the user has not yet

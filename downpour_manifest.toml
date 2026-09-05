@@ -2,7 +2,7 @@
 
 [project]
 name = "downpour"
-sdk_version = "0.8.2.19"
+sdk_version = "0.8.0.15"
 game_root = "assets"
 
 [entrypoint]

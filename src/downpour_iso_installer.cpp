@@ -15,6 +15,9 @@
 #include <rex/ui/overlay/acquire_wizard_overlay.h>
 
 #include "downpour_title_update_installer.h"
+#if defined(__APPLE__)
+#include "downpour_file_picker.h"
+#endif
 
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
@@ -269,8 +272,8 @@ std::filesystem::path PickIsoFile() {
 }
 #elif defined(__APPLE__)
 std::filesystem::path PickIsoFile() {
-  REXLOG_ERROR("The ISO file picker is not implemented on macOS.");
-  return {};
+  return PickFileWithNativeDialog(
+      "Select your Silent Hill: Downpour Xbox 360 disc image", {"iso"});
 }
 #else
 std::filesystem::path PickIsoFile() {

@@ -5,6 +5,12 @@
 cmake_minimum_required(VERSION 3.25)
 project(downpour LANGUAGES CXX)
 
+if(APPLE)
+    # The native file picker is implemented in Objective-C++. Enable the
+    # language before importing the SDK so CMake initializes its rules first.
+    enable_language(OBJCXX)
+endif()
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -78,6 +84,10 @@ set(DOWNPOUR_SOURCES
     src/downpour_title_update_installer.cpp
 )
 
+if(APPLE)
+    list(APPEND DOWNPOUR_SOURCES src/downpour_file_picker.mm)
+endif()
+
 # dpour-fork 2026-08-08: the native render layer is RETIRED by owner decision.
 # All of its sources and docs live in _archived_native_render/; the guard
 # macro below keeps the app-side hooks compiled out. The game renders through
@@ -107,4 +117,7 @@ if(WIN32)
     # === DPOUR MIGRATION 2026-07-24: native-render Phase 1a/1b need D3D12/DXGI +
     # d3dcompiler (Phase 1b compiles the overlay shaders at runtime) ===
     target_link_libraries(downpour PRIVATE d3d12 dxgi d3dcompiler)
+elseif(APPLE)
+    find_library(APPKIT_FRAMEWORK AppKit REQUIRED)
+    target_link_libraries(downpour PRIVATE ${APPKIT_FRAMEWORK})
 endif()

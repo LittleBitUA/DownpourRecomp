@@ -12,6 +12,8 @@
 # --- Game files (never commit) ----------------------------------------------
 Game/
 assets/
+# ...and the symlink some local setups use instead of a real directory.
+/assets
 **/default.xex
 **/default.pe.bin
 **/*.xex
